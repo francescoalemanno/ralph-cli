@@ -1,0 +1,2 @@
+Controller note:
+planner clarification block invalid: clarification supports at most 3 options

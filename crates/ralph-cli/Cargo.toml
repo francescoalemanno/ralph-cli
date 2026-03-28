@@ -1,0 +1,15 @@
+[package]
+name = "ralph"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camino.workspace = true
+clap.workspace = true
+ralph-app = { path = "../ralph-app" }
+ralph-core = { path = "../ralph-core" }
+ralph-tui = { path = "../ralph-tui" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

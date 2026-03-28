@@ -1,0 +1,37 @@
+[workspace]
+members = [
+    "crates/ralph-core",
+    "crates/ralph-runner",
+    "crates/ralph-app",
+    "crates/ralph-tui",
+    "crates/ralph-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+async-trait = "0.1.89"
+camino = { version = "1.2.1", features = ["serde1"] }
+clap = { version = "4.5.48", features = ["derive", "env"] }
+crossterm = "0.28.1"
+dirs = "6.0.0"
+insta = { version = "1.43.2", features = ["yaml"] }
+notify = "8.2.0"
+proptest = "1.8.0"
+rand = "0.9.2"
+ratatui = "0.29.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tempfile = "3.23.0"
+textwrap = "0.16.2"
+thiserror = "2.0.17"
+tokio = { version = "1.47.1", features = ["full"] }
+toml = "0.8.23"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+tui-textarea = "0.7.0"
+unicode-width = "0.2.0"
