@@ -16,10 +16,6 @@ pub enum BuilderMarker {
 pub enum MarkerError {
     #[error("missing exact completion marker")]
     MissingMarker,
-    #[error("multiple exact markers are not allowed")]
-    DuplicateMarkers,
-    #[error("malformed marker-like line: {0}")]
-    MalformedMarker(String),
 }
 
 pub fn parse_planning_marker_from_output(output: &str) -> Result<PlanningMarker, MarkerError> {
@@ -27,7 +23,7 @@ pub fn parse_planning_marker_from_output(output: &str) -> Result<PlanningMarker,
         "<plan-promise>DONE</plan-promise>",
         "<plan-promise>CONTINUE</plan-promise>",
     ];
-    match parse_exact_marker(output, &exact, "<plan-promise>")? {
+    match parse_exact_marker(output, &exact)? {
         "<plan-promise>DONE</plan-promise>" => Ok(PlanningMarker::Done),
         "<plan-promise>CONTINUE</plan-promise>" => Ok(PlanningMarker::Continue),
         _ => unreachable!(),
@@ -36,7 +32,7 @@ pub fn parse_planning_marker_from_output(output: &str) -> Result<PlanningMarker,
 
 pub fn parse_builder_marker_from_output(output: &str) -> Result<BuilderMarker, MarkerError> {
     let exact = ["<promise>DONE</promise>", "<promise>CONTINUE</promise>"];
-    match parse_exact_marker(output, &exact, "<promise>")? {
+    match parse_exact_marker(output, &exact)? {
         "<promise>DONE</promise>" => Ok(BuilderMarker::Done),
         "<promise>CONTINUE</promise>" => Ok(BuilderMarker::Continue),
         _ => unreachable!(),
@@ -72,28 +68,16 @@ pub fn append_persisted_done_marker(contents: &str) -> String {
     }
 }
 
-fn parse_exact_marker<'a>(
-    output: &'a str,
-    accepted: &[&'a str],
-    marker_prefix: &str,
-) -> Result<&'a str, MarkerError> {
-    let mut exact = Vec::new();
+fn parse_exact_marker<'a>(output: &'a str, accepted: &[&'a str]) -> Result<&'a str, MarkerError> {
+    let mut last_exact = None;
     for line in output.lines() {
         let trimmed = line.trim();
         if accepted.contains(&trimmed) {
-            exact.push(trimmed);
-            continue;
-        }
-        if trimmed.contains(marker_prefix) {
-            return Err(MarkerError::MalformedMarker(trimmed.to_owned()));
+            last_exact = Some(trimmed);
         }
     }
 
-    match exact.len() {
-        0 => Err(MarkerError::MissingMarker),
-        1 => Ok(exact[0]),
-        _ => Err(MarkerError::DuplicateMarkers),
-    }
+    last_exact.ok_or(MarkerError::MissingMarker)
 }
 
 #[cfg(test)]
@@ -110,12 +94,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_inline_builder_marker() {
+    fn ignores_inline_builder_marker_and_reports_missing_when_no_exact_line_exists() {
         let output = "done <promise>DONE</promise>";
         assert!(matches!(
             parse_builder_marker_from_output(output),
-            Err(MarkerError::MalformedMarker(_))
+            Err(MarkerError::MissingMarker)
         ));
+    }
+
+    #[test]
+    fn uses_last_exact_builder_marker_as_source_of_truth() {
+        let output = "work\n<promise>CONTINUE</promise>\nmore work\n<promise>DONE</promise>\n";
+        assert_eq!(
+            parse_builder_marker_from_output(output).unwrap(),
+            BuilderMarker::Done
+        );
+    }
+
+    #[test]
+    fn planning_ignores_prose_mentions_and_accepts_final_exact_marker() {
+        let output = "I should end with the planning marker <plan-promise>DONE</plan-promise> later.\n<plan-promise>DONE</plan-promise>\n";
+        assert_eq!(
+            parse_planning_marker_from_output(output).unwrap(),
+            PlanningMarker::Done
+        );
     }
 
     #[test]
