@@ -1,4 +1,4 @@
-use crate::QuestionSupportMode;
+use crate::{ClarificationExchange, QuestionSupportMode};
 
 #[derive(Debug, Clone)]
 pub struct PlanningPromptContext {
@@ -7,7 +7,8 @@ pub struct PlanningPromptContext {
     pub progress_path: String,
     pub existing_spec: String,
     pub existing_progress: String,
-    pub prior_answers: Vec<String>,
+    pub clarification_history: Vec<ClarificationExchange>,
+    pub controller_warnings: Vec<String>,
     pub question_support: QuestionSupportMode,
 }
 
@@ -36,16 +37,29 @@ Then stop. Do not emit a planning marker in the same response."#
         }
     };
 
-    let prior_answers = if context.prior_answers.is_empty() {
+    let recent_feedback = context
+        .clarification_history
+        .last()
+        .map(|exchange| format_exchange(1, exchange))
+        .unwrap_or_else(|| "None.".to_owned());
+
+    let older_feedback = if context.clarification_history.len() <= 1 {
         "None.".to_owned()
     } else {
         context
-            .prior_answers
+            .clarification_history
             .iter()
+            .take(context.clarification_history.len() - 1)
             .enumerate()
-            .map(|(index, answer)| format!("{}. {}", index + 1, answer))
+            .map(|(index, exchange)| format_exchange(index + 1, exchange))
             .collect::<Vec<_>>()
             .join("\n")
+    };
+
+    let controller_warnings = if context.controller_warnings.is_empty() {
+        "None.".to_owned()
+    } else {
+        context.controller_warnings.join("\n")
     };
 
     format!(
@@ -76,8 +90,16 @@ Required spec format:
 Planning request:
 {planning_request}
 
-Prior clarification answers:
-{prior_answers}
+Recent feedback to shape the plan:
+This is the most recent authoritative user guidance collected in the previous planning iteration.
+{recent_feedback}
+
+Older feedbacks from past iterations:
+These older clarifications remain authoritative unless superseded by newer feedback above.
+{older_feedback}
+
+Controller warnings:
+{controller_warnings}
 
 Existing spec:
 {existing_spec}
@@ -95,10 +117,21 @@ When you finish a planning pass, end with exactly one of:
         spec_path = context.spec_path,
         progress_path = context.progress_path,
         planning_request = context.planning_request.trim(),
-        prior_answers = prior_answers,
+        recent_feedback = recent_feedback,
+        older_feedback = older_feedback,
+        controller_warnings = controller_warnings,
         existing_spec = display_block(&context.existing_spec),
         existing_progress = display_block(&context.existing_progress),
         clarification_protocol = clarification_protocol,
+    )
+}
+
+fn format_exchange(index: usize, exchange: &ClarificationExchange) -> String {
+    format!(
+        "{}. Q: {}\n   A: {}",
+        index,
+        exchange.question.trim(),
+        exchange.answer.trim()
     )
 }
 
@@ -142,5 +175,39 @@ fn display_block(contents: &str) -> String {
         "<empty>".to_owned()
     } else {
         contents.trim().to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlanningPromptContext, planning_prompt};
+    use crate::{ClarificationExchange, QuestionSupportMode};
+
+    #[test]
+    fn planning_prompt_splits_recent_and_older_feedback() {
+        let prompt = planning_prompt(&PlanningPromptContext {
+            planning_request: "Implement feature".to_owned(),
+            spec_path: "/tmp/spec.md".to_owned(),
+            progress_path: "/tmp/progress.txt".to_owned(),
+            existing_spec: String::new(),
+            existing_progress: String::new(),
+            clarification_history: vec![
+                ClarificationExchange {
+                    question: "Which runtime?".to_owned(),
+                    answer: "Tokio".to_owned(),
+                },
+                ClarificationExchange {
+                    question: "Which database?".to_owned(),
+                    answer: "Postgres".to_owned(),
+                },
+            ],
+            controller_warnings: vec![],
+            question_support: QuestionSupportMode::TextProtocol,
+        });
+
+        assert!(prompt.contains("Recent feedback to shape the plan:"));
+        assert!(prompt.contains("1. Q: Which database?\n   A: Postgres"));
+        assert!(prompt.contains("Older feedbacks from past iterations:"));
+        assert!(prompt.contains("1. Q: Which runtime?\n   A: Tokio"));
     }
 }
