@@ -4,9 +4,9 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
-    AppConfig, ArtifactStore, BuildPromptContext, BuilderMarker, ClarificationRequest, ReviewData,
-    RunControl, RunnerInvocation, RunnerMode, SpecPaths, SpecSummary, build_prompt,
-    parse_builder_marker_from_output, parse_clarification_request,
+    AppConfig, ArtifactStore, BuildPromptContext, BuilderMarker, ClarificationExchange,
+    ClarificationRequest, ReviewData, RunControl, RunnerInvocation, RunnerMode, SpecPaths,
+    SpecSummary, build_prompt, parse_builder_marker_from_output, parse_clarification_request,
     parse_planning_marker_from_output, planning_prompt, strip_persisted_promise_markers,
 };
 use ralph_runner::{CommandRunner, RunnerAdapter, RunnerStreamEvent};
@@ -235,7 +235,8 @@ where
             self.store.delete_pair(&paths)?;
         }
 
-        let mut prior_answers = Vec::new();
+        let mut clarification_history = Vec::new();
+        let mut controller_warnings = Vec::new();
         for iteration in 1..=self.config.planning_max_iterations {
             if control.is_cancelled() {
                 return Err(anyhow!("operation canceled"));
@@ -256,7 +257,8 @@ where
                 progress_path: paths.progress_path.to_string(),
                 existing_spec: spec_before.clone(),
                 existing_progress: progress_before.clone(),
-                prior_answers: prior_answers.clone(),
+                clarification_history: clarification_history.clone(),
+                controller_warnings: controller_warnings.clone(),
                 question_support: self.config.planner.question_support,
             });
 
@@ -304,12 +306,19 @@ where
                 continue;
             }
 
-            if let Some(request) = parse_clarification_request(&result.stdout) {
-                let answer = delegate.ask_clarification(request).await?;
-                let Some(answer) = answer else {
-                    return Err(anyhow!("planning canceled during clarification"));
+            let asked_clarification =
+                if let Some(request) = parse_clarification_request(&result.stdout) {
+                    let question = request.question.clone();
+                    let answer = delegate.ask_clarification(request).await?;
+                    let Some(answer) = answer else {
+                        return Err(anyhow!("planning canceled during clarification"));
+                    };
+                    clarification_history.push(ClarificationExchange { question, answer });
+                    true
+                } else {
+                    false
                 };
-                prior_answers.push(answer);
+            if asked_clarification {
                 continue;
             }
 
@@ -329,13 +338,6 @@ where
             }
             if progress_after.trim().is_empty() {
                 let note = "planner did not produce a non-empty progress file".to_owned();
-                self.store
-                    .append_controller_note(&paths.progress_path, &note)?;
-                delegate.on_event(RunEvent::Note(note)).await?;
-                continue;
-            }
-            if spec_after == spec_before && progress_after == progress_before {
-                let note = "planner did not change spec or progress".to_owned();
                 self.store
                     .append_controller_note(&paths.progress_path, &note)?;
                 delegate.on_event(RunEvent::Note(note)).await?;
@@ -363,6 +365,20 @@ where
                     })
                     .await?;
                 return Ok(summary);
+            }
+
+            if spec_after == spec_before && progress_after == progress_before {
+                let note = "planner did not change spec or progress".to_owned();
+                self.store
+                    .append_controller_note(&paths.progress_path, &note)?;
+                delegate.on_event(RunEvent::Note(note)).await?;
+                if marker == ralph_core::PlanningMarker::Continue {
+                    let warning = "System warning: in the previous planning iteration you emitted CONTINUE without changing spec/progress and without asking clarification. This is irrational. In the next iteration you must either modify the plan artifacts, ask a clarification question, or emit DONE.".to_owned();
+                    if !controller_warnings.contains(&warning) {
+                        controller_warnings.push(warning);
+                    }
+                }
+                continue;
             }
         }
 
@@ -853,6 +869,181 @@ mod tests {
             .unwrap();
         assert_eq!(summary.state, WorkflowState::Planned);
         assert!(delegate.notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn planning_reinjects_prior_clarification_question_and_answer() {
+        let runner = ScriptedRunner::new(vec![
+            Box::new(|invocation| {
+                fs::write(
+                    &invocation.spec_path,
+                    "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
+                )
+                .unwrap();
+                fs::write(&invocation.progress_path, "Task 1\n").unwrap();
+                RunnerResult {
+                    stdout: "<ralph-question>{\"question\":\"Which database should the plan assume?\",\"options\":[{\"label\":\"Postgres\",\"description\":\"Use PostgreSQL\"}]}</ralph-question>".to_owned(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                }
+            }),
+            Box::new(|invocation| {
+                assert!(
+                    invocation
+                        .prompt_text
+                        .contains("Recent feedback to shape the plan:")
+                );
+                assert!(
+                    invocation
+                        .prompt_text
+                        .contains("This is the most recent authoritative user guidance collected in the previous planning iteration.")
+                );
+                assert!(
+                    invocation
+                        .prompt_text
+                        .contains("Older feedbacks from past iterations:\nThese older clarifications remain authoritative unless superseded by newer feedback above.\nNone.")
+                );
+                assert!(
+                    invocation
+                        .prompt_text
+                        .contains("Q: Which database should the plan assume?")
+                );
+                assert!(invocation.prompt_text.contains("A: Postgres"));
+                fs::write(
+                    &invocation.spec_path,
+                    "# Goal\nA\n# User Specification\nB\n# Plan\nD\n",
+                )
+                .unwrap();
+                fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
+                RunnerResult {
+                    stdout: "<plan-promise>DONE</plan-promise>\n".to_owned(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                }
+            }),
+        ]);
+
+        let (_temp, app) = app(runner);
+        let mut delegate = TestDelegate {
+            answers: vec![Some("Postgres".to_owned())],
+            notes: vec![],
+            stdout: vec![],
+            stderr: vec![],
+        };
+
+        let summary = app
+            .create_new("Implement feature", &mut delegate)
+            .await
+            .unwrap();
+        assert_eq!(summary.state, WorkflowState::Planned);
+    }
+
+    #[tokio::test]
+    async fn planning_done_succeeds_even_without_artifact_changes_in_final_pass() {
+        let runner = ScriptedRunner::new(vec![
+            Box::new(|invocation| {
+                fs::write(
+                    &invocation.spec_path,
+                    "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
+                )
+                .unwrap();
+                fs::write(&invocation.progress_path, "Task 1\n").unwrap();
+                RunnerResult {
+                    stdout: "<plan-promise>CONTINUE</plan-promise>\n".to_owned(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                }
+            }),
+            Box::new(|_invocation| RunnerResult {
+                stdout: "<plan-promise>DONE</plan-promise>\n".to_owned(),
+                stderr: String::new(),
+                exit_code: 0,
+            }),
+        ]);
+
+        let (_temp, app) = app(runner);
+        let mut delegate = TestDelegate {
+            answers: vec![],
+            notes: vec![],
+            stdout: vec![],
+            stderr: vec![],
+        };
+
+        let summary = app
+            .create_new("Implement feature", &mut delegate)
+            .await
+            .unwrap();
+        assert_eq!(summary.state, WorkflowState::Planned);
+        assert!(
+            !delegate
+                .notes
+                .iter()
+                .any(|note| note.contains("planner did not change spec or progress"))
+        );
+    }
+
+    #[tokio::test]
+    async fn planning_warns_after_continue_without_changes_or_questions() {
+        let runner = ScriptedRunner::new(vec![
+            Box::new(|invocation| {
+                fs::write(
+                    &invocation.spec_path,
+                    "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
+                )
+                .unwrap();
+                fs::write(&invocation.progress_path, "Task 1\n").unwrap();
+                RunnerResult {
+                    stdout: "<plan-promise>CONTINUE</plan-promise>\n".to_owned(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                }
+            }),
+            Box::new(|invocation| {
+                assert!(invocation.prompt_text.contains(
+                    "System warning: in the previous planning iteration you emitted CONTINUE without changing spec/progress and without asking clarification."
+                ));
+                fs::write(
+                    &invocation.spec_path,
+                    "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
+                )
+                .unwrap();
+                fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
+                RunnerResult {
+                    stdout: "<plan-promise>DONE</plan-promise>\n".to_owned(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                }
+            }),
+        ]);
+
+        let (_temp, app) = app(runner);
+        let paths = app.resolve_target("alpha").unwrap();
+        fs::create_dir_all(paths.spec_path.parent().unwrap()).unwrap();
+        fs::write(
+            &paths.spec_path,
+            "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
+        )
+        .unwrap();
+        fs::write(&paths.progress_path, "Task 1\n").unwrap();
+
+        let mut delegate = TestDelegate {
+            answers: vec![],
+            notes: vec![],
+            stdout: vec![],
+            stderr: vec![],
+        };
+
+        let summary = app
+            .revise_target("alpha", "Implement feature", &mut delegate)
+            .await
+            .unwrap();
+        assert_eq!(summary.state, WorkflowState::Planned);
+        assert!(
+            delegate
+                .notes
+                .iter()
+                .any(|note| note.contains("planner did not change spec or progress"))
+        );
     }
 
     struct BlockingRunner;
