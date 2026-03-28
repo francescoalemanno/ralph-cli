@@ -255,8 +255,6 @@ where
                 planning_request: planning_request.to_owned(),
                 spec_path: paths.spec_path.to_string(),
                 progress_path: paths.progress_path.to_string(),
-                existing_spec: spec_before.clone(),
-                existing_progress: progress_before.clone(),
                 clarification_history: clarification_history.clone(),
                 controller_warnings: controller_warnings.clone(),
                 question_support: self.config.planner.question_support,
@@ -425,8 +423,6 @@ where
             let prompt = build_prompt(&BuildPromptContext {
                 spec_path: paths.spec_path.to_string(),
                 progress_path: paths.progress_path.to_string(),
-                spec_contents: spec.clone(),
-                progress_contents: stripped.clone(),
             });
 
             let result = match self
@@ -573,14 +569,14 @@ where
 fn preview(contents: &str) -> String {
     let compact = contents
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .take(5)
+        .skip_while(|line| line.trim().is_empty())
+        .map(str::trim_end)
+        .take(12)
         .collect::<Vec<_>>();
     if compact.is_empty() {
         "<empty>".to_owned()
     } else {
-        compact.join(" | ")
+        compact.join("\n")
     }
 }
 
@@ -714,15 +710,17 @@ mod tests {
         (temp, RalphApp::new(project_dir, config, runner))
     }
 
+    fn sample_spec(suffix: &str) -> String {
+        format!(
+            "# Goal\nGoal {suffix}\n\n# User Requirements And Constraints\nRequirements {suffix}\n\n# Non-Goals\nNon-goals {suffix}\n\n# Proposed Design\nDesign {suffix}\n\n# Implementation Plan\nPlan {suffix}\n\n# Acceptance Criteria\nAcceptance {suffix}\n\n# Risks\nRisks {suffix}\n\n# Open Questions\nQuestions {suffix}\n"
+        )
+    }
+
     #[tokio::test]
     async fn planning_retries_on_invalid_marker() {
         let runner = ScriptedRunner::new(vec![
             Box::new(|invocation| {
-                fs::write(
-                    &invocation.spec_path,
-                    "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
-                )
-                .unwrap();
+                fs::write(&invocation.spec_path, sample_spec("A")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\n").unwrap();
                 RunnerResult {
                     stdout: "not a marker\n".to_owned(),
@@ -731,11 +729,7 @@ mod tests {
                 }
             }),
             Box::new(|invocation| {
-                fs::write(
-                    &invocation.spec_path,
-                    "# Goal\nA\n# User Specification\nB\n# Plan\nD\n",
-                )
-                .unwrap();
+                fs::write(&invocation.spec_path, sample_spec("D")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
                 RunnerResult {
                     stdout: "<plan-promise>DONE</plan-promise>\n".to_owned(),
@@ -779,11 +773,7 @@ mod tests {
         let (_temp, app) = app(runner);
         let paths = app.resolve_target("alpha").unwrap();
         fs::create_dir_all(paths.spec_path.parent().unwrap()).unwrap();
-        fs::write(
-            &paths.spec_path,
-            "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
-        )
-        .unwrap();
+        fs::write(&paths.spec_path, sample_spec("C")).unwrap();
         fs::write(
             &paths.progress_path,
             "Task 1\n<promise>CONTINUE</promise>\n",
@@ -805,11 +795,7 @@ mod tests {
     #[tokio::test]
     async fn planning_preserves_partial_artifacts_on_cancel() {
         let runner = ScriptedRunner::new(vec![Box::new(|invocation| {
-            fs::write(
-                &invocation.spec_path,
-                "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
-            )
-            .unwrap();
+            fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
             fs::write(&invocation.progress_path, "Task 1\n").unwrap();
             RunnerResult {
                 stdout: "<ralph-question>{\"question\":\"Which?\",\"options\":[]}</ralph-question>"
@@ -840,11 +826,7 @@ mod tests {
     #[tokio::test]
     async fn planning_ignores_malformed_clarification_blocks() {
         let runner = ScriptedRunner::new(vec![Box::new(|invocation| {
-            fs::write(
-                &invocation.spec_path,
-                "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
-            )
-            .unwrap();
+            fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
             fs::write(&invocation.progress_path, "Task 1\n").unwrap();
             RunnerResult {
                 stdout:
@@ -875,11 +857,7 @@ mod tests {
     async fn planning_reinjects_prior_clarification_question_and_answer() {
         let runner = ScriptedRunner::new(vec![
             Box::new(|invocation| {
-                fs::write(
-                    &invocation.spec_path,
-                    "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
-                )
-                .unwrap();
+                fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\n").unwrap();
                 RunnerResult {
                     stdout: "<ralph-question>{\"question\":\"Which database should the plan assume?\",\"options\":[{\"label\":\"Postgres\",\"description\":\"Use PostgreSQL\"}]}</ralph-question>".to_owned(),
@@ -909,11 +887,7 @@ mod tests {
                         .contains("Q: Which database should the plan assume?")
                 );
                 assert!(invocation.prompt_text.contains("A: Postgres"));
-                fs::write(
-                    &invocation.spec_path,
-                    "# Goal\nA\n# User Specification\nB\n# Plan\nD\n",
-                )
-                .unwrap();
+                fs::write(&invocation.spec_path, sample_spec("D")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
                 RunnerResult {
                     stdout: "<plan-promise>DONE</plan-promise>\n".to_owned(),
@@ -942,11 +916,7 @@ mod tests {
     async fn planning_done_succeeds_even_without_artifact_changes_in_final_pass() {
         let runner = ScriptedRunner::new(vec![
             Box::new(|invocation| {
-                fs::write(
-                    &invocation.spec_path,
-                    "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
-                )
-                .unwrap();
+                fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\n").unwrap();
                 RunnerResult {
                     stdout: "<plan-promise>CONTINUE</plan-promise>\n".to_owned(),
@@ -986,11 +956,7 @@ mod tests {
     async fn planning_warns_after_continue_without_changes_or_questions() {
         let runner = ScriptedRunner::new(vec![
             Box::new(|invocation| {
-                fs::write(
-                    &invocation.spec_path,
-                    "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
-                )
-                .unwrap();
+                fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\n").unwrap();
                 RunnerResult {
                     stdout: "<plan-promise>CONTINUE</plan-promise>\n".to_owned(),
@@ -1002,11 +968,7 @@ mod tests {
                 assert!(invocation.prompt_text.contains(
                     "System warning: in the previous planning iteration you emitted CONTINUE without changing spec/progress and without asking clarification."
                 ));
-                fs::write(
-                    &invocation.spec_path,
-                    "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
-                )
-                .unwrap();
+                fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
                 RunnerResult {
                     stdout: "<plan-promise>DONE</plan-promise>\n".to_owned(),
@@ -1019,11 +981,7 @@ mod tests {
         let (_temp, app) = app(runner);
         let paths = app.resolve_target("alpha").unwrap();
         fs::create_dir_all(paths.spec_path.parent().unwrap()).unwrap();
-        fs::write(
-            &paths.spec_path,
-            "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
-        )
-        .unwrap();
+        fs::write(&paths.spec_path, sample_spec("C")).unwrap();
         fs::write(&paths.progress_path, "Task 1\n").unwrap();
 
         let mut delegate = TestDelegate {
@@ -1079,11 +1037,7 @@ mod tests {
 
         let paths = app.resolve_target("alpha").unwrap();
         fs::create_dir_all(paths.spec_path.parent().unwrap()).unwrap();
-        fs::write(
-            &paths.spec_path,
-            "# Goal\nA\n# User Specification\nB\n# Plan\nC\n",
-        )
-        .unwrap();
+        fs::write(&paths.spec_path, sample_spec("C")).unwrap();
         fs::write(&paths.progress_path, "Task 1\n").unwrap();
 
         let control = RunControl::new();

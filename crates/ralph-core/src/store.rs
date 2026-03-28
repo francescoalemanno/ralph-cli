@@ -260,15 +260,15 @@ impl ArtifactStore {
 fn preview(contents: &str) -> String {
     let lines = contents
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .take(6)
+        .skip_while(|line| line.trim().is_empty())
+        .map(str::trim_end)
+        .take(12)
         .collect::<Vec<_>>();
 
     if lines.is_empty() {
         "<empty>".to_owned()
     } else {
-        lines.join(" | ")
+        lines.join("\n")
     }
 }
 
@@ -276,6 +276,12 @@ fn preview(contents: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    fn sample_spec(suffix: &str) -> String {
+        format!(
+            "# Goal\nGoal {suffix}\n\n# User Requirements And Constraints\nRequirements {suffix}\n\n# Non-Goals\nNon-goals {suffix}\n\n# Proposed Design\nDesign {suffix}\n\n# Implementation Plan\nPlan {suffix}\n\n# Acceptance Criteria\nAcceptance {suffix}\n\n# Risks\nRisks {suffix}\n\n# Open Questions\nQuestions {suffix}\n"
+        )
+    }
 
     fn store() -> (TempDir, ArtifactStore) {
         let temp = TempDir::new().unwrap();
@@ -309,10 +315,7 @@ mod tests {
         assert_eq!(store.state_for_paths(&empty).unwrap(), WorkflowState::Empty);
 
         store
-            .write_spec(
-                &empty.spec_path,
-                "# Goal\nX\n# User Specification\nY\n# Plan\nZ\n",
-            )
+            .write_spec(&empty.spec_path, &sample_spec("X"))
             .unwrap();
         assert_eq!(
             store.state_for_paths(&empty).unwrap(),
@@ -333,18 +336,12 @@ mod tests {
         let (_temp, store) = store();
         let active = store.resolve_target("active").unwrap();
         store
-            .write_spec(
-                &active.spec_path,
-                "# Goal\na\n# User Specification\nb\n# Plan\nc\n",
-            )
+            .write_spec(&active.spec_path, &sample_spec("active"))
             .unwrap();
 
         let completed = store.resolve_target("done").unwrap();
         store
-            .write_spec(
-                &completed.spec_path,
-                "# Goal\na\n# User Specification\nb\n# Plan\nc\n",
-            )
+            .write_spec(&completed.spec_path, &sample_spec("done"))
             .unwrap();
         store
             .write_progress(&completed.progress_path, "<promise>DONE</promise>\n")
