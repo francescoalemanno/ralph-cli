@@ -67,6 +67,12 @@ pub struct ClarificationRequest {
     pub options: Vec<ClarificationOption>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClarificationExchange {
+    pub question: String,
+    pub answer: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerInvocation {
     pub prompt_text: String,

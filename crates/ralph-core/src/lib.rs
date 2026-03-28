@@ -17,6 +17,6 @@ pub use prompts::{BuildPromptContext, PlanningPromptContext, build_prompt, plann
 pub use slug::generate_slug;
 pub use store::ArtifactStore;
 pub use types::{
-    ClarificationOption, ClarificationRequest, ReviewData, RunControl, RunnerInvocation,
-    RunnerMode, RunnerResult, SpecPaths, SpecSummary, WorkflowState,
+    ClarificationExchange, ClarificationOption, ClarificationRequest, ReviewData, RunControl,
+    RunnerInvocation, RunnerMode, RunnerResult, SpecPaths, SpecSummary, WorkflowState,
 };
