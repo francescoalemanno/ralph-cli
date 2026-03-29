@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, VecDeque},
     env,
     fs::OpenOptions,
     io::{self, Read, Write},
@@ -24,8 +25,8 @@ use crossterm::{
 };
 use ralph_app::{RalphApp, RunDelegate, RunEvent, format_iteration_banner};
 use ralph_core::{
-    ClarificationRequest, CodingAgent, ReviewData, RunControl, RunnerMode, SpecSummary,
-    WorkflowState,
+    ClarificationAnswer, ClarificationRequest, CodingAgent, ReviewData, RunControl, RunnerMode,
+    SpecSummary, WorkflowState,
 };
 use ratatui::{
     Frame, Terminal,
@@ -76,9 +77,13 @@ enum UiEvent {
     Resize,
     SpecsLoaded(Result<Vec<SpecSummary>, String>),
     ReviewLoaded(Result<ReviewData, String>),
-    OperationDone(Result<SpecSummary, String>),
-    RunMessage(RunEvent),
-    ClarificationRequested(ClarificationRequest, oneshot::Sender<Option<String>>),
+    OperationDone(RunId, Result<SpecSummary, String>),
+    RunMessage(RunId, RunEvent),
+    ClarificationRequested(
+        RunId,
+        ClarificationRequest,
+        oneshot::Sender<Option<ClarificationAnswer>>,
+    ),
 }
 
 enum Screen {
@@ -86,7 +91,7 @@ enum Screen {
     Scoped,
     Composer(ComposerKind),
     Review,
-    Running,
+    Running(RunId),
 }
 
 enum ComposerKind {
@@ -96,9 +101,55 @@ enum ComposerKind {
 }
 
 struct ClarificationModal {
+    run_id: RunId,
     request: ClarificationRequest,
-    responder: oneshot::Sender<Option<String>>,
+    responder: oneshot::Sender<Option<ClarificationAnswer>>,
     input: TextArea<'static>,
+}
+
+type RunId = u64;
+
+struct RunSession {
+    mode: RunnerMode,
+    target: String,
+    logs: Vec<String>,
+    scroll: u16,
+    follow: bool,
+    iteration: Option<(usize, usize)>,
+    signal: String,
+    control: RunControl,
+    pending: bool,
+}
+
+impl RunSession {
+    fn new(mode: RunnerMode, target: String, control: RunControl) -> Self {
+        Self {
+            mode,
+            target,
+            logs: Vec::new(),
+            scroll: 0,
+            follow: true,
+            iteration: None,
+            signal: "Waiting for first agent output".to_owned(),
+            control,
+            pending: true,
+        }
+    }
+}
+
+struct PendingClarification {
+    run_id: RunId,
+    request: ClarificationRequest,
+    responder: oneshot::Sender<Option<ClarificationAnswer>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskStatus {
+    Planning,
+    Building,
+    ToPlan,
+    ToBuild,
+    Idle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,23 +182,21 @@ struct TuiApp {
     composer: TextArea<'static>,
     review: Option<ReviewData>,
     review_tab: usize,
+    review_pending: bool,
     dashboard_preview_scroll: u16,
     scoped_scroll: u16,
     review_scroll: u16,
-    run_logs: Vec<String>,
-    run_scroll: u16,
-    run_follow: bool,
-    run_mode: Option<RunnerMode>,
-    run_iteration: Option<(usize, usize)>,
-    run_signal: String,
-    run_target: Option<String>,
-    active_control: Option<RunControl>,
-    cancel_armed: bool,
+    runs: BTreeMap<RunId, RunSession>,
+    run_order: Vec<RunId>,
+    next_run_id: RunId,
+    cancel_armed_run: Option<RunId>,
     cancel_armed_until: Option<Instant>,
-    pending: bool,
     tick_count: u64,
     color_mode: ColorMode,
     clarification: Option<ClarificationModal>,
+    clarification_queue: VecDeque<PendingClarification>,
+    clarification_abort_armed: bool,
+    clarification_abort_armed_until: Option<Instant>,
     clarification_scroll: u16,
     notice: Option<Notice>,
     focus_spec_path: Option<String>,
@@ -177,23 +226,21 @@ impl TuiApp {
             composer,
             review: None,
             review_tab: 0,
+            review_pending: false,
             dashboard_preview_scroll: 0,
             scoped_scroll: 0,
             review_scroll: 0,
-            run_logs: Vec::new(),
-            run_scroll: 0,
-            run_follow: true,
-            run_mode: None,
-            run_iteration: None,
-            run_signal: "Idle".to_owned(),
-            run_target: None,
-            active_control: None,
-            cancel_armed: false,
+            runs: BTreeMap::new(),
+            run_order: Vec::new(),
+            next_run_id: 1,
+            cancel_armed_run: None,
             cancel_armed_until: None,
-            pending: false,
             tick_count: 0,
             color_mode,
             clarification: None,
+            clarification_queue: VecDeque::new(),
+            clarification_abort_armed: false,
+            clarification_abort_armed_until: None,
             clarification_scroll: 0,
             notice: None,
             focus_spec_path: None,
@@ -266,7 +313,7 @@ impl TuiApp {
     }
 
     fn load_review(&mut self, target: String) {
-        self.pending = true;
+        self.review_pending = true;
         self.status = format!("Loading review for {target}");
         let tx = self.tx.clone();
         let app = self.app.clone();
@@ -279,78 +326,81 @@ impl TuiApp {
     }
 
     fn run_create(&mut self, request: String) {
-        let control = RunControl::new();
-        self.pending = true;
-        self.active_control = Some(control.clone());
-        self.screen = Screen::Running;
-        self.reset_run_view(RunnerMode::Plan, "new spec".to_owned());
+        let (run_id, control) = self.start_run(
+            RunnerMode::Plan,
+            "new spec".to_owned(),
+            "Running planner…".to_owned(),
+        );
         self.status = "Running planner…".to_owned();
         let tx = self.tx.clone();
         let app = self.app.clone();
         self.handle.spawn(async move {
-            let mut delegate = ChannelDelegate { tx: tx.clone() };
+            let mut delegate = ChannelDelegate {
+                tx: tx.clone(),
+                run_id,
+            };
             let result = app
                 .create_new_with_control(&request, control, &mut delegate)
                 .await
                 .map_err(|error| error.to_string());
-            let _ = tx.send(UiEvent::OperationDone(result));
+            let _ = tx.send(UiEvent::OperationDone(run_id, result));
         });
     }
 
     fn run_revise(&mut self, target: String, request: String) {
-        let control = RunControl::new();
-        self.pending = true;
-        self.active_control = Some(control.clone());
-        self.screen = Screen::Running;
-        self.reset_run_view(RunnerMode::Plan, target.clone());
+        let status = format!("Revising {target}");
+        let (run_id, control) = self.start_run(RunnerMode::Plan, target.clone(), status.clone());
         self.status = format!("Revising {target}");
         let tx = self.tx.clone();
         let app = self.app.clone();
         self.handle.spawn(async move {
-            let mut delegate = ChannelDelegate { tx: tx.clone() };
+            let mut delegate = ChannelDelegate {
+                tx: tx.clone(),
+                run_id,
+            };
             let result = app
                 .revise_target_with_control(&target, &request, control, &mut delegate)
                 .await
                 .map_err(|error| error.to_string());
-            let _ = tx.send(UiEvent::OperationDone(result));
+            let _ = tx.send(UiEvent::OperationDone(run_id, result));
         });
     }
 
     fn run_replan(&mut self, target: String, request: String) {
-        let control = RunControl::new();
-        self.pending = true;
-        self.active_control = Some(control.clone());
-        self.screen = Screen::Running;
-        self.reset_run_view(RunnerMode::Plan, target.clone());
+        let status = format!("Replanning {target}");
+        let (run_id, control) = self.start_run(RunnerMode::Plan, target.clone(), status.clone());
         self.status = format!("Replanning {target}");
         let tx = self.tx.clone();
         let app = self.app.clone();
         self.handle.spawn(async move {
-            let mut delegate = ChannelDelegate { tx: tx.clone() };
+            let mut delegate = ChannelDelegate {
+                tx: tx.clone(),
+                run_id,
+            };
             let result = app
                 .replan_target_with_control(&target, &request, control, &mut delegate)
                 .await
                 .map_err(|error| error.to_string());
-            let _ = tx.send(UiEvent::OperationDone(result));
+            let _ = tx.send(UiEvent::OperationDone(run_id, result));
         });
     }
 
     fn run_builder(&mut self, target: String) {
-        let control = RunControl::new();
-        self.pending = true;
-        self.active_control = Some(control.clone());
-        self.screen = Screen::Running;
-        self.reset_run_view(RunnerMode::Build, target.clone());
+        let status = format!("Running {target}");
+        let (run_id, control) = self.start_run(RunnerMode::Build, target.clone(), status.clone());
         self.status = format!("Running {target}");
         let tx = self.tx.clone();
         let app = self.app.clone();
         self.handle.spawn(async move {
-            let mut delegate = ChannelDelegate { tx: tx.clone() };
+            let mut delegate = ChannelDelegate {
+                tx: tx.clone(),
+                run_id,
+            };
             let result = app
                 .run_target_with_control(&target, control, &mut delegate)
                 .await
                 .map_err(|error| error.to_string());
-            let _ = tx.send(UiEvent::OperationDone(result));
+            let _ = tx.send(UiEvent::OperationDone(run_id, result));
         });
     }
 
@@ -364,6 +414,7 @@ impl TuiApp {
             UiEvent::Tick => {
                 self.tick_count = self.tick_count.wrapping_add(1);
                 self.expire_cancel_arm_if_needed();
+                self.expire_clarification_abort_if_needed();
             }
             UiEvent::Resize => {}
             UiEvent::Key(key) => self.handle_key(key),
@@ -378,8 +429,6 @@ impl TuiApp {
                             .position(|summary| summary.spec_path.as_str() == path)
                         {
                             self.selected = index;
-                            self.screen = Screen::Scoped;
-                            self.scoped_scroll = 0;
                         }
                     }
                     if self.selected >= self.specs.len() {
@@ -394,7 +443,7 @@ impl TuiApp {
                 Err(error) => self.status = error,
             },
             UiEvent::ReviewLoaded(result) => {
-                self.pending = false;
+                self.review_pending = false;
                 match result {
                     Ok(review) => {
                         self.review = Some(review);
@@ -406,20 +455,24 @@ impl TuiApp {
                     Err(error) => self.status = error,
                 }
             }
-            UiEvent::OperationDone(result) => {
-                self.pending = false;
-                self.active_control = None;
-                self.cancel_armed = false;
-                self.cancel_armed_until = None;
-                self.clarification = None;
+            UiEvent::OperationDone(run_id, result) => {
+                if let Some(run) = self.runs.get_mut(&run_id) {
+                    run.pending = false;
+                }
+                if self.cancel_armed_run == Some(run_id) {
+                    self.cancel_armed_run = None;
+                    self.cancel_armed_until = None;
+                }
                 match result {
                     Ok(summary) => {
-                        self.run_target = Some(summary.spec_path.to_string());
-                        self.run_signal = if summary.state == WorkflowState::Completed {
-                            "Workflow reached a verified done state".to_owned()
-                        } else {
-                            "Planning artifacts were updated".to_owned()
-                        };
+                        if let Some(run) = self.runs.get_mut(&run_id) {
+                            run.target = summary.spec_path.to_string();
+                            run.signal = if summary.state == WorkflowState::Completed {
+                                "Workflow reached a verified done state".to_owned()
+                            } else {
+                                "Planning artifacts were updated".to_owned()
+                            };
+                        }
                         self.status = format!("Updated {}", summary.spec_path);
                         self.focus_spec_path = Some(summary.spec_path.to_string());
                         self.notice = Some(Notice {
@@ -438,8 +491,10 @@ impl TuiApp {
                     }
                     Err(error) => {
                         self.status = error.clone();
-                        self.run_signal = error.clone();
-                        self.append_run_log(format!("error: {error}"));
+                        if let Some(run) = self.runs.get_mut(&run_id) {
+                            run.signal = error.clone();
+                        }
+                        self.append_run_log(run_id, format!("error: {error}"));
                         self.notice = Some(Notice {
                             tone: NoticeTone::Error,
                             message: error,
@@ -447,84 +502,107 @@ impl TuiApp {
                     }
                 }
             }
-            UiEvent::RunMessage(message) => self.apply_run_event(message),
-            UiEvent::ClarificationRequested(request, responder) => {
-                self.status = "Clarification required".to_owned();
-                self.run_signal = format!(
-                    "Waiting for your answer: {}",
-                    compact_text(&request.question, 72)
-                );
-                self.clarification_scroll = 0;
-                let mut input = TextArea::default();
-                input.set_block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Clarification")
-                        .border_type(BorderType::Rounded),
-                );
-                input.set_cursor_line_style(Style::default().fg(self.accent_color()));
-                self.clarification = Some(ClarificationModal {
+            UiEvent::RunMessage(run_id, message) => self.apply_run_event(run_id, message),
+            UiEvent::ClarificationRequested(run_id, request, responder) => {
+                self.enqueue_clarification(PendingClarification {
+                    run_id,
                     request,
                     responder,
-                    input,
                 });
             }
         }
     }
 
-    fn append_run_log(&mut self, line: String) {
-        self.run_logs.push(line);
-        self.run_follow = true;
-        self.run_scroll = u16::MAX;
+    fn append_run_log(&mut self, run_id: RunId, line: String) {
+        if let Some(run) = self.runs.get_mut(&run_id) {
+            run.logs.push(line);
+            run.follow = true;
+            run.scroll = u16::MAX;
+        }
     }
 
-    fn reset_run_view(&mut self, mode: RunnerMode, target: String) {
-        self.run_logs.clear();
-        self.run_scroll = 0;
-        self.run_follow = true;
-        self.run_mode = Some(mode);
-        self.run_iteration = None;
-        self.run_signal = "Waiting for first agent output".to_owned();
-        self.run_target = Some(target);
-        self.cancel_armed = false;
+    fn start_run(
+        &mut self,
+        mode: RunnerMode,
+        target: String,
+        status: String,
+    ) -> (RunId, RunControl) {
+        let run_id = self.next_run_id;
+        self.next_run_id = self.next_run_id.saturating_add(1);
+        let control = RunControl::new();
+        self.runs
+            .insert(run_id, RunSession::new(mode, target, control.clone()));
+        self.run_order.retain(|existing| *existing != run_id);
+        self.run_order.push(run_id);
+        self.screen = Screen::Running(run_id);
+        self.cancel_armed_run = None;
         self.cancel_armed_until = None;
+        self.status = status;
+        (run_id, control)
     }
 
-    fn apply_run_event(&mut self, event: RunEvent) {
+    fn apply_run_event(&mut self, run_id: RunId, event: RunEvent) {
         match event {
+            RunEvent::ArtifactsCreated {
+                spec_path,
+                progress_path,
+                feedback_path,
+            } => {
+                if let Some(run) = self.runs.get_mut(&run_id) {
+                    run.target = spec_path.clone();
+                    run.signal = "Planning artifacts stubbed on disk".to_owned();
+                }
+                self.status = format!("Tracking {spec_path}");
+                self.focus_spec_path = Some(spec_path);
+                self.notice = Some(Notice {
+                    tone: NoticeTone::Info,
+                    message: format!(
+                        "Stubbed planning files at {progress_path} and {feedback_path}"
+                    ),
+                });
+                self.load_specs();
+            }
             RunEvent::IterationStarted {
                 mode,
                 iteration,
                 max_iterations,
             } => {
-                self.run_mode = Some(mode);
-                self.run_iteration = Some((iteration, max_iterations));
-                self.run_signal = format!(
-                    "{} iteration {} of {} is running",
-                    mode_label(mode),
-                    iteration,
-                    max_iterations
+                if let Some(run) = self.runs.get_mut(&run_id) {
+                    run.mode = mode;
+                    run.iteration = Some((iteration, max_iterations));
+                    run.signal = format!(
+                        "{} iteration {} of {} is running",
+                        mode_label(mode),
+                        iteration,
+                        max_iterations
+                    );
+                }
+                self.append_run_log(
+                    run_id,
+                    format_iteration_banner(mode, iteration, max_iterations),
                 );
-                self.append_run_log(format_iteration_banner(mode, iteration, max_iterations));
             }
-            RunEvent::Stdout(chunk) => self.append_run_log(normalize_stream_chunk(&chunk)),
-            RunEvent::Stderr(chunk) => self.append_run_log(normalize_stream_chunk(&chunk)),
+            RunEvent::Output(chunk) => self.append_run_log(run_id, normalize_stream_chunk(&chunk)),
             RunEvent::Note(note) => {
-                self.run_signal = compact_text(&note, 88);
-                self.append_run_log(format!("note: {note}"));
+                if let Some(run) = self.runs.get_mut(&run_id) {
+                    run.signal = compact_text(&note, 88);
+                }
+                self.append_run_log(run_id, format!("note: {note}"));
             }
             RunEvent::Finished {
                 mode,
                 completed,
                 summary,
             } => {
-                self.run_mode = Some(mode);
-                self.run_signal = if completed {
-                    format!("{} finished with a done marker", mode_label(mode))
-                } else {
-                    format!("{} finished without a done marker", mode_label(mode))
-                };
-                self.append_run_log(summary);
+                if let Some(run) = self.runs.get_mut(&run_id) {
+                    run.mode = mode;
+                    run.signal = if completed {
+                        format!("{} finished with a done marker", mode_label(mode))
+                    } else {
+                        format!("{} finished without a done marker", mode_label(mode))
+                    };
+                }
+                self.append_run_log(run_id, summary);
                 self.status = format!(
                     "{} {}",
                     mode.as_str(),
@@ -539,11 +617,15 @@ impl TuiApp {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
-        if self.pending
-            && key.modifiers.contains(KeyModifiers::CONTROL)
+        if key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('c')
+            && self.focused_run_is_pending()
         {
             self.cancel_active_operation();
+            return;
+        }
+
+        if key.code == KeyCode::Esc && self.handle_escape() {
             return;
         }
 
@@ -557,7 +639,7 @@ impl TuiApp {
             Screen::Scoped => self.handle_scoped_key(key),
             Screen::Composer(_) => self.handle_composer_key(key),
             Screen::Review => self.handle_review_key(key),
-            Screen::Running => self.handle_running_key(key),
+            Screen::Running(_) => self.handle_running_key(key),
         }
     }
 
@@ -589,9 +671,11 @@ impl TuiApp {
             Screen::Review => {
                 self.review_scroll = apply_scroll_delta(self.review_scroll, delta, false);
             }
-            Screen::Running => {
-                self.run_follow = false;
-                self.run_scroll = apply_scroll_delta(self.run_scroll, delta, true);
+            Screen::Running(run_id) => {
+                if let Some(run) = self.runs.get_mut(&run_id) {
+                    run.follow = false;
+                    run.scroll = apply_scroll_delta(run.scroll, delta, true);
+                }
             }
         }
     }
@@ -605,7 +689,7 @@ impl TuiApp {
 
         match key.code {
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true
+                self.request_quit();
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.selected + 1 < self.specs.len() {
@@ -621,6 +705,10 @@ impl TuiApp {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && !self.specs.is_empty() =>
             {
                 self.screen = Screen::Scoped
+            }
+            KeyCode::Enter if !self.specs.is_empty() => self.screen = Screen::Scoped,
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.focus_run_for_selected_target();
             }
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.composer = fresh_composer("Create New Spec", self.accent_color());
@@ -651,8 +739,12 @@ impl TuiApp {
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.screen = Screen::Dashboard
             }
+            KeyCode::Enter => {
+                self.review_scroll = 0;
+                self.load_review(target)
+            }
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true
+                self.request_quit();
             }
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.review_scroll = 0;
@@ -674,6 +766,9 @@ impl TuiApp {
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cycle_coding_agent();
+            }
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.focus_run_for_selected_target();
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.scoped_scroll =
@@ -703,7 +798,7 @@ impl TuiApp {
                 self.status = "Planning request cannot be empty".to_owned();
                 return;
             }
-            match std::mem::replace(&mut self.screen, Screen::Running) {
+            match std::mem::replace(&mut self.screen, Screen::Dashboard) {
                 Screen::Composer(ComposerKind::Create) => self.run_create(request),
                 Screen::Composer(ComposerKind::Revise(target)) => self.run_revise(target, request),
                 Screen::Composer(ComposerKind::Replan(target)) => self.run_replan(target, request),
@@ -735,8 +830,8 @@ impl TuiApp {
                 self.review_scroll =
                     apply_scroll_delta(self.review_scroll, ScrollDelta::Lines(-5), false);
             }
-            KeyCode::Left => self.review_tab = 0,
-            KeyCode::Right => self.review_tab = 1,
+            KeyCode::Left => self.review_tab = self.review_tab.saturating_sub(1),
+            KeyCode::Right => self.review_tab = (self.review_tab + 1).min(2),
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.screen = Screen::Scoped
             }
@@ -746,8 +841,11 @@ impl TuiApp {
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.review_tab = 1
             }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.review_tab = 2
+            }
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true
+                self.request_quit();
             }
             _ => {}
         }
@@ -755,8 +853,10 @@ impl TuiApp {
 
     fn handle_running_key(&mut self, key: KeyEvent) {
         if let Some(delta) = scroll_delta(key) {
-            self.run_follow = matches!(delta, ScrollDelta::End);
-            self.run_scroll = apply_scroll_delta(self.run_scroll, delta, true);
+            if let Some(run) = self.current_run_mut() {
+                run.follow = matches!(delta, ScrollDelta::End);
+                run.scroll = apply_scroll_delta(run.scroll, delta, true);
+            }
             return;
         }
 
@@ -764,15 +864,11 @@ impl TuiApp {
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cycle_coding_agent();
             }
-            KeyCode::Char('w')
-                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.pending =>
-            {
-                self.screen = Screen::Scoped
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.screen = Screen::Dashboard
             }
-            KeyCode::Char('q')
-                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.pending =>
-            {
-                self.should_quit = true
+            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.request_quit();
             }
             _ => {}
         }
@@ -786,36 +882,50 @@ impl TuiApp {
             return;
         }
 
-        self.cancel_armed = false;
+        let run_id = self.cancel_armed_run.take();
         self.cancel_armed_until = None;
-        if self.pending {
+        if let Some(run_id) = run_id {
             self.status = "Kill disarmed".to_owned();
-            self.run_signal = "Kill disarmed after 2s window".to_owned();
-            self.append_run_log("kill disarmed after 2s window".to_owned());
+            if let Some(run) = self.runs.get_mut(&run_id) {
+                run.signal = "Kill disarmed after 2s window".to_owned();
+            }
+            self.append_run_log(run_id, "kill disarmed after 2s window".to_owned());
         }
     }
 
     fn cancel_active_operation(&mut self) {
         self.expire_cancel_arm_if_needed();
-        if let Some(control) = &self.active_control {
-            if control.is_force_cancelled() {
-                return;
-            }
-            if !self.cancel_armed {
-                self.cancel_armed = true;
-                self.cancel_armed_until = Some(Instant::now() + Duration::from_secs(2));
-                self.status = "Ctrl-C again to kill loop".to_owned();
-                self.run_signal = "Ctrl-C again to kill loop".to_owned();
-                self.append_run_log("kill armed; press Ctrl-C again to kill loop".to_owned());
-                return;
-            }
-
-            self.cancel_armed_until = None;
-            control.force_cancel();
-            self.status = "Force-killing agent subprocess…".to_owned();
-            self.run_signal = "Force kill requested".to_owned();
-            self.append_run_log("force kill requested".to_owned());
+        let Some(run_id) = self.current_run_id() else {
+            return;
+        };
+        let Some(control) = self.runs.get(&run_id).map(|run| run.control.clone()) else {
+            return;
+        };
+        if control.is_force_cancelled() {
+            return;
         }
+        if self.cancel_armed_run != Some(run_id) {
+            self.cancel_armed_run = Some(run_id);
+            self.cancel_armed_until = Some(Instant::now() + Duration::from_secs(2));
+            self.status = "Ctrl-C again to kill loop".to_owned();
+            if let Some(run) = self.runs.get_mut(&run_id) {
+                run.signal = "Ctrl-C again to kill loop".to_owned();
+            }
+            self.append_run_log(
+                run_id,
+                "kill armed; press Ctrl-C again to kill loop".to_owned(),
+            );
+            return;
+        }
+
+        self.cancel_armed_run = None;
+        self.cancel_armed_until = None;
+        control.force_cancel();
+        self.status = "Force-killing agent subprocess…".to_owned();
+        if let Some(run) = self.runs.get_mut(&run_id) {
+            run.signal = "Force kill requested".to_owned();
+        }
+        self.append_run_log(run_id, "force kill requested".to_owned());
     }
 
     fn handle_clarification_key(&mut self, key: KeyEvent) {
@@ -830,8 +940,21 @@ impl TuiApp {
 
         match key.code {
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !self.clarification_abort_armed {
+                    self.clarification_abort_armed = true;
+                    self.clarification_abort_armed_until =
+                        Some(Instant::now() + Duration::from_secs(2));
+                    self.status = "Ctrl-W again to abort clarification".to_owned();
+                    self.notice = Some(Notice {
+                        tone: NoticeTone::Info,
+                        message: "Clarification requires an explicit answer, or press Ctrl-W again to abort this run".to_owned(),
+                    });
+                    return;
+                }
+                self.reset_clarification_abort();
                 if let Some(modal) = self.clarification.take() {
                     let _ = modal.responder.send(None);
+                    self.show_next_clarification();
                 }
             }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -844,16 +967,39 @@ impl TuiApp {
                     self.clarification
                         .as_ref()
                         .and_then(|modal| modal.request.options.get(index.saturating_sub(1)))
-                        .map(|option| option.label.clone())
-                        .unwrap_or(raw_answer)
+                        .map(|option| ClarificationAnswer {
+                            text: option.label.clone(),
+                            used_option_selection: true,
+                        })
+                        .unwrap_or(ClarificationAnswer {
+                            text: raw_answer,
+                            used_option_selection: false,
+                        })
                 } else {
-                    raw_answer
+                    ClarificationAnswer {
+                        text: raw_answer,
+                        used_option_selection: false,
+                    }
                 };
+                if answer.text.trim().is_empty() {
+                    self.reset_clarification_abort();
+                    self.status = "Clarification answer required".to_owned();
+                    self.notice = Some(Notice {
+                        tone: NoticeTone::Error,
+                        message:
+                            "Provide a clarification answer or press Ctrl-W twice to abort the run"
+                                .to_owned(),
+                    });
+                    return;
+                }
                 if let Some(modal) = self.clarification.take() {
-                    let _ = modal.responder.send((!answer.is_empty()).then_some(answer));
+                    self.reset_clarification_abort();
+                    let _ = modal.responder.send(Some(answer));
+                    self.show_next_clarification();
                 }
             }
             _ => {
+                self.reset_clarification_abort();
                 if let Some(modal) = self.clarification.as_mut() {
                     modal.input.input(TextInput::from(key));
                 }
@@ -861,10 +1007,198 @@ impl TuiApp {
         }
     }
 
+    fn expire_clarification_abort_if_needed(&mut self) {
+        let Some(deadline) = self.clarification_abort_armed_until else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.reset_clarification_abort();
+    }
+
+    fn reset_clarification_abort(&mut self) {
+        self.clarification_abort_armed = false;
+        self.clarification_abort_armed_until = None;
+    }
+
     fn selected_target(&self) -> Option<String> {
         self.specs
             .get(self.selected)
             .map(|summary| summary.spec_path.to_string())
+    }
+
+    fn focused_run_is_pending(&self) -> bool {
+        self.current_run().map(|run| run.pending).unwrap_or(false)
+    }
+
+    fn request_quit(&mut self) {
+        let active_runs = self.active_run_count();
+        if active_runs > 0 {
+            self.status = format!(
+                "{active_runs} run{} still active",
+                if active_runs == 1 { "" } else { "s" }
+            );
+            self.notice = Some(Notice {
+                tone: NoticeTone::Info,
+                message: "Background runs stay attached until they finish or you cancel them"
+                    .to_owned(),
+            });
+            return;
+        }
+        self.should_quit = true;
+    }
+
+    fn focus_run_for_selected_target(&mut self) {
+        let Some(target) = self.selected_target() else {
+            self.status = "No selected workflow".to_owned();
+            return;
+        };
+
+        if let Some(run_id) = self.latest_run_for_target(&target) {
+            self.screen = Screen::Running(run_id);
+            return;
+        }
+
+        self.status = "No run stream for selected workflow".to_owned();
+        self.notice = Some(Notice {
+            tone: NoticeTone::Info,
+            message: "Start planning or building this workflow to open its stream".to_owned(),
+        });
+    }
+
+    fn latest_run_for_target(&self, target: &str) -> Option<RunId> {
+        self.run_order.iter().rev().copied().find(|run_id| {
+            self.runs
+                .get(run_id)
+                .is_some_and(|run| run.target == target)
+        })
+    }
+
+    fn handle_escape(&mut self) -> bool {
+        if self.clarification.is_some() {
+            self.handle_clarification_escape();
+            return true;
+        }
+
+        match self.screen {
+            Screen::Dashboard => false,
+            Screen::Scoped => {
+                self.screen = Screen::Dashboard;
+                true
+            }
+            Screen::Composer(ComposerKind::Create) => {
+                self.screen = Screen::Dashboard;
+                true
+            }
+            Screen::Composer(_) => {
+                self.screen = Screen::Scoped;
+                true
+            }
+            Screen::Review => {
+                self.screen = Screen::Scoped;
+                true
+            }
+            Screen::Running(_) => {
+                self.screen = Screen::Dashboard;
+                true
+            }
+        }
+    }
+
+    fn handle_clarification_escape(&mut self) {
+        if !self.clarification_abort_armed {
+            self.clarification_abort_armed = true;
+            self.clarification_abort_armed_until = Some(Instant::now() + Duration::from_secs(2));
+            self.status = "Esc again to abort clarification".to_owned();
+            self.notice = Some(Notice {
+                tone: NoticeTone::Info,
+                message: "Clarification requires an explicit answer, or press Esc again to abort this run".to_owned(),
+            });
+            return;
+        }
+
+        self.reset_clarification_abort();
+        if let Some(modal) = self.clarification.take() {
+            let _ = modal.responder.send(None);
+            self.show_next_clarification();
+        }
+    }
+
+    fn active_run_count(&self) -> usize {
+        self.runs.values().filter(|run| run.pending).count()
+    }
+
+    fn task_status(&self, summary: &SpecSummary) -> TaskStatus {
+        let active_mode = self.run_order.iter().rev().find_map(|run_id| {
+            let run = self.runs.get(run_id)?;
+            if run.pending && run.target == summary.spec_path.as_str() {
+                Some(run.mode)
+            } else {
+                None
+            }
+        });
+        task_status_for(summary.state, active_mode)
+    }
+
+    fn current_run_id(&self) -> Option<RunId> {
+        match self.screen {
+            Screen::Running(run_id) => Some(run_id),
+            _ => None,
+        }
+    }
+
+    fn current_run(&self) -> Option<&RunSession> {
+        self.current_run_id()
+            .and_then(|run_id| self.runs.get(&run_id))
+    }
+
+    fn current_run_mut(&mut self) -> Option<&mut RunSession> {
+        let run_id = self.current_run_id()?;
+        self.runs.get_mut(&run_id)
+    }
+
+    fn enqueue_clarification(&mut self, clarification: PendingClarification) {
+        if self.clarification.is_some() {
+            self.clarification_queue.push_back(clarification);
+            return;
+        }
+        self.open_clarification(clarification);
+    }
+
+    fn show_next_clarification(&mut self) {
+        if self.clarification.is_some() {
+            return;
+        }
+        if let Some(next) = self.clarification_queue.pop_front() {
+            self.open_clarification(next);
+        }
+    }
+
+    fn open_clarification(&mut self, clarification: PendingClarification) {
+        self.status = "Clarification required".to_owned();
+        self.reset_clarification_abort();
+        if let Some(run) = self.runs.get_mut(&clarification.run_id) {
+            run.signal = format!(
+                "Waiting for your answer: {}",
+                compact_text(&clarification.request.question, 72)
+            );
+        }
+        self.clarification_scroll = 0;
+        let mut input = TextArea::default();
+        input.set_block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Clarification")
+                .border_type(BorderType::Rounded),
+        );
+        input.set_cursor_line_style(Style::default().fg(self.accent_color()));
+        self.clarification = Some(ClarificationModal {
+            run_id: clarification.run_id,
+            request: clarification.request,
+            responder: clarification.responder,
+            input,
+        });
     }
 
     fn perform_edit(
@@ -911,16 +1245,17 @@ impl TuiApp {
                     .map_err(|error| error.to_string());
                 match revision {
                     Ok(Some(request)) => {
-                        let control = RunControl::new();
-                        self.pending = true;
-                        self.active_control = Some(control.clone());
-                        self.screen = Screen::Running;
-                        self.reset_run_view(RunnerMode::Plan, target.clone());
+                        let status = format!("Revising progress for {target}");
+                        let (run_id, control) =
+                            self.start_run(RunnerMode::Plan, target.clone(), status.clone());
                         self.status = format!("Revising progress for {target}");
                         let tx = self.tx.clone();
                         let app = self.app.clone();
                         self.handle.spawn(async move {
-                            let mut delegate = ChannelDelegate { tx: tx.clone() };
+                            let mut delegate = ChannelDelegate {
+                                tx: tx.clone(),
+                                run_id,
+                            };
                             let result = app
                                 .revise_progress_after_spec_edit_with_control(
                                     request,
@@ -929,7 +1264,7 @@ impl TuiApp {
                                 )
                                 .await
                                 .map_err(|error| error.to_string());
-                            let _ = tx.send(UiEvent::OperationDone(result));
+                            let _ = tx.send(UiEvent::OperationDone(run_id, result));
                         });
                     }
                     Ok(None) => {
@@ -968,16 +1303,16 @@ impl TuiApp {
     fn cycle_coding_agent(&mut self) {
         let next = self.coding_agent().next();
         self.app.set_coding_agent(next);
-        if let Some(control) = &self.active_control {
-            control.set_coding_agent(next);
-        }
         self.status = format!("Agent set to {}", next.label());
-        if self.pending && matches!(self.screen, Screen::Running) {
-            self.run_signal = format!("Next iteration will use {}", next.label());
-            self.append_run_log(format!(
+        if let Some(run) = self.current_run_mut().filter(|run| run.pending) {
+            run.control.set_coding_agent(next);
+            run.signal = format!("Next iteration will use {}", next.label());
+            run.logs.push(format!(
                 "agent switched to {}; next iteration will use it",
                 next.label()
             ));
+            run.follow = true;
+            run.scroll = u16::MAX;
         } else {
             self.notice = Some(Notice {
                 tone: NoticeTone::Info,
@@ -1018,7 +1353,7 @@ impl TuiApp {
             Screen::Scoped => self.draw_scoped(frame, chunks[content_index]),
             Screen::Composer(_) => self.draw_composer(frame, chunks[content_index]),
             Screen::Review => self.draw_review(frame, chunks[content_index]),
-            Screen::Running => self.draw_running(frame, chunks[content_index]),
+            Screen::Running(run_id) => self.draw_running(frame, chunks[content_index], run_id),
         }
 
         let footer = Paragraph::new(self.footer_text())
@@ -1064,9 +1399,10 @@ impl TuiApp {
             ),
             Span::styled(
                 format!(
-                    "active {}  ◆  completed {}  ◆  agent {}  ◆  {}",
+                    "active {}  ◆  completed {}  ◆  live runs {}  ◆  agent {}  ◆  {}",
                     active_count,
                     completed_count,
+                    self.active_run_count(),
                     self.coding_agent().label(),
                     self.app.project_dir()
                 ),
@@ -1127,6 +1463,7 @@ impl TuiApp {
             self.specs
                 .iter()
                 .map(|summary| {
+                    let task_status = self.task_status(summary);
                     let title = Line::from(vec![
                         Span::styled(
                             format!("{} ", state_badge(summary.state)),
@@ -1147,6 +1484,18 @@ impl TuiApp {
                                 .fg(self.text_color())
                                 .add_modifier(Modifier::BOLD),
                         ),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!(" {} ", task_status_label(task_status)),
+                            task_status_style(
+                                task_status,
+                                self.accent_color(),
+                                self.success_color(),
+                                self.warning_color(),
+                                self.muted_color(),
+                            )
+                            .add_modifier(Modifier::BOLD),
+                        ),
                     ]);
                     let meta = Line::from(vec![
                         Span::styled(
@@ -1158,6 +1507,10 @@ impl TuiApp {
                                 self.muted_color(),
                             )
                             .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("  ◆  {}", task_status_label(task_status)),
+                            Style::default().fg(self.muted_color()),
                         ),
                         Span::styled(
                             format!("  ◆  {}", summary.progress_path),
@@ -1191,21 +1544,30 @@ impl TuiApp {
         frame.render_stateful_widget(list, chunks[0], &mut list_state);
 
         let (preview_text, preview_source) = if let Some(summary) = self.specs.get(self.selected) {
+            let task_status = self.task_status(summary);
+            let feedback_display = feedback_display_string(&summary.feedback_preview);
             let source = format!(
-                "Shortcuts\nCtrl-N create  •  Ctrl-O open  •  Ctrl-A switch agent  •  Ctrl-L reload  •  Ctrl-Q quit\nScroll\nPgUp/PgDn/Home/End\n\n◆ Agent      {}\n◆ State      {}\n◆ Spec       {}\n◆ Progress   {}\n\n╭─ Spec Preview\n{}\n\n╭─ Progress Preview\n{}\n",
+                "Shortcuts\nCtrl-N create  •  Ctrl-O open  •  Ctrl-R selected stream  •  Ctrl-A switch agent  •  Ctrl-L reload  •  Ctrl-Q quit\nScroll\nPgUp/PgDn/Home/End\n\n◆ Agent      {}\n◆ Live Runs  {}\n◆ Status     {}\n◆ State      {}\n◆ Spec       {}\n◆ Progress   {}\n◆ Feedback   {}\n\n╭─ Spec Preview\n{}\n\n╭─ Progress Preview\n{}\n\n╭─ Feedback Preview\n{}\n",
                 self.coding_agent().label(),
+                self.active_run_count(),
+                task_status_label(task_status),
                 state_label(summary.state),
                 summary.spec_path,
                 summary.progress_path,
+                summary.feedback_path,
                 summary.spec_preview,
                 summary.progress_preview,
+                feedback_display,
             );
             let mut text = plain_text_from_string(format!(
-                "Shortcuts\nCtrl-N create  •  Ctrl-O open  •  Ctrl-A switch agent  •  Ctrl-L reload  •  Ctrl-Q quit\nScroll\nPgUp/PgDn/Home/End\n\n◆ Agent      {}\n◆ State      {}\n◆ Spec       {}\n◆ Progress   {}\n\n╭─ Spec Preview\n",
+                "Shortcuts\nCtrl-N create  •  Ctrl-O open  •  Ctrl-R selected stream  •  Ctrl-A switch agent  •  Ctrl-L reload  •  Ctrl-Q quit\nScroll\nPgUp/PgDn/Home/End\n\n◆ Agent      {}\n◆ Live Runs  {}\n◆ Status     {}\n◆ State      {}\n◆ Spec       {}\n◆ Progress   {}\n◆ Feedback   {}\n\n╭─ Spec Preview\n",
                 self.coding_agent().label(),
+                self.active_run_count(),
+                task_status_label(task_status),
                 state_label(summary.state),
                 summary.spec_path,
                 summary.progress_path,
+                summary.feedback_path,
             ));
             append_text(
                 &mut text,
@@ -1217,6 +1579,9 @@ impl TuiApp {
                 &mut text,
                 highlight_markdown(summary.progress_preview.as_str(), self.color_mode),
             );
+            text.lines.push(Line::raw(""));
+            text.lines.push(Line::raw("╭─ Feedback Preview"));
+            append_text(&mut text, plain_text_from_string(feedback_display));
             (text, source)
         } else {
             (
@@ -1284,6 +1649,10 @@ impl TuiApp {
                 Span::raw("  Back to dashboard"),
             ]),
             Line::from(vec![
+                Span::styled("Ctrl-R", key_style(self.muted_color())),
+                Span::raw("  Open selected task stream"),
+            ]),
+            Line::from(vec![
                 Span::styled("PgUp/PgDn", key_style(self.muted_color())),
                 Span::raw("  Scroll the detail pane"),
             ]),
@@ -1303,20 +1672,29 @@ impl TuiApp {
         frame.render_widget(action_panel, chunks[0]);
 
         let (contents_text, contents_source) = if let Some(summary) = summary {
+            let task_status = self.task_status(summary);
+            let feedback_display = feedback_display_string(&summary.feedback_preview);
             let source = format!(
-                "Shortcuts\nCtrl-B run  •  Ctrl-V review  •  Ctrl-E edit spec + revise progress  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-W back\nScroll\n↑/↓ or j/k line scroll  •  PgUp/PgDn/Home/End page scroll\n\n{}\n{}\n\n◆ Agent\n{}\n\n◆ State\n{}\n\n◆ Spec Preview\n{}\n\n◆ Progress Preview\n{}\n",
+                "Shortcuts\nCtrl-B run  •  Ctrl-V review  •  Ctrl-E edit spec + revise progress  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-R selected stream  •  Ctrl-W back\nScroll\n↑/↓ or j/k line scroll  •  PgUp/PgDn/Home/End page scroll\n\n{}\n{}\n{}\n\n◆ Agent\n{}\n\n◆ Live Runs\n{}\n\n◆ Status\n{}\n\n◆ State\n{}\n\n◆ Spec Preview\n{}\n\n◆ Progress Preview\n{}\n\n◆ Feedback Preview\n{}\n",
                 summary.spec_path,
                 summary.progress_path,
+                summary.feedback_path,
                 self.coding_agent().label(),
+                self.active_run_count(),
+                task_status_label(task_status),
                 state_label(summary.state),
                 summary.spec_preview,
                 summary.progress_preview,
+                feedback_display,
             );
             let mut text = plain_text_from_string(format!(
-                "Shortcuts\nCtrl-B run  •  Ctrl-V review  •  Ctrl-E edit spec + revise progress  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-W back\nScroll\n↑/↓ or j/k line scroll  •  PgUp/PgDn/Home/End page scroll\n\n{}\n{}\n\n◆ Agent\n{}\n\n◆ State\n{}\n\n◆ Spec Preview\n",
+                "Shortcuts\nCtrl-B run  •  Ctrl-V review  •  Ctrl-E edit spec + revise progress  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-R selected stream  •  Ctrl-W back\nScroll\n↑/↓ or j/k line scroll  •  PgUp/PgDn/Home/End page scroll\n\n{}\n{}\n{}\n\n◆ Agent\n{}\n\n◆ Live Runs\n{}\n\n◆ Status\n{}\n\n◆ State\n{}\n\n◆ Spec Preview\n",
                 summary.spec_path,
                 summary.progress_path,
+                summary.feedback_path,
                 self.coding_agent().label(),
+                self.active_run_count(),
+                task_status_label(task_status),
                 state_label(summary.state),
             ));
             append_text(
@@ -1329,6 +1707,9 @@ impl TuiApp {
                 &mut text,
                 highlight_markdown(summary.progress_preview.as_str(), self.color_mode),
             );
+            text.lines.push(Line::raw(""));
+            text.lines.push(Line::raw("◆ Feedback Preview"));
+            append_text(&mut text, plain_text_from_string(feedback_display));
             (text, source)
         } else {
             (
@@ -1387,7 +1768,7 @@ impl TuiApp {
         frame.render_widget(Clear, chunks[0]);
         frame.render_widget(Clear, chunks[1]);
 
-        let tabs = Tabs::new(vec!["Spec", "Progress"])
+        let tabs = Tabs::new(vec!["Spec", "Progress", "Feedback"])
             .select(self.review_tab)
             .block(
                 Block::default()
@@ -1403,24 +1784,34 @@ impl TuiApp {
             .style(Style::default().fg(self.muted_color()));
         frame.render_widget(tabs, chunks[0]);
 
-        let body = if self.review_tab == 0 {
-            &review.spec_contents
-        } else {
-            &review.progress_contents
+        let body = match self.review_tab {
+            0 => &review.spec_contents,
+            1 => &review.progress_contents,
+            _ => &review.feedback_contents,
         };
-        let paragraph = Paragraph::new(highlight_markdown(body, self.color_mode))
+        let rendered_body = if self.review_tab == 2 {
+            plain_text_from_string(feedback_display_string(body))
+        } else {
+            highlight_markdown(body, self.color_mode)
+        };
+        let scroll_source = if self.review_tab == 2 {
+            feedback_display_string(body)
+        } else {
+            body.to_owned()
+        };
+        let paragraph = Paragraph::new(rendered_body)
             .block(
                 Block::default()
                     .title(self.title_line(
                         "Body",
-                        "←/→ switch tab  •  ↑/↓ scroll 5 lines  •  Ctrl-H spec  •  Ctrl-L progress  •  Ctrl-W back  •  PgUp/PgDn or mouse scroll",
+                        "←/→ switch tab  •  ↑/↓ scroll 5 lines  •  Ctrl-H spec  •  Ctrl-L progress  •  Ctrl-F feedback  •  Ctrl-W back  •  PgUp/PgDn or mouse scroll",
                     ))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded),
             )
             .wrap(Wrap { trim: false });
         let max_scroll = max_scroll_for_text(
-            body,
+            &scroll_source,
             chunks[1].width.saturating_sub(2),
             chunks[1].height.saturating_sub(2),
         );
@@ -1431,19 +1822,22 @@ impl TuiApp {
         frame.render_widget(paragraph, chunks[1]);
     }
 
-    fn draw_running(&mut self, frame: &mut Frame, area: Rect) {
+    fn draw_running(&mut self, frame: &mut Frame, area: Rect, run_id: RunId) {
+        let Some(run) = self.runs.get(&run_id) else {
+            frame.render_widget(Paragraph::new("Run not found"), area);
+            return;
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(8), Constraint::Min(1)])
             .split(area);
         frame.render_widget(Clear, chunks[0]);
         frame.render_widget(Clear, chunks[1]);
-        let target = self.run_target.as_deref().unwrap_or("unknown");
         let header = Paragraph::new(Text::from(vec![
-            self.running_summary_line(),
+            self.running_summary_line(run_id, run),
             Line::from(vec![
                 Span::styled(" target ", key_style(self.subtle_color())),
-                Span::styled(target, Style::default().fg(self.text_color())),
+                Span::styled(&run.target, Style::default().fg(self.text_color())),
             ]),
             Line::from(vec![
                 Span::styled(" agent ", key_style(self.accent_color())),
@@ -1454,13 +1848,13 @@ impl TuiApp {
             ]),
             Line::from(vec![
                 Span::styled(" signal ", key_style(self.warning_color())),
-                Span::styled(&self.run_signal, Style::default().fg(self.text_color())),
+                Span::styled(&run.signal, Style::default().fg(self.text_color())),
             ]),
-            self.run_telemetry_line(),
+            self.run_telemetry_line(run),
             Line::from(vec![
                 Span::styled(" shortcuts ", key_style(self.muted_color())),
                 Span::styled(
-                    "Ctrl-A switch next agent  •  Ctrl-C arm kill  •  Ctrl-C again kills it  •  Ctrl-W back when idle  •  PgUp/PgDn/Home/End scroll",
+                    "Ctrl-A switch next agent  •  Ctrl-C arm kill  •  Ctrl-C again kills it  •  Ctrl-W back to plans  •  PgUp/PgDn/Home/End scroll",
                     Style::default().fg(self.muted_color()),
                 ),
             ]),
@@ -1473,19 +1867,23 @@ impl TuiApp {
         );
         frame.render_widget(header, chunks[0]);
 
-        let joined = self.run_logs.join("\n");
+        let joined = run.logs.join("\n");
         let body_width = chunks[1].width.saturating_sub(2);
         let body_height = chunks[1].height.saturating_sub(2);
         let wrapped_lines = wrap_visual_lines(&joined, body_width);
         let max_scroll = wrapped_lines
             .len()
             .saturating_sub(usize::from(body_height.max(1))) as u16;
-        if self.run_follow {
-            self.run_scroll = max_scroll;
-        } else if self.run_scroll > max_scroll {
-            self.run_scroll = max_scroll;
+        let mut run_scroll = run.scroll;
+        if run.follow {
+            run_scroll = max_scroll;
+        } else if run_scroll > max_scroll {
+            run_scroll = max_scroll;
         }
-        let start = usize::from(self.run_scroll.min(max_scroll));
+        if let Some(run) = self.runs.get_mut(&run_id) {
+            run.scroll = run_scroll;
+        }
+        let start = usize::from(run_scroll.min(max_scroll));
         let end = (start + usize::from(body_height.max(1))).min(wrapped_lines.len());
         let visible = if wrapped_lines.is_empty() {
             String::new()
@@ -1503,7 +1901,13 @@ impl TuiApp {
 
     fn draw_clarification(&mut self, frame: &mut Frame, area: Rect) {
         let warning_color = self.warning_color();
-        let title = self.title_line("Clarification", "Planner needs a decision");
+        let subtitle = self
+            .clarification
+            .as_ref()
+            .and_then(|modal| self.runs.get(&modal.run_id))
+            .map(|run| format!("Planner needs a decision for {}", run.target))
+            .unwrap_or_else(|| "Planner needs a decision".to_owned());
+        let title = self.title_line("Clarification", &subtitle);
         let Some(modal) = self.clarification.as_mut() else {
             return;
         };
@@ -1512,11 +1916,17 @@ impl TuiApp {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .constraints([
+                Constraint::Min(8),
+                Constraint::Length(5),
+                Constraint::Length(8),
+            ])
             .split(popup);
         frame.render_widget(Clear, chunks[0]);
         frame.render_widget(Clear, chunks[1]);
+        frame.render_widget(Clear, chunks[2]);
 
+        let top_source = clarification_body_text(&modal.request);
         let mut text = vec![
             Line::from(Span::styled(
                 "Clarification Required",
@@ -1536,11 +1946,6 @@ impl TuiApp {
                 option.description
             )));
         }
-        text.push(Line::from(""));
-        text.push(Line::from("Shortcuts"));
-        text.push(Line::from("1-9 type into the input box normally"));
-        text.push(Line::from("Ctrl-S submit typed number or free-form answer"));
-        text.push(Line::from("Ctrl-W cancel  •  PgUp/PgDn/Home/End scroll"));
 
         let top = Paragraph::new(text)
             .block(
@@ -1550,18 +1955,8 @@ impl TuiApp {
                     .border_type(BorderType::Rounded),
             )
             .wrap(Wrap { trim: true });
-        let modal_text = modal
-            .request
-            .options
-            .iter()
-            .enumerate()
-            .map(|(index, option)| {
-                format!("{}. {} - {}", index + 1, option.label, option.description)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
         let max_scroll = max_scroll_for_text(
-            &format!("{}\n{}", modal.request.question, modal_text),
+            &top_source,
             chunks[0].width.saturating_sub(2),
             chunks[0].height.saturating_sub(2),
         );
@@ -1570,17 +1965,26 @@ impl TuiApp {
         }
         let top = top.scroll((self.clarification_scroll, 0));
         frame.render_widget(top, chunks[0]);
-        frame.render_widget(&modal.input, chunks[1]);
+        let shortcuts = Paragraph::new(clarification_shortcuts_text())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Shortcuts")
+                    .border_type(BorderType::Rounded),
+            )
+            .wrap(Wrap { trim: true });
+        frame.render_widget(shortcuts, chunks[1]);
+        frame.render_widget(&modal.input, chunks[2]);
     }
 
     fn footer_text(&self) -> String {
         match self.screen {
             Screen::Dashboard => format!(
-                "{}    ◆  Ctrl-N create  •  Ctrl-O open  •  Ctrl-A switch agent  •  Ctrl-L reload  •  Ctrl-Q quit",
+                "{}    ◆  Ctrl-N create  •  Ctrl-O open  •  Ctrl-R selected stream  •  Ctrl-A switch agent  •  Ctrl-L reload  •  Ctrl-Q quit",
                 self.status
             ),
             Screen::Scoped => format!(
-                "{}    ◆  Ctrl-B run  •  Ctrl-V review  •  Ctrl-E edit spec + revise progress  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-W back  •  ↑/↓ scroll",
+                "{}    ◆  Ctrl-B run  •  Ctrl-V review  •  Ctrl-E edit spec + revise progress  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-R selected stream  •  Ctrl-W back  •  ↑/↓ scroll",
                 self.status
             ),
             Screen::Composer(_) => format!(
@@ -1588,26 +1992,28 @@ impl TuiApp {
                 self.status
             ),
             Screen::Review => format!(
-                "{}    ◆  ←/→ switch  •  ↑/↓ scroll  •  Ctrl-H spec  •  Ctrl-L progress  •  Ctrl-W back",
+                "{}    ◆  ←/→ switch  •  ↑/↓ scroll  •  Ctrl-H spec  •  Ctrl-L progress  •  Ctrl-F feedback  •  Ctrl-W back",
                 self.status
             ),
-            Screen::Running => format!(
-                "{}    ◆  Ctrl-A switch next agent  •  Ctrl-C arm kill  •  Ctrl-C again kills it  •  Ctrl-W back when idle  •  auto-follow on new output",
+            Screen::Running(_) => format!(
+                "{}    ◆  Ctrl-A switch next agent  •  Ctrl-C arm kill  •  Ctrl-C again kills it  •  Ctrl-W back to plans  •  auto-follow on new output",
                 self.status
             ),
         }
     }
 
-    fn running_summary_line(&self) -> Line<'static> {
-        let (status_label, status_style) = self.run_status_badge();
-        let indicator = self.run_indicator();
-        let (mode_text, iteration_text) = match (self.run_mode, self.run_iteration) {
-            (Some(mode), Some((iteration, max_iterations))) => (
-                mode_label(mode).to_owned(),
+    fn running_summary_line(&self, run_id: RunId, run: &RunSession) -> Line<'static> {
+        let (status_label, status_style) = self.run_status_badge(run_id, run);
+        let indicator = self.run_indicator(run_id, run);
+        let (mode_text, iteration_text) = match run.iteration {
+            Some((iteration, max_iterations)) => (
+                mode_label(run.mode).to_owned(),
                 format!("iteration {iteration}/{max_iterations}"),
             ),
-            (Some(mode), None) => (mode_label(mode).to_owned(), "waiting to start".to_owned()),
-            (None, _) => ("run".to_owned(), "no iteration yet".to_owned()),
+            None => (
+                mode_label(run.mode).to_owned(),
+                "waiting to start".to_owned(),
+            ),
         };
 
         Line::from(vec![
@@ -1634,7 +2040,7 @@ impl TuiApp {
             ),
             Span::raw(" "),
             Span::styled(
-                if self.run_follow {
+                if run.follow {
                     " follow latest "
                 } else {
                     " manual scroll "
@@ -1644,21 +2050,21 @@ impl TuiApp {
         ])
     }
 
-    fn run_telemetry_line(&self) -> Line<'static> {
-        let activity = if self.pending {
+    fn run_telemetry_line(&self, run: &RunSession) -> Line<'static> {
+        let activity = if run.pending {
             "agent live"
         } else {
             "agent idle"
         };
-        let scroll_mode = if self.run_follow {
+        let scroll_mode = if run.follow {
             "auto-follow locked"
         } else {
             "manual scroll"
         };
         let logs = format!(
             "{} log chunk{}",
-            self.run_logs.len(),
-            if self.run_logs.len() == 1 { "" } else { "s" }
+            run.logs.len(),
+            if run.logs.len() == 1 { "" } else { "s" }
         );
 
         Line::from(vec![
@@ -1671,13 +2077,17 @@ impl TuiApp {
         ])
     }
 
-    fn run_status_badge(&self) -> (&'static str, Style) {
-        if self.clarification.is_some() {
+    fn run_status_badge(&self, run_id: RunId, run: &RunSession) -> (&'static str, Style) {
+        if self
+            .clarification
+            .as_ref()
+            .is_some_and(|modal| modal.run_id == run_id)
+        {
             (
                 "WAITING",
                 Style::default().fg(Color::Black).bg(self.warning_color()),
             )
-        } else if self.pending {
+        } else if run.pending {
             (
                 "LIVE",
                 Style::default().fg(Color::Black).bg(self.success_color()),
@@ -1692,16 +2102,20 @@ impl TuiApp {
         }
     }
 
-    fn run_indicator(&self) -> Span<'static> {
+    fn run_indicator(&self, run_id: RunId, run: &RunSession) -> Span<'static> {
         let pulse_on = ((self.tick_count / 2) % 2) == 0;
-        if self.clarification.is_some() {
+        if self
+            .clarification
+            .as_ref()
+            .is_some_and(|modal| modal.run_id == run_id)
+        {
             Span::styled(
                 if pulse_on { "◉" } else { "◎" },
                 Style::default()
                     .fg(self.warning_color())
                     .add_modifier(Modifier::BOLD),
             )
-        } else if self.pending {
+        } else if run.pending {
             Span::styled(
                 if pulse_on { "●" } else { "◉" },
                 Style::default()
@@ -1789,20 +2203,28 @@ impl TuiApp {
 
 struct ChannelDelegate {
     tx: Sender<UiEvent>,
+    run_id: RunId,
 }
 
 #[async_trait]
 impl RunDelegate for ChannelDelegate {
     async fn on_event(&mut self, event: RunEvent) -> Result<()> {
         self.tx
-            .send(UiEvent::RunMessage(event))
+            .send(UiEvent::RunMessage(self.run_id, event))
             .map_err(|_| anyhow!("failed to send run event"))
     }
 
-    async fn ask_clarification(&mut self, request: ClarificationRequest) -> Result<Option<String>> {
+    async fn ask_clarification(
+        &mut self,
+        request: ClarificationRequest,
+    ) -> Result<Option<ClarificationAnswer>> {
         let (responder, receiver) = oneshot::channel();
         self.tx
-            .send(UiEvent::ClarificationRequested(request, responder))
+            .send(UiEvent::ClarificationRequested(
+                self.run_id,
+                request,
+                responder,
+            ))
             .map_err(|_| anyhow!("failed to open clarification modal"))?;
         receiver
             .await
@@ -1843,6 +2265,44 @@ fn state_style(state: WorkflowState, accent: Color, success: Color, muted: Color
         WorkflowState::Empty => Style::default().fg(muted),
         WorkflowState::Planned => Style::default().fg(accent),
         WorkflowState::Completed => Style::default().fg(success),
+    }
+}
+
+fn task_status_for(state: WorkflowState, active_mode: Option<RunnerMode>) -> TaskStatus {
+    match active_mode {
+        Some(RunnerMode::Plan) => TaskStatus::Planning,
+        Some(RunnerMode::Build) => TaskStatus::Building,
+        None => match state {
+            WorkflowState::Empty => TaskStatus::ToPlan,
+            WorkflowState::Planned => TaskStatus::ToBuild,
+            WorkflowState::Completed => TaskStatus::Idle,
+        },
+    }
+}
+
+fn task_status_label(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Planning => "PLANNING",
+        TaskStatus::Building => "BUILDING",
+        TaskStatus::ToPlan => "TO-PLAN",
+        TaskStatus::ToBuild => "TO-BUILD",
+        TaskStatus::Idle => "IDLE",
+    }
+}
+
+fn task_status_style(
+    status: TaskStatus,
+    accent: Color,
+    success: Color,
+    warning: Color,
+    muted: Color,
+) -> Style {
+    match status {
+        TaskStatus::Planning => Style::default().fg(Color::Black).bg(warning),
+        TaskStatus::Building => Style::default().fg(Color::Black).bg(success),
+        TaskStatus::ToPlan => Style::default().fg(muted),
+        TaskStatus::ToBuild => Style::default().fg(accent),
+        TaskStatus::Idle => Style::default().fg(success),
     }
 }
 
@@ -2234,6 +2694,69 @@ fn apply_scroll_delta(current: u16, delta: ScrollDelta, sticky_bottom: bool) -> 
     }
 }
 
+fn clarification_body_text(request: &ClarificationRequest) -> String {
+    let mut lines = vec![
+        "Clarification Required".to_owned(),
+        String::new(),
+        request.question.clone(),
+        String::new(),
+    ];
+    for (index, option) in request.options.iter().enumerate() {
+        lines.push(format!(
+            "{}. {} - {}",
+            index + 1,
+            option.label,
+            option.description
+        ));
+    }
+    lines.join("\n")
+}
+
+fn clarification_shortcuts_text() -> &'static str {
+    "1-9 type into input  •  Ctrl-S submit choice or free-form answer  •  Ctrl-W arm abort, Ctrl-W again aborts run  •  PgUp/PgDn/Home/End scroll"
+}
+
+fn feedback_display_string(contents: &str) -> String {
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_owned();
+    }
+
+    let recent = extract_feedback_section_for_display(
+        trimmed,
+        "<RECENT-USER-FEEDBACK>",
+        "</RECENT-USER-FEEDBACK>",
+    );
+    let older = extract_feedback_section_for_display(
+        trimmed,
+        "<OLDER-USER-FEEDBACK>",
+        "</OLDER-USER-FEEDBACK>",
+    );
+
+    match (recent, older) {
+        (Some(recent), Some(older)) => {
+            format!("Recent Feedback\n{}\n\nOlder Feedback\n{}", recent, older)
+        }
+        _ => trimmed.to_owned(),
+    }
+}
+
+fn extract_feedback_section_for_display(
+    contents: &str,
+    start_tag: &str,
+    end_tag: &str,
+) -> Option<String> {
+    let start = contents.find(start_tag)?;
+    let content_start = start + start_tag.len();
+    let end = contents[content_start..].find(end_tag)? + content_start;
+    let section = contents[content_start..end].trim();
+    Some(if section.is_empty() {
+        "None.".to_owned()
+    } else {
+        section.to_owned()
+    })
+}
+
 fn max_scroll_for_text(text: &str, width: u16, height: u16) -> u16 {
     let available_width = usize::from(width.max(1));
     let visible_lines = usize::from(height.max(1));
@@ -2312,9 +2835,11 @@ fn wrap_visual_lines(text: &str, width: u16) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColorMode, normalize_stream_chunk, parse_osc_hex_channel, parse_osc11_response,
-        wrap_visual_lines,
+        ColorMode, TaskStatus, clarification_body_text, clarification_shortcuts_text,
+        feedback_display_string, max_scroll_for_text, normalize_stream_chunk,
+        parse_osc_hex_channel, parse_osc11_response, task_status_for, wrap_visual_lines,
     };
+    use ralph_core::{ClarificationOption, ClarificationRequest, RunnerMode, WorkflowState};
 
     #[test]
     fn normalizes_carriage_returns_and_ansi_sequences() {
@@ -2344,5 +2869,86 @@ mod tests {
     fn normalizes_variable_length_osc_channels() {
         let value = parse_osc_hex_channel("ff").unwrap();
         assert!((value - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn task_status_prefers_live_run_mode() {
+        assert_eq!(
+            task_status_for(WorkflowState::Planned, Some(RunnerMode::Plan)),
+            TaskStatus::Planning
+        );
+        assert_eq!(
+            task_status_for(WorkflowState::Completed, Some(RunnerMode::Build)),
+            TaskStatus::Building
+        );
+    }
+
+    #[test]
+    fn task_status_falls_back_to_durable_state() {
+        assert_eq!(
+            task_status_for(WorkflowState::Empty, None),
+            TaskStatus::ToPlan
+        );
+        assert_eq!(
+            task_status_for(WorkflowState::Planned, None),
+            TaskStatus::ToBuild
+        );
+        assert_eq!(
+            task_status_for(WorkflowState::Completed, None),
+            TaskStatus::Idle
+        );
+    }
+
+    #[test]
+    fn clarification_scroll_accounts_for_shortcuts_and_options() {
+        let request = ClarificationRequest {
+            question: "Ciao! Vedo che vuoi lavorare sul progetto Numismatica. Per pianificare al meglio, ho bisogno di alcune precisazioni:".to_owned(),
+            options: vec![
+                ClarificationOption {
+                    label: "Importare dati monete".to_owned(),
+                    description:
+                        "Importare i dati esistenti da data_monete/ nel database SQLite"
+                            .to_owned(),
+                },
+                ClarificationOption {
+                    label: "Sviluppare nuove funzionalita".to_owned(),
+                    description:
+                        "Aggiungere pagine, componenti o funzionalita mancanti".to_owned(),
+                },
+                ClarificationOption {
+                    label: "Migliorare UI/UX".to_owned(),
+                    description: "Rifinire l'interfaccia utente e responsive design".to_owned(),
+                },
+                ClarificationOption {
+                    label: "Fix bug o problemi".to_owned(),
+                    description: "Risolvere bug conosciuti o problemi di funzionamento"
+                        .to_owned(),
+                },
+                ClarificationOption {
+                    label: "Setup/Configurazione".to_owned(),
+                    description: "Configurare ambiente, database e dipendenze".to_owned(),
+                },
+                ClarificationOption {
+                    label: "Altro".to_owned(),
+                    description: "Specifica tu cosa vuoi realizzare".to_owned(),
+                },
+            ],
+        };
+
+        let body = clarification_body_text(&request);
+        assert!(max_scroll_for_text(&body, 80, 12) > 0);
+        assert!(clarification_shortcuts_text().contains("Ctrl-S submit"));
+    }
+
+    #[test]
+    fn feedback_display_hides_structured_tags() {
+        let rendered = feedback_display_string(
+            "<RECENT-USER-FEEDBACK>\nQ: Which db?\nA: Postgres\n</RECENT-USER-FEEDBACK>\n\n<OLDER-USER-FEEDBACK>\nNone.\n</OLDER-USER-FEEDBACK>\n",
+        );
+        assert!(rendered.contains("Recent Feedback"));
+        assert!(rendered.contains("Older Feedback"));
+        assert!(rendered.contains("Q: Which db?"));
+        assert!(!rendered.contains("<RECENT-USER-FEEDBACK>"));
+        assert!(!rendered.contains("<OLDER-USER-FEEDBACK>"));
     }
 }
