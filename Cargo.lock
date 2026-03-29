@@ -915,6 +915,7 @@ dependencies = [
  "async-trait",
  "camino",
  "ralph-core",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

@@ -1,13 +1,15 @@
-use std::process::Stdio;
+use std::{env, process::Stdio};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use ralph_core::{PromptTransport, RunControl, RunnerConfig, RunnerInvocation, RunnerResult};
+use serde_json::json;
 use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::mpsc::{self, UnboundedSender},
+    task::JoinHandle,
     time::{Duration, sleep},
 };
 use tracing::debug;
@@ -67,6 +69,7 @@ impl RunnerAdapter for CommandRunner {
         };
 
         command.current_dir(invocation.project_dir.as_std_path());
+        command.kill_on_drop(true);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut envs = config
@@ -102,6 +105,12 @@ impl RunnerAdapter for CommandRunner {
         if let Some(prompt_file) = &prompt_file {
             envs.push(("RALPH_PROMPT_FILE".to_owned(), prompt_file.clone()));
         }
+        if should_inject_opencode_permissions(config, &envs) {
+            envs.push((
+                "OPENCODE_CONFIG_CONTENT".to_owned(),
+                opencode_auto_approve_config(),
+            ));
+        }
         command.envs(envs);
 
         if matches!(config.prompt_transport, PromptTransport::Stdin) {
@@ -133,6 +142,10 @@ impl RunnerAdapter for CommandRunner {
                 .write_all(invocation.prompt_text.as_bytes())
                 .await
                 .context("failed to write prompt to runner stdin")?;
+            stdin
+                .shutdown()
+                .await
+                .context("failed to close runner stdin after writing prompt")?;
         }
 
         let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
@@ -194,8 +207,8 @@ impl RunnerAdapter for CommandRunner {
             }
         };
 
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
+        await_stream_task(stdout_task, "stdout").await?;
+        await_stream_task(stderr_task, "stderr").await?;
         drop(temp_prompt);
 
         Ok(RunnerResult {
@@ -203,6 +216,13 @@ impl RunnerAdapter for CommandRunner {
             stderr: stderr_buffer,
             exit_code,
         })
+    }
+}
+
+async fn await_stream_task(task: JoinHandle<Result<()>>, name: &str) -> Result<()> {
+    match task.await {
+        Ok(result) => result.with_context(|| format!("runner {name} stream failed")),
+        Err(error) => Err(anyhow!("runner {name} stream task failed: {error}")),
     }
 }
 
@@ -236,6 +256,33 @@ where
     Ok(())
 }
 
+fn should_inject_opencode_permissions(config: &RunnerConfig, envs: &[(String, String)]) -> bool {
+    is_opencode_program(&config.program)
+        && !has_explicit_opencode_config(envs)
+        && env::var_os("OPENCODE_CONFIG").is_none()
+        && env::var_os("OPENCODE_CONFIG_CONTENT").is_none()
+}
+
+fn has_explicit_opencode_config(envs: &[(String, String)]) -> bool {
+    envs.iter()
+        .any(|(key, _)| matches!(key.as_str(), "OPENCODE_CONFIG" | "OPENCODE_CONFIG_CONTENT"))
+}
+
+fn is_opencode_program(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    name.strip_suffix(".exe")
+        .unwrap_or(name)
+        .eq_ignore_ascii_case("opencode")
+}
+
+fn opencode_auto_approve_config() -> String {
+    json!({
+        "$schema": "https://opencode.ai/config.json",
+        "permission": "allow",
+    })
+    .to_string()
+}
+
 fn render_template(
     template: &str,
     invocation: &RunnerInvocation,
@@ -254,6 +301,43 @@ fn render_template(
         rendered = rendered.replace(needle, value);
     }
     rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_explicit_opencode_config, is_opencode_program, opencode_auto_approve_config};
+
+    #[test]
+    fn detects_opencode_program_names() {
+        assert!(is_opencode_program("opencode"));
+        assert!(is_opencode_program("/usr/local/bin/opencode"));
+        assert!(is_opencode_program(r"C:\\Tools\\opencode.exe"));
+        assert!(!is_opencode_program("claude"));
+    }
+
+    #[test]
+    fn detects_explicit_opencode_overrides() {
+        assert!(has_explicit_opencode_config(&[(
+            "OPENCODE_CONFIG".to_owned(),
+            "/tmp/opencode.json".to_owned(),
+        )]));
+        assert!(has_explicit_opencode_config(&[(
+            "OPENCODE_CONFIG_CONTENT".to_owned(),
+            "{}".to_owned(),
+        )]));
+        assert!(!has_explicit_opencode_config(&[(
+            "RALPH_MODE".to_owned(),
+            "build".to_owned(),
+        )]));
+    }
+
+    #[test]
+    fn builds_allow_all_opencode_config() {
+        assert_eq!(
+            opencode_auto_approve_config(),
+            r#"{"$schema":"https://opencode.ai/config.json","permission":"allow"}"#
+        );
+    }
 }
 
 fn shell_command() -> Command {
