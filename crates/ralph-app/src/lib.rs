@@ -29,6 +29,22 @@ pub enum RunEvent {
     },
 }
 
+pub fn format_iteration_banner(
+    mode: RunnerMode,
+    iteration: usize,
+    max_iterations: usize,
+) -> String {
+    let title = format!(
+        " {} ITERATION {}/{} ",
+        mode.as_str().to_ascii_uppercase(),
+        iteration,
+        max_iterations
+    );
+    let width = title.len().max(44);
+    let rule = "=".repeat(width);
+    format!("\n{rule}\n{title:=^width$}\n{rule}", width = width)
+}
+
 #[async_trait]
 pub trait RunDelegate: Send {
     async fn on_event(&mut self, event: RunEvent) -> Result<()>;
@@ -601,7 +617,10 @@ impl RunDelegate for ConsoleDelegate {
                 iteration,
                 max_iterations,
             } => {
-                println!("[{} {}/{}]", mode.as_str(), iteration, max_iterations);
+                println!(
+                    "{}",
+                    format_iteration_banner(mode, iteration, max_iterations)
+                );
             }
             RunEvent::Stdout(chunk) => print!("{chunk}"),
             RunEvent::Stderr(chunk) => eprint!("{chunk}"),
@@ -1074,5 +1093,13 @@ mod tests {
                 .iter()
                 .any(|chunk| chunk.contains("started"))
         );
+    }
+
+    #[test]
+    fn iteration_banner_is_visually_distinct() {
+        let banner = format_iteration_banner(RunnerMode::Plan, 2, 8);
+        assert!(banner.starts_with('\n'));
+        assert!(banner.contains("PLAN ITERATION 2/8"));
+        assert_eq!(banner.lines().count(), 4);
     }
 }

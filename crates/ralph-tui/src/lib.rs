@@ -22,7 +22,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ralph_app::{RalphApp, RunDelegate, RunEvent};
+use ralph_app::{RalphApp, RunDelegate, RunEvent, format_iteration_banner};
 use ralph_core::{
     ClarificationRequest, ReviewData, RunControl, RunnerMode, SpecSummary, WorkflowState,
 };
@@ -495,12 +495,7 @@ impl TuiApp {
                     iteration,
                     max_iterations
                 );
-                self.append_run_log(format!(
-                    "[{} {}/{}]",
-                    mode.as_str(),
-                    iteration,
-                    max_iterations
-                ));
+                self.append_run_log(format_iteration_banner(mode, iteration, max_iterations));
             }
             RunEvent::Stdout(chunk) => self.append_run_log(normalize_stream_chunk(&chunk)),
             RunEvent::Stderr(chunk) => self.append_run_log(normalize_stream_chunk(&chunk)),
