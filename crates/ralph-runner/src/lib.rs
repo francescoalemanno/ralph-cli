@@ -7,10 +7,10 @@ use serde_json::json;
 use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::Command,
+    process::{Child, Command},
     sync::mpsc::{self, UnboundedSender},
     task::JoinHandle,
-    time::{Duration, sleep},
+    time::{Duration, sleep, timeout},
 };
 use tracing::debug;
 
@@ -68,6 +68,7 @@ impl RunnerAdapter for CommandRunner {
             command
         };
 
+        configure_process_group(&mut command);
         command.current_dir(invocation.project_dir.as_std_path());
         command.kill_on_drop(true);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -124,6 +125,7 @@ impl RunnerAdapter for CommandRunner {
         );
 
         let mut child = command.spawn().context("failed to spawn runner process")?;
+        let child_pid = child.id();
         let stdout = child
             .stdout
             .take()
@@ -154,14 +156,32 @@ impl RunnerAdapter for CommandRunner {
 
         let mut stdout_buffer = String::new();
         let mut stderr_buffer = String::new();
+        let mut sent_cancel_stage = 0_u8;
         let exit_code = loop {
-            if control.is_cancelled() {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+            let cancel_stage = control.cancel_stage();
+            if cancel_stage > sent_cancel_stage {
+                match cancel_stage {
+                    1 => interrupt_runner(&mut child, child_pid).await,
+                    _ => force_kill_runner(&mut child, child_pid).await,
+                }
+                sent_cancel_stage = cancel_stage;
+            }
+
+            if sent_cancel_stage >= 2 {
+                stdout_task.abort();
+                stderr_task.abort();
+                let _ = timeout(Duration::from_millis(250), child.wait()).await;
                 drop(temp_prompt);
                 return Err(anyhow!("runner canceled"));
+            }
+
+            if sent_cancel_stage >= 1 {
+                if child.try_wait().context("failed while polling canceled runner")?.is_some() {
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    drop(temp_prompt);
+                    return Err(anyhow!("runner canceled"));
+                }
             }
 
             if let Some(status) = child.try_wait().context("failed while polling runner")? {
@@ -254,6 +274,58 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn configure_process_group(command: &mut Command) {
+    use std::io;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut Command) {}
+
+async fn interrupt_runner(child: &mut Child, child_pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = child_pid {
+        let _ = signal_process_group(pid, libc::SIGINT);
+        return;
+    }
+
+    let _ = child.start_kill();
+}
+
+async fn force_kill_runner(child: &mut Child, child_pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = child_pid {
+        let _ = signal_process_group(pid, libc::SIGKILL);
+    }
+
+    let _ = child.start_kill();
+}
+
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: i32) -> Result<()> {
+    let result = unsafe { libc::kill(-(pid as i32), signal) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::ESRCH)) {
+        Ok(())
+    } else {
+        Err(anyhow!("failed to signal runner process group: {error}"))
+    }
 }
 
 fn should_inject_opencode_permissions(config: &RunnerConfig, envs: &[(String, String)]) -> bool {

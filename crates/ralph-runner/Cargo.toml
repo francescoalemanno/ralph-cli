@@ -7,6 +7,7 @@ edition.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 camino.workspace = true
+libc.workspace = true
 ralph-core = { path = "../ralph-core" }
 serde_json.workspace = true
 tempfile.workspace = true
