@@ -9,7 +9,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -24,7 +24,8 @@ use crossterm::{
 };
 use ralph_app::{RalphApp, RunDelegate, RunEvent, format_iteration_banner};
 use ralph_core::{
-    ClarificationRequest, ReviewData, RunControl, RunnerMode, SpecSummary, WorkflowState,
+    ClarificationRequest, CodingAgent, ReviewData, RunControl, RunnerMode, SpecSummary,
+    WorkflowState,
 };
 use ratatui::{
     Frame, Terminal,
@@ -141,6 +142,8 @@ struct TuiApp {
     run_signal: String,
     run_target: Option<String>,
     active_control: Option<RunControl>,
+    cancel_armed: bool,
+    cancel_armed_until: Option<Instant>,
     pending: bool,
     tick_count: u64,
     color_mode: ColorMode,
@@ -185,6 +188,8 @@ impl TuiApp {
             run_signal: "Idle".to_owned(),
             run_target: None,
             active_control: None,
+            cancel_armed: false,
+            cancel_armed_until: None,
             pending: false,
             tick_count: 0,
             color_mode,
@@ -350,7 +355,7 @@ impl TuiApp {
     }
 
     fn run_edit(&mut self, target: String) {
-        self.status = format!("Opening editor for {target}");
+        self.status = format!("Editing spec for {target}");
         self.pending_editor_target = Some(target);
     }
 
@@ -358,6 +363,7 @@ impl TuiApp {
         match event {
             UiEvent::Tick => {
                 self.tick_count = self.tick_count.wrapping_add(1);
+                self.expire_cancel_arm_if_needed();
             }
             UiEvent::Resize => {}
             UiEvent::Key(key) => self.handle_key(key),
@@ -403,6 +409,8 @@ impl TuiApp {
             UiEvent::OperationDone(result) => {
                 self.pending = false;
                 self.active_control = None;
+                self.cancel_armed = false;
+                self.cancel_armed_until = None;
                 self.clarification = None;
                 match result {
                     Ok(summary) => {
@@ -478,6 +486,8 @@ impl TuiApp {
         self.run_iteration = None;
         self.run_signal = "Waiting for first agent output".to_owned();
         self.run_target = Some(target);
+        self.cancel_armed = false;
+        self.cancel_armed_until = None;
     }
 
     fn apply_run_event(&mut self, event: RunEvent) {
@@ -616,6 +626,9 @@ impl TuiApp {
                 self.composer = fresh_composer("Create New Spec", self.accent_color());
                 self.screen = Screen::Composer(ComposerKind::Create);
             }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cycle_coding_agent();
+            }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.load_specs()
             }
@@ -659,6 +672,9 @@ impl TuiApp {
                 self.composer = fresh_composer("Replan From Scratch", self.accent_color());
                 self.screen = Screen::Composer(ComposerKind::Replan(target));
             }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cycle_coding_agent();
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.scoped_scroll =
                     apply_scroll_delta(self.scoped_scroll, ScrollDelta::Lines(1), false);
@@ -693,6 +709,11 @@ impl TuiApp {
                 Screen::Composer(ComposerKind::Replan(target)) => self.run_replan(target, request),
                 other => self.screen = other,
             }
+            return;
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
+            self.cycle_coding_agent();
             return;
         }
 
@@ -740,6 +761,9 @@ impl TuiApp {
         }
 
         match key.code {
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cycle_coding_agent();
+            }
             KeyCode::Char('w')
                 if key.modifiers.contains(KeyModifiers::CONTROL) && !self.pending =>
             {
@@ -754,13 +778,43 @@ impl TuiApp {
         }
     }
 
+    fn expire_cancel_arm_if_needed(&mut self) {
+        let Some(deadline) = self.cancel_armed_until else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+
+        self.cancel_armed = false;
+        self.cancel_armed_until = None;
+        if self.pending {
+            self.status = "Kill disarmed".to_owned();
+            self.run_signal = "Kill disarmed after 2s window".to_owned();
+            self.append_run_log("kill disarmed after 2s window".to_owned());
+        }
+    }
+
     fn cancel_active_operation(&mut self) {
+        self.expire_cancel_arm_if_needed();
         if let Some(control) = &self.active_control {
-            control.cancel();
-            self.status = "Canceling agent subprocess…".to_owned();
-            self.run_signal =
-                "Cancellation requested; waiting for the subprocess to stop".to_owned();
-            self.append_run_log("cancel requested".to_owned());
+            if control.is_force_cancelled() {
+                return;
+            }
+            if !self.cancel_armed {
+                self.cancel_armed = true;
+                self.cancel_armed_until = Some(Instant::now() + Duration::from_secs(2));
+                self.status = "Ctrl-C again to kill loop".to_owned();
+                self.run_signal = "Ctrl-C again to kill loop".to_owned();
+                self.append_run_log("kill armed; press Ctrl-C again to kill loop".to_owned());
+                return;
+            }
+
+            self.cancel_armed_until = None;
+            control.force_cancel();
+            self.status = "Force-killing agent subprocess…".to_owned();
+            self.run_signal = "Force kill requested".to_owned();
+            self.append_run_log("force kill requested".to_owned());
         }
     }
 
@@ -818,6 +872,22 @@ impl TuiApp {
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
         target: String,
     ) -> Result<()> {
+        let session = self
+            .app
+            .begin_spec_edit(&target)
+            .map_err(|error| error.to_string());
+        let session = match session {
+            Ok(session) => session,
+            Err(error) => {
+                self.status = error.clone();
+                self.notice = Some(Notice {
+                    tone: NoticeTone::Error,
+                    message: error,
+                });
+                return Ok(());
+            }
+        };
+
         self.input_suspended.store(true, Ordering::SeqCst);
         if let Err(error) = suspend_terminal(terminal) {
             self.input_suspended.store(false, Ordering::SeqCst);
@@ -825,7 +895,7 @@ impl TuiApp {
         }
         let result = self
             .app
-            .edit_target(&target)
+            .edit_spec_session(&session)
             .map_err(|error| error.to_string());
         if let Err(error) = resume_terminal(terminal) {
             self.input_suspended.store(false, Ordering::SeqCst);
@@ -835,12 +905,49 @@ impl TuiApp {
 
         match result {
             Ok(()) => {
-                self.status = "Editor exited".to_owned();
-                self.notice = Some(Notice {
-                    tone: NoticeTone::Info,
-                    message: "Editor closed".to_owned(),
-                });
-                self.load_specs();
+                let revision = self
+                    .app
+                    .finish_spec_edit(session)
+                    .map_err(|error| error.to_string());
+                match revision {
+                    Ok(Some(request)) => {
+                        let control = RunControl::new();
+                        self.pending = true;
+                        self.active_control = Some(control.clone());
+                        self.screen = Screen::Running;
+                        self.reset_run_view(RunnerMode::Plan, target.clone());
+                        self.status = format!("Revising progress for {target}");
+                        let tx = self.tx.clone();
+                        let app = self.app.clone();
+                        self.handle.spawn(async move {
+                            let mut delegate = ChannelDelegate { tx: tx.clone() };
+                            let result = app
+                                .revise_progress_after_spec_edit_with_control(
+                                    request,
+                                    control,
+                                    &mut delegate,
+                                )
+                                .await
+                                .map_err(|error| error.to_string());
+                            let _ = tx.send(UiEvent::OperationDone(result));
+                        });
+                    }
+                    Ok(None) => {
+                        self.status = "Spec unchanged".to_owned();
+                        self.notice = Some(Notice {
+                            tone: NoticeTone::Info,
+                            message: "Editor closed without spec changes".to_owned(),
+                        });
+                        self.load_specs();
+                    }
+                    Err(error) => {
+                        self.status = error.clone();
+                        self.notice = Some(Notice {
+                            tone: NoticeTone::Error,
+                            message: error,
+                        });
+                    }
+                }
             }
             Err(error) => {
                 self.status = error.clone();
@@ -852,6 +959,31 @@ impl TuiApp {
         }
 
         Ok(())
+    }
+
+    fn coding_agent(&self) -> CodingAgent {
+        self.app.coding_agent()
+    }
+
+    fn cycle_coding_agent(&mut self) {
+        let next = self.coding_agent().next();
+        self.app.set_coding_agent(next);
+        if let Some(control) = &self.active_control {
+            control.set_coding_agent(next);
+        }
+        self.status = format!("Agent set to {}", next.label());
+        if self.pending && matches!(self.screen, Screen::Running) {
+            self.run_signal = format!("Next iteration will use {}", next.label());
+            self.append_run_log(format!(
+                "agent switched to {}; next iteration will use it",
+                next.label()
+            ));
+        } else {
+            self.notice = Some(Notice {
+                tone: NoticeTone::Info,
+                message: format!("Planner and builder now use {}", next.label()),
+            });
+        }
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -932,9 +1064,10 @@ impl TuiApp {
             ),
             Span::styled(
                 format!(
-                    "active {}  ◆  completed {}  ◆  {}",
+                    "active {}  ◆  completed {}  ◆  agent {}  ◆  {}",
                     active_count,
                     completed_count,
+                    self.coding_agent().label(),
                     self.app.project_dir()
                 ),
                 Style::default().fg(self.muted_color()),
@@ -1059,7 +1192,8 @@ impl TuiApp {
 
         let (preview_text, preview_source) = if let Some(summary) = self.specs.get(self.selected) {
             let source = format!(
-                "Shortcuts\nCtrl-N create  •  Ctrl-O open  •  Ctrl-L reload  •  Ctrl-Q quit\nScroll\nPgUp/PgDn/Home/End\n\n◆ State      {}\n◆ Spec       {}\n◆ Progress   {}\n\n╭─ Spec Preview\n{}\n\n╭─ Progress Preview\n{}\n",
+                "Shortcuts\nCtrl-N create  •  Ctrl-O open  •  Ctrl-A switch agent  •  Ctrl-L reload  •  Ctrl-Q quit\nScroll\nPgUp/PgDn/Home/End\n\n◆ Agent      {}\n◆ State      {}\n◆ Spec       {}\n◆ Progress   {}\n\n╭─ Spec Preview\n{}\n\n╭─ Progress Preview\n{}\n",
+                self.coding_agent().label(),
                 state_label(summary.state),
                 summary.spec_path,
                 summary.progress_path,
@@ -1067,7 +1201,8 @@ impl TuiApp {
                 summary.progress_preview,
             );
             let mut text = plain_text_from_string(format!(
-                "Shortcuts\nCtrl-N create  •  Ctrl-O open  •  Ctrl-L reload  •  Ctrl-Q quit\nScroll\nPgUp/PgDn/Home/End\n\n◆ State      {}\n◆ Spec       {}\n◆ Progress   {}\n\n╭─ Spec Preview\n",
+                "Shortcuts\nCtrl-N create  •  Ctrl-O open  •  Ctrl-A switch agent  •  Ctrl-L reload  •  Ctrl-Q quit\nScroll\nPgUp/PgDn/Home/End\n\n◆ Agent      {}\n◆ State      {}\n◆ Spec       {}\n◆ Progress   {}\n\n╭─ Spec Preview\n",
+                self.coding_agent().label(),
                 state_label(summary.state),
                 summary.spec_path,
                 summary.progress_path,
@@ -1129,7 +1264,11 @@ impl TuiApp {
             ]),
             Line::from(vec![
                 Span::styled("Ctrl-E", key_style(self.accent_color())),
-                Span::raw("  Open spec in $EDITOR"),
+                Span::raw("  Edit spec, then revise progress"),
+            ]),
+            Line::from(vec![
+                Span::styled("Ctrl-A", key_style(self.warning_color())),
+                Span::raw("  Switch coding agent"),
             ]),
             Line::from(vec![
                 Span::styled("Ctrl-U", key_style(self.warning_color())),
@@ -1165,17 +1304,19 @@ impl TuiApp {
 
         let (contents_text, contents_source) = if let Some(summary) = summary {
             let source = format!(
-                "Shortcuts\nCtrl-B run  •  Ctrl-V review  •  Ctrl-E edit  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-W back\nScroll\n↑/↓ or j/k line scroll  •  PgUp/PgDn/Home/End page scroll\n\n{}\n{}\n\n◆ State\n{}\n\n◆ Spec Preview\n{}\n\n◆ Progress Preview\n{}\n",
+                "Shortcuts\nCtrl-B run  •  Ctrl-V review  •  Ctrl-E edit spec + revise progress  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-W back\nScroll\n↑/↓ or j/k line scroll  •  PgUp/PgDn/Home/End page scroll\n\n{}\n{}\n\n◆ Agent\n{}\n\n◆ State\n{}\n\n◆ Spec Preview\n{}\n\n◆ Progress Preview\n{}\n",
                 summary.spec_path,
                 summary.progress_path,
+                self.coding_agent().label(),
                 state_label(summary.state),
                 summary.spec_preview,
                 summary.progress_preview,
             );
             let mut text = plain_text_from_string(format!(
-                "Shortcuts\nCtrl-B run  •  Ctrl-V review  •  Ctrl-E edit  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-W back\nScroll\n↑/↓ or j/k line scroll  •  PgUp/PgDn/Home/End page scroll\n\n{}\n{}\n\n◆ State\n{}\n\n◆ Spec Preview\n",
+                "Shortcuts\nCtrl-B run  •  Ctrl-V review  •  Ctrl-E edit spec + revise progress  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-W back\nScroll\n↑/↓ or j/k line scroll  •  PgUp/PgDn/Home/End page scroll\n\n{}\n{}\n\n◆ Agent\n{}\n\n◆ State\n{}\n\n◆ Spec Preview\n",
                 summary.spec_path,
                 summary.progress_path,
+                self.coding_agent().label(),
                 state_label(summary.state),
             ));
             append_text(
@@ -1221,7 +1362,13 @@ impl TuiApp {
         self.composer.set_block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(self.title_line("Planning Request", "Ctrl-S submit  •  Ctrl-W cancel"))
+                .title(self.title_line(
+                    "Planning Request",
+                    &format!(
+                        "agent {}  •  Ctrl-S submit  •  Ctrl-A switch  •  Ctrl-W cancel",
+                        self.coding_agent().label()
+                    ),
+                ))
                 .border_type(BorderType::Rounded),
         );
         frame.render_widget(&self.composer, area);
@@ -1287,7 +1434,7 @@ impl TuiApp {
     fn draw_running(&mut self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(7), Constraint::Min(1)])
+            .constraints([Constraint::Length(8), Constraint::Min(1)])
             .split(area);
         frame.render_widget(Clear, chunks[0]);
         frame.render_widget(Clear, chunks[1]);
@@ -1299,6 +1446,13 @@ impl TuiApp {
                 Span::styled(target, Style::default().fg(self.text_color())),
             ]),
             Line::from(vec![
+                Span::styled(" agent ", key_style(self.accent_color())),
+                Span::styled(
+                    self.coding_agent().label(),
+                    Style::default().fg(self.text_color()),
+                ),
+            ]),
+            Line::from(vec![
                 Span::styled(" signal ", key_style(self.warning_color())),
                 Span::styled(&self.run_signal, Style::default().fg(self.text_color())),
             ]),
@@ -1306,7 +1460,7 @@ impl TuiApp {
             Line::from(vec![
                 Span::styled(" shortcuts ", key_style(self.muted_color())),
                 Span::styled(
-                    "Ctrl-C cancel agent  •  Ctrl-W back when idle  •  PgUp/PgDn/Home/End scroll",
+                    "Ctrl-A switch next agent  •  Ctrl-C arm kill  •  Ctrl-C again kills it  •  Ctrl-W back when idle  •  PgUp/PgDn/Home/End scroll",
                     Style::default().fg(self.muted_color()),
                 ),
             ]),
@@ -1422,20 +1576,23 @@ impl TuiApp {
     fn footer_text(&self) -> String {
         match self.screen {
             Screen::Dashboard => format!(
-                "{}    ◆  Ctrl-N create  •  Ctrl-O open  •  Ctrl-L reload  •  Ctrl-Q quit",
+                "{}    ◆  Ctrl-N create  •  Ctrl-O open  •  Ctrl-A switch agent  •  Ctrl-L reload  •  Ctrl-Q quit",
                 self.status
             ),
             Screen::Scoped => format!(
-                "{}    ◆  Ctrl-B run  •  Ctrl-V review  •  Ctrl-E edit  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-W back  •  ↑/↓ scroll",
+                "{}    ◆  Ctrl-B run  •  Ctrl-V review  •  Ctrl-E edit spec + revise progress  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-W back  •  ↑/↓ scroll",
                 self.status
             ),
-            Screen::Composer(_) => format!("{}    ◆  Ctrl-S submit  •  Ctrl-W cancel", self.status),
+            Screen::Composer(_) => format!(
+                "{}    ◆  Ctrl-S submit  •  Ctrl-A switch agent  •  Ctrl-W cancel",
+                self.status
+            ),
             Screen::Review => format!(
                 "{}    ◆  ←/→ switch  •  ↑/↓ scroll  •  Ctrl-H spec  •  Ctrl-L progress  •  Ctrl-W back",
                 self.status
             ),
             Screen::Running => format!(
-                "{}    ◆  Ctrl-C cancel agent  •  Ctrl-W back when idle  •  auto-follow on new output",
+                "{}    ◆  Ctrl-A switch next agent  •  Ctrl-C arm kill  •  Ctrl-C again kills it  •  Ctrl-W back when idle  •  auto-follow on new output",
                 self.status
             ),
         }
