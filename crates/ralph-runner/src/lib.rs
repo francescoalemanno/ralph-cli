@@ -16,8 +16,7 @@ use tracing::debug;
 
 #[derive(Debug, Clone)]
 pub enum RunnerStreamEvent {
-    Stdout(String),
-    Stderr(String),
+    Output(String),
 }
 
 #[async_trait]
@@ -151,11 +150,10 @@ impl RunnerAdapter for CommandRunner {
         }
 
         let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
-        let stdout_task = tokio::spawn(read_stream(stdout, true, chunk_tx.clone()));
-        let stderr_task = tokio::spawn(read_stream(stderr, false, chunk_tx));
+        let stdout_task = tokio::spawn(read_stream(stdout, chunk_tx.clone()));
+        let stderr_task = tokio::spawn(read_stream(stderr, chunk_tx));
 
-        let mut stdout_buffer = String::new();
-        let mut stderr_buffer = String::new();
+        let mut output_buffer = String::new();
         let mut sent_cancel_stage = 0_u8;
         let exit_code = loop {
             let cancel_stage = control.cancel_stage();
@@ -176,7 +174,11 @@ impl RunnerAdapter for CommandRunner {
             }
 
             if sent_cancel_stage >= 1 {
-                if child.try_wait().context("failed while polling canceled runner")?.is_some() {
+                if child
+                    .try_wait()
+                    .context("failed while polling canceled runner")?
+                    .is_some()
+                {
                     stdout_task.abort();
                     stderr_task.abort();
                     drop(temp_prompt);
@@ -186,19 +188,10 @@ impl RunnerAdapter for CommandRunner {
 
             if let Some(status) = child.try_wait().context("failed while polling runner")? {
                 while let Some(event) = chunk_rx.recv().await {
-                    match event {
-                        RunnerStreamEvent::Stdout(chunk) => {
-                            stdout_buffer.push_str(&chunk);
-                            if let Some(tx) = &stream {
-                                let _ = tx.send(RunnerStreamEvent::Stdout(chunk));
-                            }
-                        }
-                        RunnerStreamEvent::Stderr(chunk) => {
-                            stderr_buffer.push_str(&chunk);
-                            if let Some(tx) = &stream {
-                                let _ = tx.send(RunnerStreamEvent::Stderr(chunk));
-                            }
-                        }
+                    let RunnerStreamEvent::Output(chunk) = event;
+                    output_buffer.push_str(&chunk);
+                    if let Some(tx) = &stream {
+                        let _ = tx.send(RunnerStreamEvent::Output(chunk));
                     }
                 }
                 break status.code().unwrap_or(-1);
@@ -207,19 +200,10 @@ impl RunnerAdapter for CommandRunner {
             tokio::select! {
                 maybe = chunk_rx.recv() => {
                     if let Some(event) = maybe {
-                        match event {
-                            RunnerStreamEvent::Stdout(chunk) => {
-                                stdout_buffer.push_str(&chunk);
-                                if let Some(tx) = &stream {
-                                    let _ = tx.send(RunnerStreamEvent::Stdout(chunk));
-                                }
-                            }
-                            RunnerStreamEvent::Stderr(chunk) => {
-                                stderr_buffer.push_str(&chunk);
-                                if let Some(tx) = &stream {
-                                    let _ = tx.send(RunnerStreamEvent::Stderr(chunk));
-                                }
-                            }
+                        let RunnerStreamEvent::Output(chunk) = event;
+                        output_buffer.push_str(&chunk);
+                        if let Some(tx) = &stream {
+                            let _ = tx.send(RunnerStreamEvent::Output(chunk));
                         }
                     }
                 }
@@ -232,8 +216,7 @@ impl RunnerAdapter for CommandRunner {
         drop(temp_prompt);
 
         Ok(RunnerResult {
-            stdout: stdout_buffer,
-            stderr: stderr_buffer,
+            output: output_buffer,
             exit_code,
         })
     }
@@ -246,11 +229,7 @@ async fn await_stream_task(task: JoinHandle<Result<()>>, name: &str) -> Result<(
     }
 }
 
-async fn read_stream<R>(
-    mut reader: R,
-    is_stdout: bool,
-    tx: UnboundedSender<RunnerStreamEvent>,
-) -> Result<()>
+async fn read_stream<R>(mut reader: R, tx: UnboundedSender<RunnerStreamEvent>) -> Result<()>
 where
     R: AsyncRead + Unpin,
 {
@@ -264,12 +243,7 @@ where
             break;
         }
         let chunk = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
-        let event = if is_stdout {
-            RunnerStreamEvent::Stdout(chunk)
-        } else {
-            RunnerStreamEvent::Stderr(chunk)
-        };
-        if tx.send(event).is_err() {
+        if tx.send(RunnerStreamEvent::Output(chunk)).is_err() {
             break;
         }
     }
