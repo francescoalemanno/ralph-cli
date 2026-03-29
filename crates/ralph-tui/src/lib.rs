@@ -23,7 +23,9 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ralph_app::{RalphApp, RunDelegate, RunEvent};
-use ralph_core::{ClarificationRequest, ReviewData, RunControl, SpecSummary, WorkflowState};
+use ralph_core::{
+    ClarificationRequest, ReviewData, RunControl, RunnerMode, SpecSummary, WorkflowState,
+};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -134,9 +136,13 @@ struct TuiApp {
     run_logs: Vec<String>,
     run_scroll: u16,
     run_follow: bool,
+    run_mode: Option<RunnerMode>,
+    run_iteration: Option<(usize, usize)>,
+    run_signal: String,
     run_target: Option<String>,
     active_control: Option<RunControl>,
     pending: bool,
+    tick_count: u64,
     color_mode: ColorMode,
     clarification: Option<ClarificationModal>,
     clarification_scroll: u16,
@@ -174,9 +180,13 @@ impl TuiApp {
             run_logs: Vec::new(),
             run_scroll: 0,
             run_follow: true,
+            run_mode: None,
+            run_iteration: None,
+            run_signal: "Idle".to_owned(),
             run_target: None,
             active_control: None,
             pending: false,
+            tick_count: 0,
             color_mode,
             clarification: None,
             clarification_scroll: 0,
@@ -268,10 +278,7 @@ impl TuiApp {
         self.pending = true;
         self.active_control = Some(control.clone());
         self.screen = Screen::Running;
-        self.run_target = Some("new spec".to_owned());
-        self.run_logs.clear();
-        self.run_scroll = 0;
-        self.run_follow = true;
+        self.reset_run_view(RunnerMode::Plan, "new spec".to_owned());
         self.status = "Running planner…".to_owned();
         let tx = self.tx.clone();
         let app = self.app.clone();
@@ -290,10 +297,7 @@ impl TuiApp {
         self.pending = true;
         self.active_control = Some(control.clone());
         self.screen = Screen::Running;
-        self.run_target = Some(target.clone());
-        self.run_logs.clear();
-        self.run_scroll = 0;
-        self.run_follow = true;
+        self.reset_run_view(RunnerMode::Plan, target.clone());
         self.status = format!("Revising {target}");
         let tx = self.tx.clone();
         let app = self.app.clone();
@@ -312,10 +316,7 @@ impl TuiApp {
         self.pending = true;
         self.active_control = Some(control.clone());
         self.screen = Screen::Running;
-        self.run_target = Some(target.clone());
-        self.run_logs.clear();
-        self.run_scroll = 0;
-        self.run_follow = true;
+        self.reset_run_view(RunnerMode::Plan, target.clone());
         self.status = format!("Replanning {target}");
         let tx = self.tx.clone();
         let app = self.app.clone();
@@ -334,10 +335,7 @@ impl TuiApp {
         self.pending = true;
         self.active_control = Some(control.clone());
         self.screen = Screen::Running;
-        self.run_target = Some(target.clone());
-        self.run_logs.clear();
-        self.run_scroll = 0;
-        self.run_follow = true;
+        self.reset_run_view(RunnerMode::Build, target.clone());
         self.status = format!("Running {target}");
         let tx = self.tx.clone();
         let app = self.app.clone();
@@ -358,7 +356,9 @@ impl TuiApp {
 
     fn handle_event(&mut self, event: UiEvent) {
         match event {
-            UiEvent::Tick => {}
+            UiEvent::Tick => {
+                self.tick_count = self.tick_count.wrapping_add(1);
+            }
             UiEvent::Resize => {}
             UiEvent::Key(key) => self.handle_key(key),
             UiEvent::Mouse(mouse) => self.handle_mouse(mouse),
@@ -407,6 +407,11 @@ impl TuiApp {
                 match result {
                     Ok(summary) => {
                         self.run_target = Some(summary.spec_path.to_string());
+                        self.run_signal = if summary.state == WorkflowState::Completed {
+                            "Workflow reached a verified done state".to_owned()
+                        } else {
+                            "Planning artifacts were updated".to_owned()
+                        };
                         self.status = format!("Updated {}", summary.spec_path);
                         self.focus_spec_path = Some(summary.spec_path.to_string());
                         self.notice = Some(Notice {
@@ -425,7 +430,8 @@ impl TuiApp {
                     }
                     Err(error) => {
                         self.status = error.clone();
-                        self.run_logs.push(format!("error: {error}"));
+                        self.run_signal = error.clone();
+                        self.append_run_log(format!("error: {error}"));
                         self.notice = Some(Notice {
                             tone: NoticeTone::Error,
                             message: error,
@@ -436,6 +442,10 @@ impl TuiApp {
             UiEvent::RunMessage(message) => self.apply_run_event(message),
             UiEvent::ClarificationRequested(request, responder) => {
                 self.status = "Clarification required".to_owned();
+                self.run_signal = format!(
+                    "Waiting for your answer: {}",
+                    compact_text(&request.question, 72)
+                );
                 self.clarification_scroll = 0;
                 let mut input = TextArea::default();
                 input.set_block(
@@ -454,6 +464,22 @@ impl TuiApp {
         }
     }
 
+    fn append_run_log(&mut self, line: String) {
+        self.run_logs.push(line);
+        self.run_follow = true;
+        self.run_scroll = u16::MAX;
+    }
+
+    fn reset_run_view(&mut self, mode: RunnerMode, target: String) {
+        self.run_logs.clear();
+        self.run_scroll = 0;
+        self.run_follow = true;
+        self.run_mode = Some(mode);
+        self.run_iteration = None;
+        self.run_signal = "Waiting for first agent output".to_owned();
+        self.run_target = Some(target);
+    }
+
     fn apply_run_event(&mut self, event: RunEvent) {
         match event {
             RunEvent::IterationStarted {
@@ -461,22 +487,39 @@ impl TuiApp {
                 iteration,
                 max_iterations,
             } => {
-                self.run_logs.push(format!(
+                self.run_mode = Some(mode);
+                self.run_iteration = Some((iteration, max_iterations));
+                self.run_signal = format!(
+                    "{} iteration {} of {} is running",
+                    mode_label(mode),
+                    iteration,
+                    max_iterations
+                );
+                self.append_run_log(format!(
                     "[{} {}/{}]",
                     mode.as_str(),
                     iteration,
                     max_iterations
                 ));
             }
-            RunEvent::Stdout(chunk) => self.run_logs.push(normalize_stream_chunk(&chunk)),
-            RunEvent::Stderr(chunk) => self.run_logs.push(normalize_stream_chunk(&chunk)),
-            RunEvent::Note(note) => self.run_logs.push(format!("note: {note}")),
+            RunEvent::Stdout(chunk) => self.append_run_log(normalize_stream_chunk(&chunk)),
+            RunEvent::Stderr(chunk) => self.append_run_log(normalize_stream_chunk(&chunk)),
+            RunEvent::Note(note) => {
+                self.run_signal = compact_text(&note, 88);
+                self.append_run_log(format!("note: {note}"));
+            }
             RunEvent::Finished {
                 mode,
                 completed,
                 summary,
             } => {
-                self.run_logs.push(summary);
+                self.run_mode = Some(mode);
+                self.run_signal = if completed {
+                    format!("{} finished with a done marker", mode_label(mode))
+                } else {
+                    format!("{} finished without a done marker", mode_label(mode))
+                };
+                self.append_run_log(summary);
                 self.status = format!(
                     "{} {}",
                     mode.as_str(),
@@ -720,7 +763,9 @@ impl TuiApp {
         if let Some(control) = &self.active_control {
             control.cancel();
             self.status = "Canceling agent subprocess…".to_owned();
-            self.run_logs.push("cancel requested".to_owned());
+            self.run_signal =
+                "Cancellation requested; waiting for the subprocess to stop".to_owned();
+            self.append_run_log("cancel requested".to_owned());
         }
     }
 
@@ -1247,21 +1292,36 @@ impl TuiApp {
     fn draw_running(&mut self, frame: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(5), Constraint::Min(1)])
+            .constraints([Constraint::Length(7), Constraint::Min(1)])
             .split(area);
         frame.render_widget(Clear, chunks[0]);
         frame.render_widget(Clear, chunks[1]);
-        let header = Paragraph::new(format!(
-            "Shortcuts  Ctrl-C cancel agent  •  Ctrl-W back when idle  •  PgUp/PgDn/Home/End scroll\n◆ Target   {}\n◆ Status   {}",
-            self.run_target.as_deref().unwrap_or("unknown"),
-            self.status
-        ))
+        let target = self.run_target.as_deref().unwrap_or("unknown");
+        let header = Paragraph::new(Text::from(vec![
+            self.running_summary_line(),
+            Line::from(vec![
+                Span::styled(" target ", key_style(self.subtle_color())),
+                Span::styled(target, Style::default().fg(self.text_color())),
+            ]),
+            Line::from(vec![
+                Span::styled(" signal ", key_style(self.warning_color())),
+                Span::styled(&self.run_signal, Style::default().fg(self.text_color())),
+            ]),
+            self.run_telemetry_line(),
+            Line::from(vec![
+                Span::styled(" shortcuts ", key_style(self.muted_color())),
+                Span::styled(
+                    "Ctrl-C cancel agent  •  Ctrl-W back when idle  •  PgUp/PgDn/Home/End scroll",
+                    Style::default().fg(self.muted_color()),
+                ),
+            ]),
+        ]))
         .block(
-                Block::default()
-                    .title(self.title_line("Live Run", "Streaming agent output"))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            );
+            Block::default()
+                .title(self.title_line("Live Run", "Telemetry and streaming agent output"))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        );
         frame.render_widget(header, chunks[0]);
 
         let joined = self.run_logs.join("\n");
@@ -1380,9 +1440,124 @@ impl TuiApp {
                 self.status
             ),
             Screen::Running => format!(
-                "{}    ◆  Ctrl-C cancel agent  •  Ctrl-W back when idle",
+                "{}    ◆  Ctrl-C cancel agent  •  Ctrl-W back when idle  •  auto-follow on new output",
                 self.status
             ),
+        }
+    }
+
+    fn running_summary_line(&self) -> Line<'static> {
+        let (status_label, status_style) = self.run_status_badge();
+        let indicator = self.run_indicator();
+        let (mode_text, iteration_text) = match (self.run_mode, self.run_iteration) {
+            (Some(mode), Some((iteration, max_iterations))) => (
+                mode_label(mode).to_owned(),
+                format!("iteration {iteration}/{max_iterations}"),
+            ),
+            (Some(mode), None) => (mode_label(mode).to_owned(), "waiting to start".to_owned()),
+            (None, _) => ("run".to_owned(), "no iteration yet".to_owned()),
+        };
+
+        Line::from(vec![
+            indicator,
+            Span::raw(" "),
+            Span::styled(
+                format!(" {} ", status_label),
+                status_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(" {} ", mode_text),
+                Style::default()
+                    .fg(self.text_color())
+                    .bg(self.panel_highlight())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!(" {} ", iteration_text),
+                Style::default()
+                    .fg(self.accent_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                if self.run_follow {
+                    " follow latest "
+                } else {
+                    " manual scroll "
+                },
+                Style::default().fg(self.muted_color()),
+            ),
+        ])
+    }
+
+    fn run_telemetry_line(&self) -> Line<'static> {
+        let activity = if self.pending {
+            "agent live"
+        } else {
+            "agent idle"
+        };
+        let scroll_mode = if self.run_follow {
+            "auto-follow locked"
+        } else {
+            "manual scroll"
+        };
+        let logs = format!(
+            "{} log chunk{}",
+            self.run_logs.len(),
+            if self.run_logs.len() == 1 { "" } else { "s" }
+        );
+
+        Line::from(vec![
+            Span::styled(" metrics ", key_style(self.success_color())),
+            Span::styled(activity, Style::default().fg(self.success_color())),
+            Span::styled("  ◆  ", Style::default().fg(self.subtle_color())),
+            Span::styled(scroll_mode, Style::default().fg(self.muted_color())),
+            Span::styled("  ◆  ", Style::default().fg(self.subtle_color())),
+            Span::styled(logs, Style::default().fg(self.muted_color())),
+        ])
+    }
+
+    fn run_status_badge(&self) -> (&'static str, Style) {
+        if self.clarification.is_some() {
+            (
+                "WAITING",
+                Style::default().fg(Color::Black).bg(self.warning_color()),
+            )
+        } else if self.pending {
+            (
+                "LIVE",
+                Style::default().fg(Color::Black).bg(self.success_color()),
+            )
+        } else {
+            (
+                "IDLE",
+                Style::default()
+                    .fg(self.text_color())
+                    .bg(self.panel_highlight()),
+            )
+        }
+    }
+
+    fn run_indicator(&self) -> Span<'static> {
+        let pulse_on = ((self.tick_count / 2) % 2) == 0;
+        if self.clarification.is_some() {
+            Span::styled(
+                if pulse_on { "◉" } else { "◎" },
+                Style::default()
+                    .fg(self.warning_color())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if self.pending {
+            Span::styled(
+                if pulse_on { "●" } else { "◉" },
+                Style::default()
+                    .fg(self.success_color())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled("○", Style::default().fg(self.muted_color()))
         }
     }
 
@@ -1538,6 +1713,27 @@ fn styled_title(
 
 fn key_style(color: Color) -> Style {
     Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+fn mode_label(mode: RunnerMode) -> &'static str {
+    match mode {
+        RunnerMode::Plan => "planner",
+        RunnerMode::Build => "builder",
+    }
+}
+
+fn compact_text(text: &str, max_chars: usize) -> String {
+    let single_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = single_line.chars().count();
+    if count <= max_chars {
+        single_line
+    } else {
+        let truncated = single_line
+            .chars()
+            .take(max_chars.saturating_sub(1))
+            .collect::<String>();
+        format!("{truncated}…")
+    }
 }
 
 fn detect_color_mode() -> ColorMode {
