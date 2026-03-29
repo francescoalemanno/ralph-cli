@@ -472,7 +472,16 @@ where
             let marker = match parse_builder_marker_from_output(&result.stdout) {
                 Ok(marker) => marker,
                 Err(error) => {
-                    let note = format!("builder marker validation failed: {error}");
+                    let progress_after = self.store.read_progress(&paths.progress_path)?;
+                    let unchanged_progress =
+                        strip_persisted_promise_markers(&progress_after) == stripped;
+                    let note = if unchanged_progress {
+                        format!(
+                            "builder marker validation failed: {error}; builder exited without updating progress"
+                        )
+                    } else {
+                        format!("builder marker validation failed: {error}")
+                    };
                     self.store
                         .append_controller_note(&paths.progress_path, &note)?;
                     delegate.on_event(RunEvent::Note(note)).await?;
