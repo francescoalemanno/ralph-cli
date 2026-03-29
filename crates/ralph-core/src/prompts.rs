@@ -16,6 +16,14 @@ pub struct BuildPromptContext {
     pub progress_path: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProgressRevisionPromptContext {
+    pub previous_spec_path: String,
+    pub current_spec_path: String,
+    pub progress_path: String,
+    pub diff_path: String,
+}
+
 pub fn planning_prompt(context: &PlanningPromptContext) -> String {
     let clarification_protocol = match context.question_support {
         QuestionSupportMode::Disabled => {
@@ -164,9 +172,49 @@ End with exactly one of:
     )
 }
 
+pub fn progress_revision_prompt(context: &ProgressRevisionPromptContext) -> String {
+    format!(
+        r#"You are the Ralph progress revisor for one focused revision pass.
+
+Do this:
+- read the previous spec, current spec, progress, and diff from disk first
+- treat both spec files as read-only
+- use the spec diff to understand what changed
+- update only the progress file so it matches the edited spec
+- preserve completed or still-valid work where possible
+- remove obsolete tasks, reorder tasks if needed, and add new concrete tasks
+- keep progress builder-facing and execution-oriented
+- finish with exactly one valid planning marker
+
+Artifacts:
+- previous spec: {previous_spec_path}
+- current spec: {current_spec_path}
+- progress: {progress_path}
+- spec diff: {diff_path}
+
+Rules:
+- do not rewrite either spec file
+- do not ask clarification questions
+- do not perform implementation work
+- if progress already matches the edited spec, leave it as-is and emit DONE
+
+End with exactly one of:
+- <plan-promise>DONE</plan-promise>
+- <plan-promise>CONTINUE</plan-promise>
+"#,
+        previous_spec_path = context.previous_spec_path,
+        current_spec_path = context.current_spec_path,
+        progress_path = context.progress_path,
+        diff_path = context.diff_path,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BuildPromptContext, PlanningPromptContext, build_prompt, planning_prompt};
+    use super::{
+        BuildPromptContext, PlanningPromptContext, ProgressRevisionPromptContext, build_prompt,
+        planning_prompt, progress_revision_prompt,
+    };
     use crate::{ClarificationExchange, QuestionSupportMode};
 
     #[test]
@@ -223,5 +271,23 @@ mod tests {
         assert!(prompt.contains("- progress: /tmp/progress.txt"));
         assert!(!prompt.contains("Spec contents:"));
         assert!(!prompt.contains("Progress contents:"));
+    }
+
+    #[test]
+    fn progress_revision_prompt_references_snapshot_and_diff_paths() {
+        let prompt = progress_revision_prompt(&ProgressRevisionPromptContext {
+            previous_spec_path: "/tmp/spec.past-spec.md".to_owned(),
+            current_spec_path: "/tmp/spec.md".to_owned(),
+            progress_path: "/tmp/progress.txt".to_owned(),
+            diff_path: "/tmp/spec.spec-edit.diff.txt".to_owned(),
+        });
+
+        assert!(prompt.contains("read the previous spec, current spec, progress, and diff from disk first"));
+        assert!(prompt.contains("- previous spec: /tmp/spec.past-spec.md"));
+        assert!(prompt.contains("- current spec: /tmp/spec.md"));
+        assert!(prompt.contains("- progress: /tmp/progress.txt"));
+        assert!(prompt.contains("- spec diff: /tmp/spec.spec-edit.diff.txt"));
+        assert!(prompt.contains("do not rewrite either spec file"));
+        assert!(prompt.contains("update only the progress file so it matches the edited spec"));
     }
 }
