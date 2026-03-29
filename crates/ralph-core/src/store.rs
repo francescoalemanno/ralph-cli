@@ -112,6 +112,10 @@ impl ArtifactStore {
         self.write_file(path, contents)
     }
 
+    pub fn write_auxiliary(&self, path: &Utf8Path, contents: &str) -> Result<()> {
+        self.write_file(path, contents)
+    }
+
     pub fn append_controller_note(&self, path: &Utf8Path, note: &str) -> Result<()> {
         let existing = self.read_optional(path)?;
         let note_block = format!("Controller note:\n{}\n", note.trim());
@@ -215,6 +219,14 @@ impl ArtifactStore {
         }
     }
 
+    pub fn past_spec_path(&self, spec_path: &Utf8Path) -> Result<Utf8PathBuf> {
+        Self::sibling_with_suffix(spec_path, ".past-spec.md")
+    }
+
+    pub fn spec_edit_diff_path(&self, spec_path: &Utf8Path) -> Result<Utf8PathBuf> {
+        Self::sibling_with_suffix(spec_path, ".spec-edit.diff.txt")
+    }
+
     fn collect_spec_paths(&self, dir: &Utf8Path, specs: &mut Vec<Utf8PathBuf>) -> Result<()> {
         if !dir.exists() {
             return Ok(());
@@ -254,6 +266,13 @@ impl ArtifactStore {
                 .with_context(|| format!("failed to create parent directory for {path}"))?;
         }
         fs::write(path, contents).with_context(|| format!("failed to write {path}"))
+    }
+
+    fn sibling_with_suffix(path: &Utf8Path, suffix: &str) -> Result<Utf8PathBuf> {
+        let stem = path
+            .file_stem()
+            .ok_or_else(|| anyhow!("path must have a valid stem"))?;
+        Ok(path.with_file_name(format!("{stem}{suffix}")))
     }
 }
 
