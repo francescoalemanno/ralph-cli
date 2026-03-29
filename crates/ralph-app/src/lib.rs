@@ -4,8 +4,8 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
-    AppConfig, ArtifactStore, BuildPromptContext, BuilderMarker, ClarificationExchange,
-    CodingAgent, ClarificationRequest, ProgressRevisionPromptContext, ReviewData, RunControl,
+    AppConfig, ArtifactStore, BuildPromptContext, BuilderMarker, ClarificationAnswer,
+    ClarificationRequest, CodingAgent, ProgressRevisionPromptContext, ReviewData, RunControl,
     RunnerConfig, RunnerInvocation, RunnerMode, SpecPaths, SpecSummary, build_prompt,
     parse_builder_marker_from_output, parse_clarification_request,
     parse_planning_marker_from_output, planning_prompt, progress_revision_prompt,
@@ -17,13 +17,17 @@ use tracing::debug;
 
 #[derive(Debug, Clone)]
 pub enum RunEvent {
+    ArtifactsCreated {
+        spec_path: String,
+        progress_path: String,
+        feedback_path: String,
+    },
     IterationStarted {
         mode: RunnerMode,
         iteration: usize,
         max_iterations: usize,
     },
-    Stdout(String),
-    Stderr(String),
+    Output(String),
     Note(String),
     Finished {
         mode: RunnerMode,
@@ -67,7 +71,10 @@ pub fn format_iteration_banner(
 pub trait RunDelegate: Send {
     async fn on_event(&mut self, event: RunEvent) -> Result<()>;
 
-    async fn ask_clarification(&mut self, request: ClarificationRequest) -> Result<Option<String>>;
+    async fn ask_clarification(
+        &mut self,
+        request: ClarificationRequest,
+    ) -> Result<Option<ClarificationAnswer>>;
 }
 
 #[derive(Debug, Clone)]
@@ -338,6 +345,7 @@ where
                         mode: RunnerMode::Plan,
                         spec_path: request.paths.spec_path.clone(),
                         progress_path: request.paths.progress_path.clone(),
+                        feedback_path: request.paths.feedback_path.clone(),
                     },
                     &control,
                     delegate,
@@ -395,7 +403,7 @@ where
                 continue;
             }
 
-            let marker = match parse_planning_marker_from_output(&result.stdout) {
+            let marker = match parse_planning_marker_from_output(&result.output) {
                 Ok(marker) => marker,
                 Err(error) => {
                     let note = format!("progress revisor marker validation failed: {error}");
@@ -479,8 +487,16 @@ where
         if reset {
             self.store.delete_pair(&paths)?;
         }
+        if self.ensure_planning_artifacts(&paths, planning_request)? {
+            delegate
+                .on_event(RunEvent::ArtifactsCreated {
+                    spec_path: paths.spec_path.to_string(),
+                    progress_path: paths.progress_path.to_string(),
+                    feedback_path: paths.feedback_path.to_string(),
+                })
+                .await?;
+        }
 
-        let mut clarification_history = Vec::new();
         let mut controller_warnings = Vec::new();
         for iteration in 1..=self.config.planning_max_iterations {
             let planner_config = self.runner_config_for(RunnerMode::Plan, &control);
@@ -501,7 +517,7 @@ where
                 planning_request: planning_request.to_owned(),
                 spec_path: paths.spec_path.to_string(),
                 progress_path: paths.progress_path.to_string(),
-                clarification_history: clarification_history.clone(),
+                feedback_path: paths.feedback_path.to_string(),
                 controller_warnings: controller_warnings.clone(),
                 question_support: planner_config.question_support,
             });
@@ -515,6 +531,7 @@ where
                         mode: RunnerMode::Plan,
                         spec_path: paths.spec_path.clone(),
                         progress_path: paths.progress_path.clone(),
+                        feedback_path: paths.feedback_path.clone(),
                     },
                     &control,
                     delegate,
@@ -550,18 +567,28 @@ where
                 continue;
             }
 
-            let asked_clarification =
-                if let Some(request) = parse_clarification_request(&result.stdout) {
-                    let question = request.question.clone();
-                    let answer = delegate.ask_clarification(request).await?;
-                    let Some(answer) = answer else {
-                        return Err(anyhow!("planning canceled during clarification"));
-                    };
-                    clarification_history.push(ClarificationExchange { question, answer });
-                    true
-                } else {
-                    false
+            let asked_clarification = if let Some(request) =
+                parse_clarification_request(&result.output)
+            {
+                let answer = delegate.ask_clarification(request.clone()).await?;
+                let Some(answer) = answer else {
+                    return Err(anyhow!("planning canceled during clarification"));
                 };
+                self.store.append_feedback_clarification(
+                    &paths.feedback_path,
+                    &request,
+                    &answer,
+                )?;
+                true
+            } else {
+                if result.output.contains("<ralph-question>") {
+                    let note = "planner emitted clarification tags but no valid clarification block could be parsed".to_owned();
+                    self.store
+                        .append_controller_note(&paths.progress_path, &note)?;
+                    delegate.on_event(RunEvent::Note(note)).await?;
+                }
+                false
+            };
             if asked_clarification {
                 continue;
             }
@@ -588,7 +615,7 @@ where
                 continue;
             }
 
-            let marker = match parse_planning_marker_from_output(&result.stdout) {
+            let marker = match parse_planning_marker_from_output(&result.output) {
                 Ok(marker) => marker,
                 Err(error) => {
                     let note = format!("planner marker validation failed: {error}");
@@ -632,6 +659,27 @@ where
         ))
     }
 
+    fn ensure_planning_artifacts(&self, paths: &SpecPaths, planning_request: &str) -> Result<bool> {
+        let mut created = false;
+        if !paths.spec_path.exists() {
+            self.store
+                .write_spec(&paths.spec_path, &initial_spec_stub(planning_request))?;
+            created = true;
+        }
+        if !paths.progress_path.exists() {
+            self.store.write_progress(&paths.progress_path, "")?;
+            created = true;
+        }
+        if !paths.feedback_path.exists() {
+            self.store.write_feedback(
+                &paths.feedback_path,
+                &ArtifactStore::default_feedback_contents(),
+            )?;
+            created = true;
+        }
+        Ok(created)
+    }
+
     async fn run_builder<D>(
         &self,
         paths: SpecPaths,
@@ -646,6 +694,12 @@ where
         let spec = self.store.read_spec(&paths.spec_path)?;
         if spec.trim().is_empty() {
             return Err(anyhow!("cannot run builder without a non-empty spec"));
+        }
+        if !paths.feedback_path.exists() {
+            self.store.write_feedback(
+                &paths.feedback_path,
+                &ArtifactStore::default_feedback_contents(),
+            )?;
         }
 
         for iteration in 1..=self.config.builder_max_iterations {
@@ -670,6 +724,7 @@ where
             let prompt = build_prompt(&BuildPromptContext {
                 spec_path: paths.spec_path.to_string(),
                 progress_path: paths.progress_path.to_string(),
+                feedback_path: paths.feedback_path.to_string(),
             });
 
             let result = match self
@@ -681,6 +736,7 @@ where
                         mode: RunnerMode::Build,
                         spec_path: paths.spec_path.clone(),
                         progress_path: paths.progress_path.clone(),
+                        feedback_path: paths.feedback_path.clone(),
                     },
                     &control,
                     delegate,
@@ -716,7 +772,7 @@ where
                 continue;
             }
 
-            let marker = match parse_builder_marker_from_output(&result.stdout) {
+            let marker = match parse_builder_marker_from_output(&result.output) {
                 Ok(marker) => marker,
                 Err(error) => {
                     let progress_after = self.store.read_progress(&paths.progress_path)?;
@@ -772,9 +828,11 @@ where
         Ok(SpecSummary {
             spec_path: review.spec_path,
             progress_path: review.progress_path,
+            feedback_path: review.feedback_path,
             state,
             spec_preview: preview(&review.spec_contents),
             progress_preview: preview(&review.progress_contents),
+            feedback_preview: preview(&review.feedback_contents),
         })
     }
 
@@ -828,8 +886,7 @@ where
     D: RunDelegate,
 {
     match event {
-        RunnerStreamEvent::Stdout(chunk) => delegate.on_event(RunEvent::Stdout(chunk)).await,
-        RunnerStreamEvent::Stderr(chunk) => delegate.on_event(RunEvent::Stderr(chunk)).await,
+        RunnerStreamEvent::Output(chunk) => delegate.on_event(RunEvent::Output(chunk)).await,
     }
 }
 
@@ -845,6 +902,13 @@ fn preview(contents: &str) -> String {
     } else {
         compact.join("\n")
     }
+}
+
+fn initial_spec_stub(planning_request: &str) -> String {
+    let request = planning_request.trim();
+    format!(
+        "# Goal\nInitial planning request: {request}\n\n# User Requirements And Constraints\nInitial request captured before full planning:\n- {request}\n\n# Non-Goals\nTo be defined during planning.\n\n# Proposed Design\nTo be defined during planning.\n\n# Implementation Plan\nTo be defined during planning.\n\n# Acceptance Criteria\nTo be defined during planning.\n\n# Risks\nPlanning was interrupted before a full spec was produced.\n\n# Open Questions\nSee the feedback file for clarification history and unresolved questions.\n"
+    )
 }
 
 fn render_spec_diff(
@@ -867,6 +931,15 @@ pub struct ConsoleDelegate;
 impl RunDelegate for ConsoleDelegate {
     async fn on_event(&mut self, event: RunEvent) -> Result<()> {
         match event {
+            RunEvent::ArtifactsCreated {
+                spec_path,
+                progress_path,
+                feedback_path,
+            } => {
+                println!(
+                    "artifacts created:\n- spec: {spec_path}\n- progress: {progress_path}\n- feedback: {feedback_path}"
+                );
+            }
             RunEvent::IterationStarted {
                 mode,
                 iteration,
@@ -877,35 +950,49 @@ impl RunDelegate for ConsoleDelegate {
                     format_iteration_banner(mode, iteration, max_iterations)
                 );
             }
-            RunEvent::Stdout(chunk) => print!("{chunk}"),
-            RunEvent::Stderr(chunk) => eprint!("{chunk}"),
+            RunEvent::Output(chunk) => print!("{chunk}"),
             RunEvent::Note(note) => eprintln!("note: {note}"),
             RunEvent::Finished { summary, .. } => println!("{summary}"),
         }
         Ok(())
     }
 
-    async fn ask_clarification(&mut self, request: ClarificationRequest) -> Result<Option<String>> {
+    async fn ask_clarification(
+        &mut self,
+        request: ClarificationRequest,
+    ) -> Result<Option<ClarificationAnswer>> {
         println!("\nClarification required:\n{}\n", request.question);
         for (index, option) in request.options.iter().enumerate() {
             println!("{}. {} - {}", index + 1, option.label, option.description);
         }
-        println!("Enter a number, free-form answer, or leave blank to cancel:");
+        loop {
+            println!("Enter a number, free-form answer, or /quit to abort:");
 
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .context("failed to read clarification answer")?;
-        let input = input.trim();
-        if input.is_empty() {
-            return Ok(None);
-        }
-        if let Ok(index) = input.parse::<usize>() {
-            if let Some(option) = request.options.get(index.saturating_sub(1)) {
-                return Ok(Some(option.label.clone()));
+            let mut input = String::new();
+            std::io::stdin()
+                .read_line(&mut input)
+                .context("failed to read clarification answer")?;
+            let input = input.trim();
+            if input.eq_ignore_ascii_case("/quit") {
+                return Ok(None);
             }
+            if input.is_empty() {
+                println!("Answer required. Type a choice, free-form answer, or /quit.");
+                continue;
+            }
+            if let Ok(index) = input.parse::<usize>() {
+                if let Some(option) = request.options.get(index.saturating_sub(1)) {
+                    return Ok(Some(ClarificationAnswer {
+                        text: option.label.clone(),
+                        used_option_selection: true,
+                    }));
+                }
+            }
+            return Ok(Some(ClarificationAnswer {
+                text: input.to_owned(),
+                used_option_selection: false,
+            }));
         }
-        Ok(Some(input.to_owned()))
     }
 }
 
@@ -946,11 +1033,8 @@ mod tests {
             let next = self.steps.lock().unwrap().remove(0);
             let result = next(&invocation);
             if let Some(stream) = stream {
-                if !result.stdout.is_empty() {
-                    let _ = stream.send(RunnerStreamEvent::Stdout(result.stdout.clone()));
-                }
-                if !result.stderr.is_empty() {
-                    let _ = stream.send(RunnerStreamEvent::Stderr(result.stderr.clone()));
+                if !result.output.is_empty() {
+                    let _ = stream.send(RunnerStreamEvent::Output(result.output.clone()));
                 }
             }
             Ok(result)
@@ -959,18 +1043,22 @@ mod tests {
 
     struct TestDelegate {
         answers: Vec<Option<String>>,
+        created: Vec<(String, String, String)>,
         notes: Vec<String>,
-        stdout: Vec<String>,
-        stderr: Vec<String>,
+        output: Vec<String>,
     }
 
     #[async_trait]
     impl RunDelegate for TestDelegate {
         async fn on_event(&mut self, event: RunEvent) -> Result<()> {
             match event {
+                RunEvent::ArtifactsCreated {
+                    spec_path,
+                    progress_path,
+                    feedback_path,
+                } => self.created.push((spec_path, progress_path, feedback_path)),
                 RunEvent::Note(note) => self.notes.push(note),
-                RunEvent::Stdout(chunk) => self.stdout.push(chunk),
-                RunEvent::Stderr(chunk) => self.stderr.push(chunk),
+                RunEvent::Output(chunk) => self.output.push(chunk),
                 _ => {}
             }
             Ok(())
@@ -979,8 +1067,11 @@ mod tests {
         async fn ask_clarification(
             &mut self,
             _request: ClarificationRequest,
-        ) -> Result<Option<String>> {
-            Ok(self.answers.remove(0))
+        ) -> Result<Option<ClarificationAnswer>> {
+            Ok(self.answers.remove(0).map(|text| ClarificationAnswer {
+                text,
+                used_option_selection: false,
+            }))
         }
     }
 
@@ -1003,11 +1094,23 @@ mod tests {
     async fn planning_retries_on_invalid_marker() {
         let runner = ScriptedRunner::new(vec![
             Box::new(|invocation| {
+                let spec = fs::read_to_string(&invocation.spec_path).unwrap();
+                assert!(spec.contains("# Goal"));
+                assert!(spec.contains("Initial planning request: Implement feature"));
+                assert!(
+                    fs::read_to_string(&invocation.progress_path)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    fs::read_to_string(&invocation.feedback_path)
+                        .unwrap()
+                        .contains("<RECENT-USER-FEEDBACK>")
+                );
                 fs::write(&invocation.spec_path, sample_spec("A")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\n").unwrap();
                 RunnerResult {
-                    stdout: "not a marker\n".to_owned(),
-                    stderr: String::new(),
+                    output: "not a marker\n".to_owned(),
                     exit_code: 0,
                 }
             }),
@@ -1015,8 +1118,7 @@ mod tests {
                 fs::write(&invocation.spec_path, sample_spec("D")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
                 RunnerResult {
-                    stdout: "<plan-promise>DONE</plan-promise>\n".to_owned(),
-                    stderr: String::new(),
+                    output: "<plan-promise>DONE</plan-promise>\n".to_owned(),
                     exit_code: 0,
                 }
             }),
@@ -1025,15 +1127,18 @@ mod tests {
         let (_temp, app) = app(runner);
         let mut delegate = TestDelegate {
             answers: vec![],
+            created: vec![],
             notes: vec![],
-            stdout: vec![],
-            stderr: vec![],
+            output: vec![],
         };
         let summary = app
             .create_new("Implement feature", &mut delegate)
             .await
             .unwrap();
         assert_eq!(summary.state, WorkflowState::Planned);
+        assert_eq!(delegate.created.len(), 1);
+        assert!(delegate.created[0].0.ends_with(".md"));
+        assert!(delegate.created[0].2.ends_with(".txt"));
         assert!(
             delegate
                 .notes
@@ -1045,10 +1150,10 @@ mod tests {
     #[tokio::test]
     async fn builder_persists_done_marker() {
         let runner = ScriptedRunner::new(vec![Box::new(|invocation| {
+            assert!(invocation.prompt_text.contains("- feedback:"));
             fs::write(&invocation.progress_path, "Task done\n").unwrap();
             RunnerResult {
-                stdout: "<promise>DONE</promise>\n".to_owned(),
-                stderr: String::new(),
+                output: "<promise>DONE</promise>\n".to_owned(),
                 exit_code: 0,
             }
         })]);
@@ -1065,9 +1170,9 @@ mod tests {
 
         let mut delegate = TestDelegate {
             answers: vec![],
+            created: vec![],
             notes: vec![],
-            stdout: vec![],
-            stderr: vec![],
+            output: vec![],
         };
         let summary = app.run_target("alpha", &mut delegate).await.unwrap();
         assert_eq!(summary.state, WorkflowState::Completed);
@@ -1081,9 +1186,8 @@ mod tests {
             fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
             fs::write(&invocation.progress_path, "Task 1\n").unwrap();
             RunnerResult {
-                stdout: "<ralph-question>{\"question\":\"Which?\",\"options\":[]}</ralph-question>"
+                output: "<ralph-question>{\"question\":\"Which?\",\"options\":[]}</ralph-question>"
                     .to_owned(),
-                stderr: String::new(),
                 exit_code: 0,
             }
         })]);
@@ -1091,9 +1195,9 @@ mod tests {
         let (_temp, app) = app(runner);
         let mut delegate = TestDelegate {
             answers: vec![None],
+            created: vec![],
             notes: vec![],
-            stdout: vec![],
-            stderr: vec![],
+            output: vec![],
         };
 
         assert!(
@@ -1107,15 +1211,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planning_ignores_malformed_clarification_blocks() {
+    async fn planning_keeps_stubbed_new_spec_visible_during_clarification() {
+        let runner = ScriptedRunner::new(vec![Box::new(|invocation| {
+            let spec = fs::read_to_string(&invocation.spec_path).unwrap();
+            assert!(spec.contains("# Goal"));
+            assert!(spec.contains("Initial planning request: Implement feature"));
+            assert!(
+                fs::read_to_string(&invocation.progress_path)
+                    .unwrap()
+                    .is_empty()
+            );
+            RunnerResult {
+                output: "<ralph-question>{\"question\":\"Which?\",\"options\":[]}</ralph-question>"
+                    .to_owned(),
+                exit_code: 0,
+            }
+        })]);
+
+        let (_temp, app) = app(runner);
+        let mut delegate = TestDelegate {
+            answers: vec![None],
+            created: vec![],
+            notes: vec![],
+            output: vec![],
+        };
+
+        assert!(
+            app.create_new("Implement feature", &mut delegate)
+                .await
+                .is_err()
+        );
+
+        let specs = app.list_specs().unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].state, WorkflowState::Planned);
+        assert!(specs[0].spec_preview.contains("Initial planning request"));
+        assert_eq!(specs[0].progress_preview, "<empty>");
+        assert_eq!(delegate.created.len(), 1);
+        assert!(
+            fs::read_to_string(&delegate.created[0].2)
+                .unwrap()
+                .contains("None.")
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_planning_leaves_a_non_empty_runnable_stub_spec() {
+        let runner = ScriptedRunner::new(vec![
+            Box::new(|invocation| {
+                let spec = fs::read_to_string(&invocation.spec_path).unwrap();
+                assert!(spec.contains("Initial planning request: Implement feature"));
+                RunnerResult {
+                    output:
+                        "<ralph-question>{\"question\":\"Which?\",\"options\":[]}</ralph-question>"
+                            .to_owned(),
+                    exit_code: 0,
+                }
+            }),
+            Box::new(|invocation| {
+                let spec = fs::read_to_string(&invocation.spec_path).unwrap();
+                assert!(spec.contains("Initial planning request: Implement feature"));
+                fs::write(&invocation.progress_path, "Task 1\n").unwrap();
+                RunnerResult {
+                    output: "<promise>DONE</promise>\n".to_owned(),
+                    exit_code: 0,
+                }
+            }),
+        ]);
+
+        let (_temp, app) = app(runner);
+        let mut planning_delegate = TestDelegate {
+            answers: vec![None],
+            created: vec![],
+            notes: vec![],
+            output: vec![],
+        };
+
+        assert!(
+            app.create_new("Implement feature", &mut planning_delegate)
+                .await
+                .is_err()
+        );
+
+        let target = planning_delegate.created[0].0.clone();
+        let mut builder_delegate = TestDelegate {
+            answers: vec![],
+            created: vec![],
+            notes: vec![],
+            output: vec![],
+        };
+
+        let summary = app
+            .run_target(&target, &mut builder_delegate)
+            .await
+            .unwrap();
+        assert_eq!(summary.state, WorkflowState::Completed);
+    }
+
+    #[tokio::test]
+    async fn planning_notes_malformed_clarification_blocks() {
         let runner = ScriptedRunner::new(vec![Box::new(|invocation| {
             fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
             fs::write(&invocation.progress_path, "Task 1\n").unwrap();
             RunnerResult {
-                stdout:
+                output:
                     "<ralph-question>{oops}</ralph-question>\n<plan-promise>DONE</plan-promise>\n"
                         .to_owned(),
-                stderr: String::new(),
                 exit_code: 0,
             }
         })]);
@@ -1123,9 +1324,9 @@ mod tests {
         let (_temp, app) = app(runner);
         let mut delegate = TestDelegate {
             answers: vec![],
+            created: vec![],
             notes: vec![],
-            stdout: vec![],
-            stderr: vec![],
+            output: vec![],
         };
 
         let summary = app
@@ -1133,48 +1334,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary.state, WorkflowState::Planned);
-        assert!(delegate.notes.is_empty());
+        assert!(
+            delegate
+                .notes
+                .iter()
+                .any(|note| { note.contains("no valid clarification block could be parsed") })
+        );
     }
 
     #[tokio::test]
-    async fn planning_reinjects_prior_clarification_question_and_answer() {
+    async fn planning_persists_clarification_history_in_feedback_file() {
         let runner = ScriptedRunner::new(vec![
             Box::new(|invocation| {
                 fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\n").unwrap();
                 RunnerResult {
-                    stdout: "<ralph-question>{\"question\":\"Which database should the plan assume?\",\"options\":[{\"label\":\"Postgres\",\"description\":\"Use PostgreSQL\"}]}</ralph-question>".to_owned(),
-                    stderr: String::new(),
+                    output: "<ralph-question>{\"question\":\"Which database should the plan assume?\",\"options\":[{\"label\":\"Postgres\",\"description\":\"Use PostgreSQL\"}]}</ralph-question>".to_owned(),
                     exit_code: 0,
                 }
             }),
             Box::new(|invocation| {
+                assert!(invocation.prompt_text.contains("- feedback:"));
                 assert!(
-                    invocation
-                        .prompt_text
-                        .contains("Recent feedback to shape the plan:")
-                );
-                assert!(
-                    invocation
-                        .prompt_text
-                        .contains("This is the most recent authoritative user guidance collected in the previous planning iteration.")
-                );
-                assert!(
-                    invocation
-                        .prompt_text
-                        .contains("Older feedbacks from past iterations:\nThese older clarifications remain authoritative unless superseded by newer feedback above.\nNone.")
-                );
-                assert!(
-                    invocation
+                    !invocation
                         .prompt_text
                         .contains("Q: Which database should the plan assume?")
                 );
-                assert!(invocation.prompt_text.contains("A: Postgres"));
+                let feedback = fs::read_to_string(&invocation.feedback_path).unwrap();
+                assert!(feedback.contains("<RECENT-USER-FEEDBACK>"));
+                assert!(feedback.contains("Q: Which database should the plan assume?"));
+                assert!(feedback.contains("A: Postgres"));
+                assert!(feedback.contains("<OLDER-USER-FEEDBACK>\nNone."));
                 fs::write(&invocation.spec_path, sample_spec("D")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
                 RunnerResult {
-                    stdout: "<plan-promise>DONE</plan-promise>\n".to_owned(),
-                    stderr: String::new(),
+                    output: "<plan-promise>DONE</plan-promise>\n".to_owned(),
                     exit_code: 0,
                 }
             }),
@@ -1183,9 +1377,9 @@ mod tests {
         let (_temp, app) = app(runner);
         let mut delegate = TestDelegate {
             answers: vec![Some("Postgres".to_owned())],
+            created: vec![],
             notes: vec![],
-            stdout: vec![],
-            stderr: vec![],
+            output: vec![],
         };
 
         let summary = app
@@ -1202,14 +1396,12 @@ mod tests {
                 fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\n").unwrap();
                 RunnerResult {
-                    stdout: "<plan-promise>CONTINUE</plan-promise>\n".to_owned(),
-                    stderr: String::new(),
+                    output: "<plan-promise>CONTINUE</plan-promise>\n".to_owned(),
                     exit_code: 0,
                 }
             }),
             Box::new(|_invocation| RunnerResult {
-                stdout: "<plan-promise>DONE</plan-promise>\n".to_owned(),
-                stderr: String::new(),
+                output: "<plan-promise>DONE</plan-promise>\n".to_owned(),
                 exit_code: 0,
             }),
         ]);
@@ -1217,9 +1409,9 @@ mod tests {
         let (_temp, app) = app(runner);
         let mut delegate = TestDelegate {
             answers: vec![],
+            created: vec![],
             notes: vec![],
-            stdout: vec![],
-            stderr: vec![],
+            output: vec![],
         };
 
         let summary = app
@@ -1242,8 +1434,7 @@ mod tests {
                 fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\n").unwrap();
                 RunnerResult {
-                    stdout: "<plan-promise>CONTINUE</plan-promise>\n".to_owned(),
-                    stderr: String::new(),
+                    output: "<plan-promise>CONTINUE</plan-promise>\n".to_owned(),
                     exit_code: 0,
                 }
             }),
@@ -1254,8 +1445,7 @@ mod tests {
                 fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
                 RunnerResult {
-                    stdout: "<plan-promise>DONE</plan-promise>\n".to_owned(),
-                    stderr: String::new(),
+                    output: "<plan-promise>DONE</plan-promise>\n".to_owned(),
                     exit_code: 0,
                 }
             }),
@@ -1269,9 +1459,9 @@ mod tests {
 
         let mut delegate = TestDelegate {
             answers: vec![],
+            created: vec![],
             notes: vec![],
-            stdout: vec![],
-            stderr: vec![],
+            output: vec![],
         };
 
         let summary = app
@@ -1299,7 +1489,7 @@ mod tests {
             stream: Option<tokio::sync::mpsc::UnboundedSender<RunnerStreamEvent>>,
         ) -> Result<RunnerResult> {
             if let Some(stream) = stream {
-                let _ = stream.send(RunnerStreamEvent::Stdout("started\n".to_owned()));
+                let _ = stream.send(RunnerStreamEvent::Output("started\n".to_owned()));
             }
             loop {
                 if control.is_cancelled() {
@@ -1332,9 +1522,9 @@ mod tests {
 
         let mut delegate = TestDelegate {
             answers: vec![],
+            created: vec![],
             notes: vec![],
-            stdout: vec![],
-            stderr: vec![],
+            output: vec![],
         };
 
         let error = app
@@ -1344,7 +1534,7 @@ mod tests {
         assert!(error.to_string().contains("operation canceled"));
         assert!(
             delegate
-                .stdout
+                .output
                 .iter()
                 .any(|chunk| chunk.contains("started"))
         );
