@@ -1,15 +1,18 @@
-use std::{env, process::Command};
+use std::{env, fs, process::Command};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
     AppConfig, ArtifactStore, BuildPromptContext, BuilderMarker, ClarificationExchange,
-    ClarificationRequest, ReviewData, RunControl, RunnerInvocation, RunnerMode, SpecPaths,
-    SpecSummary, build_prompt, parse_builder_marker_from_output, parse_clarification_request,
-    parse_planning_marker_from_output, planning_prompt, strip_persisted_promise_markers,
+    CodingAgent, ClarificationRequest, ProgressRevisionPromptContext, ReviewData, RunControl,
+    RunnerConfig, RunnerInvocation, RunnerMode, SpecPaths, SpecSummary, build_prompt,
+    parse_builder_marker_from_output, parse_clarification_request,
+    parse_planning_marker_from_output, planning_prompt, progress_revision_prompt,
+    strip_persisted_promise_markers,
 };
 use ralph_runner::{CommandRunner, RunnerAdapter, RunnerStreamEvent};
+use similar::TextDiff;
 use tracing::debug;
 
 #[derive(Debug, Clone)]
@@ -27,6 +30,21 @@ pub enum RunEvent {
         completed: bool,
         summary: String,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct SpecEditSession {
+    pub target: String,
+    pub paths: SpecPaths,
+    pub past_spec_path: Utf8PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProgressRevisionRequest {
+    pub target: String,
+    pub paths: SpecPaths,
+    pub past_spec_path: Utf8PathBuf,
+    pub diff_path: Utf8PathBuf,
 }
 
 pub fn format_iteration_banner(
@@ -90,6 +108,14 @@ where
         &self.config
     }
 
+    pub fn coding_agent(&self) -> CodingAgent {
+        self.config.coding_agent()
+    }
+
+    pub fn set_coding_agent(&mut self, agent: CodingAgent) {
+        self.config.set_coding_agent(agent);
+    }
+
     pub fn project_dir(&self) -> &Utf8Path {
         &self.project_dir
     }
@@ -108,12 +134,60 @@ where
     }
 
     pub fn edit_target(&self, target: &str) -> Result<()> {
+        let session = self.begin_spec_edit(target)?;
+        self.open_in_editor(&session.paths.spec_path)
+    }
+
+    pub fn begin_spec_edit(&self, target: &str) -> Result<SpecEditSession> {
         let paths = self.store.resolve_target(target)?;
         self.store.ensure_ralph_dir()?;
         if !paths.spec_path.exists() {
             self.store.write_spec(&paths.spec_path, "")?;
         }
+        let current_spec = self.store.read_spec(&paths.spec_path)?;
+        let past_spec_path = self.store.past_spec_path(&paths.spec_path)?;
+        self.store.write_auxiliary(&past_spec_path, &current_spec)?;
 
+        Ok(SpecEditSession {
+            target: target.to_owned(),
+            paths,
+            past_spec_path,
+        })
+    }
+
+    pub fn finish_spec_edit(
+        &self,
+        session: SpecEditSession,
+    ) -> Result<Option<ProgressRevisionRequest>> {
+        let previous_spec = self.store.read_spec(&session.past_spec_path)?;
+        let current_spec = self.store.read_spec(&session.paths.spec_path)?;
+        if previous_spec == current_spec {
+            self.remove_optional_file(&session.past_spec_path)?;
+            return Ok(None);
+        }
+
+        let diff_path = self.store.spec_edit_diff_path(&session.paths.spec_path)?;
+        let diff = render_spec_diff(
+            &session.past_spec_path,
+            &session.paths.spec_path,
+            &previous_spec,
+            &current_spec,
+        );
+        self.store.write_auxiliary(&diff_path, &diff)?;
+
+        Ok(Some(ProgressRevisionRequest {
+            target: session.target,
+            paths: session.paths,
+            past_spec_path: session.past_spec_path,
+            diff_path,
+        }))
+    }
+
+    pub fn edit_spec_session(&self, session: &SpecEditSession) -> Result<()> {
+        self.open_in_editor(&session.paths.spec_path)
+    }
+
+    fn open_in_editor(&self, path: &Utf8Path) -> Result<()> {
         let editor = self
             .config
             .editor_override
@@ -123,13 +197,20 @@ where
             .unwrap_or_else(|| "vi".to_owned());
 
         let status = Command::new(&editor)
-            .arg(paths.spec_path.as_std_path())
+            .arg(path.as_std_path())
             .status()
             .with_context(|| format!("failed to open editor {editor}"))?;
         if !status.success() {
             return Err(anyhow!("editor exited with status {}", status));
         }
         Ok(())
+    }
+
+    fn remove_optional_file(&self, path: &Utf8Path) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        fs::remove_file(path).with_context(|| format!("failed to remove {path}"))
     }
 
     pub async fn create_new<D>(
@@ -214,6 +295,154 @@ where
             .await
     }
 
+    pub async fn revise_progress_after_spec_edit_with_control<D>(
+        &self,
+        request: ProgressRevisionRequest,
+        control: RunControl,
+        delegate: &mut D,
+    ) -> Result<SpecSummary>
+    where
+        D: RunDelegate,
+    {
+        self.store.ensure_ralph_dir()?;
+
+        for iteration in 1..=self.config.planning_max_iterations {
+            let planner_config = self.runner_config_for(RunnerMode::Plan, &control);
+            if control.is_cancelled() {
+                return Err(anyhow!("operation canceled"));
+            }
+            delegate
+                .on_event(RunEvent::IterationStarted {
+                    mode: RunnerMode::Plan,
+                    iteration,
+                    max_iterations: self.config.planning_max_iterations,
+                })
+                .await?;
+
+            let current_spec_before = self.store.read_spec(&request.paths.spec_path)?;
+            let past_spec_before = self.store.read_spec(&request.past_spec_path)?;
+            let progress_before = self.store.read_progress(&request.paths.progress_path)?;
+            let prompt = progress_revision_prompt(&ProgressRevisionPromptContext {
+                previous_spec_path: request.past_spec_path.to_string(),
+                current_spec_path: request.paths.spec_path.to_string(),
+                progress_path: request.paths.progress_path.to_string(),
+                diff_path: request.diff_path.to_string(),
+            });
+
+            let result = match self
+                .execute_runner(
+                    &planner_config,
+                    RunnerInvocation {
+                        prompt_text: prompt,
+                        project_dir: self.project_dir.clone(),
+                        mode: RunnerMode::Plan,
+                        spec_path: request.paths.spec_path.clone(),
+                        progress_path: request.paths.progress_path.clone(),
+                    },
+                    &control,
+                    delegate,
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    if control.is_cancelled() {
+                        return Err(anyhow!("operation canceled"));
+                    }
+                    self.store.append_controller_note(
+                        &request.paths.progress_path,
+                        &format!("progress revisor failed: {error}"),
+                    )?;
+                    delegate
+                        .on_event(RunEvent::Note(format!(
+                            "Progress revisor failed on iteration {iteration}: {error}"
+                        )))
+                        .await?;
+                    continue;
+                }
+            };
+
+            if result.exit_code != 0 {
+                if control.is_cancelled() {
+                    return Err(anyhow!("operation canceled"));
+                }
+                let note = format!("progress revisor exited with code {}", result.exit_code);
+                self.store
+                    .append_controller_note(&request.paths.progress_path, &note)?;
+                delegate.on_event(RunEvent::Note(note)).await?;
+                continue;
+            }
+
+            let current_spec_after = self.store.read_spec(&request.paths.spec_path)?;
+            if current_spec_after != current_spec_before {
+                self.store
+                    .write_spec(&request.paths.spec_path, &current_spec_before)?;
+                let note = "progress revisor must not modify the edited spec".to_owned();
+                self.store
+                    .append_controller_note(&request.paths.progress_path, &note)?;
+                delegate.on_event(RunEvent::Note(note)).await?;
+                continue;
+            }
+
+            let past_spec_after = self.store.read_spec(&request.past_spec_path)?;
+            if past_spec_after != past_spec_before {
+                self.store
+                    .write_auxiliary(&request.past_spec_path, &past_spec_before)?;
+                let note = "progress revisor must not modify the past spec snapshot".to_owned();
+                self.store
+                    .append_controller_note(&request.paths.progress_path, &note)?;
+                delegate.on_event(RunEvent::Note(note)).await?;
+                continue;
+            }
+
+            let marker = match parse_planning_marker_from_output(&result.stdout) {
+                Ok(marker) => marker,
+                Err(error) => {
+                    let note = format!("progress revisor marker validation failed: {error}");
+                    self.store
+                        .append_controller_note(&request.paths.progress_path, &note)?;
+                    delegate.on_event(RunEvent::Note(note)).await?;
+                    continue;
+                }
+            };
+
+            let progress_after = self.store.read_progress(&request.paths.progress_path)?;
+            if progress_after.trim().is_empty() {
+                let note = "progress revisor did not leave a non-empty progress file".to_owned();
+                self.store
+                    .append_controller_note(&request.paths.progress_path, &note)?;
+                delegate.on_event(RunEvent::Note(note)).await?;
+                continue;
+            }
+
+            if marker == ralph_core::PlanningMarker::Done {
+                self.remove_optional_file(&request.past_spec_path)?;
+                self.remove_optional_file(&request.diff_path)?;
+                let summary = self.summary_for_paths(&request.paths)?;
+                delegate
+                    .on_event(RunEvent::Finished {
+                        mode: RunnerMode::Plan,
+                        completed: true,
+                        summary: format!("Progress revised for {}", summary.spec_path),
+                    })
+                    .await?;
+                return Ok(summary);
+            }
+
+            if progress_after == progress_before {
+                let note = "progress revisor did not change progress".to_owned();
+                self.store
+                    .append_controller_note(&request.paths.progress_path, &note)?;
+                delegate.on_event(RunEvent::Note(note)).await?;
+            }
+        }
+
+        Err(anyhow!(
+            "progress revisor exceeded {} iterations",
+            self.config.planning_max_iterations
+        ))
+    }
+
     pub async fn run_target<D>(&self, target: &str, delegate: &mut D) -> Result<SpecSummary>
     where
         D: RunDelegate,
@@ -254,6 +483,7 @@ where
         let mut clarification_history = Vec::new();
         let mut controller_warnings = Vec::new();
         for iteration in 1..=self.config.planning_max_iterations {
+            let planner_config = self.runner_config_for(RunnerMode::Plan, &control);
             if control.is_cancelled() {
                 return Err(anyhow!("operation canceled"));
             }
@@ -273,12 +503,12 @@ where
                 progress_path: paths.progress_path.to_string(),
                 clarification_history: clarification_history.clone(),
                 controller_warnings: controller_warnings.clone(),
-                question_support: self.config.planner.question_support,
+                question_support: planner_config.question_support,
             });
 
             let result = match self
                 .execute_runner(
-                    &self.config.planner,
+                    &planner_config,
                     RunnerInvocation {
                         prompt_text: prompt,
                         project_dir: self.project_dir.clone(),
@@ -419,6 +649,7 @@ where
         }
 
         for iteration in 1..=self.config.builder_max_iterations {
+            let builder_config = self.runner_config_for(RunnerMode::Build, &control);
             if control.is_cancelled() {
                 return Err(anyhow!("operation canceled"));
             }
@@ -443,7 +674,7 @@ where
 
             let result = match self
                 .execute_runner(
-                    &self.config.builder,
+                    &builder_config,
                     RunnerInvocation {
                         prompt_text: prompt,
                         project_dir: self.project_dir.clone(),
@@ -547,6 +778,17 @@ where
         })
     }
 
+    fn runner_config_for(&self, mode: RunnerMode, control: &RunControl) -> RunnerConfig {
+        if let Some(agent) = control.coding_agent() {
+            RunnerConfig::for_agent(agent)
+        } else {
+            match mode {
+                RunnerMode::Plan => self.config.planner.clone(),
+                RunnerMode::Build => self.config.builder.clone(),
+            }
+        }
+    }
+
     async fn execute_runner<D>(
         &self,
         config: &ralph_core::RunnerConfig,
@@ -603,6 +845,19 @@ fn preview(contents: &str) -> String {
     } else {
         compact.join("\n")
     }
+}
+
+fn render_spec_diff(
+    previous_spec_path: &Utf8Path,
+    current_spec_path: &Utf8Path,
+    previous_spec: &str,
+    current_spec: &str,
+) -> String {
+    TextDiff::from_lines(previous_spec, current_spec)
+        .unified_diff()
+        .context_radius(3)
+        .header(previous_spec_path.as_str(), current_spec_path.as_str())
+        .to_string()
 }
 
 #[derive(Default)]

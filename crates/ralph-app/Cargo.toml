@@ -9,6 +9,7 @@ async-trait.workspace = true
 camino.workspace = true
 ralph-core = { path = "../ralph-core" }
 ralph-runner = { path = "../ralph-runner" }
+similar.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
