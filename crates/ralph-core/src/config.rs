@@ -20,7 +20,6 @@ pub enum QuestionSupportMode {
     Disabled,
     #[default]
     TextProtocol,
-    NativeTool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

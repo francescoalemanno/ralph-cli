@@ -1,7 +1,6 @@
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU8, Ordering},
-    Mutex,
 };
 
 use camino::Utf8PathBuf;
@@ -37,23 +36,28 @@ impl RunnerMode {
 pub struct SpecPaths {
     pub spec_path: Utf8PathBuf,
     pub progress_path: Utf8PathBuf,
+    pub feedback_path: Utf8PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpecSummary {
     pub spec_path: Utf8PathBuf,
     pub progress_path: Utf8PathBuf,
+    pub feedback_path: Utf8PathBuf,
     pub state: WorkflowState,
     pub spec_preview: String,
     pub progress_preview: String,
+    pub feedback_preview: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewData {
     pub spec_path: Utf8PathBuf,
     pub progress_path: Utf8PathBuf,
+    pub feedback_path: Utf8PathBuf,
     pub spec_contents: String,
     pub progress_contents: String,
+    pub feedback_contents: String,
     pub state: WorkflowState,
 }
 
@@ -71,9 +75,9 @@ pub struct ClarificationRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClarificationExchange {
-    pub question: String,
-    pub answer: String,
+pub struct ClarificationAnswer {
+    pub text: String,
+    pub used_option_selection: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,12 +87,12 @@ pub struct RunnerInvocation {
     pub mode: RunnerMode,
     pub spec_path: Utf8PathBuf,
     pub progress_path: Utf8PathBuf,
+    pub feedback_path: Utf8PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerResult {
-    pub stdout: String,
-    pub stderr: String,
+    pub output: String,
     pub exit_code: i32,
 }
 
@@ -113,11 +117,17 @@ impl RunControl {
     }
 
     pub fn set_coding_agent(&self, agent: CodingAgent) {
-        *self.coding_agent.lock().expect("run control mutex poisoned") = Some(agent);
+        *self
+            .coding_agent
+            .lock()
+            .expect("run control mutex poisoned") = Some(agent);
     }
 
     pub fn coding_agent(&self) -> Option<CodingAgent> {
-        *self.coding_agent.lock().expect("run control mutex poisoned")
+        *self
+            .coding_agent
+            .lock()
+            .expect("run control mutex poisoned")
     }
 
     pub fn is_cancelled(&self) -> bool {

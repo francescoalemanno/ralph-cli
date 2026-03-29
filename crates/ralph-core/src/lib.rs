@@ -22,6 +22,6 @@ pub use prompts::{
 pub use slug::generate_slug;
 pub use store::ArtifactStore;
 pub use types::{
-    ClarificationExchange, ClarificationOption, ClarificationRequest, ReviewData, RunControl,
+    ClarificationAnswer, ClarificationOption, ClarificationRequest, ReviewData, RunControl,
     RunnerInvocation, RunnerMode, RunnerResult, SpecPaths, SpecSummary, WorkflowState,
 };
