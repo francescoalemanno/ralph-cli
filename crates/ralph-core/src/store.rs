@@ -24,7 +24,7 @@ impl ArtifactStore {
     }
 
     pub fn ralph_dir(&self) -> Utf8PathBuf {
-        self.project_dir.join("ralph")
+        self.project_dir.join(".ralph")
     }
 
     pub fn ensure_ralph_dir(&self) -> Result<()> {
@@ -293,19 +293,19 @@ mod tests {
 
     #[test]
     fn derives_default_progress_path() {
-        let path = Utf8Path::new("/tmp/project/ralph/spec-otter-thread-sage.md");
+        let path = Utf8Path::new("/tmp/project/.ralph/spec-otter-thread-sage.md");
         let progress = ArtifactStore::derive_progress_path(path).unwrap();
         assert_eq!(
             progress,
-            "/tmp/project/ralph/progress-otter-thread-sage.txt"
+            "/tmp/project/.ralph/progress-otter-thread-sage.txt"
         );
     }
 
     #[test]
     fn derives_custom_progress_path() {
-        let path = Utf8Path::new("/tmp/project/ralph/my-feature.md");
+        let path = Utf8Path::new("/tmp/project/.ralph/my-feature.md");
         let progress = ArtifactStore::derive_progress_path(path).unwrap();
-        assert_eq!(progress, "/tmp/project/ralph/my-feature.progress.txt");
+        assert_eq!(progress, "/tmp/project/.ralph/my-feature.progress.txt");
     }
 
     #[test]
@@ -365,5 +365,17 @@ mod tests {
             store.read_progress(&paths.progress_path).unwrap(),
             "Task\n<promise>DONE</promise>\n"
         );
+    }
+
+    #[test]
+    fn ignores_legacy_visible_ralph_directory() {
+        let (_temp, store) = store();
+        let legacy_dir = store.project_dir().join("ralph");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(legacy_dir.join("spec-legacy.md"), sample_spec("legacy")).unwrap();
+        fs::write(legacy_dir.join("progress-legacy.txt"), "Task 1\n").unwrap();
+
+        let specs = store.list_specs().unwrap();
+        assert!(specs.is_empty());
     }
 }
