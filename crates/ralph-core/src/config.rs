@@ -23,6 +23,30 @@ pub enum QuestionSupportMode {
     NativeTool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingAgent {
+    #[default]
+    Opencode,
+    Codex,
+}
+
+impl CodingAgent {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Opencode => "OpenCode",
+            Self::Codex => "Codex",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Opencode => Self::Codex,
+            Self::Codex => Self::Opencode,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerConfig {
     pub program: String,
@@ -42,19 +66,48 @@ pub struct RunnerConfig {
 
 impl Default for RunnerConfig {
     fn default() -> Self {
-        Self {
-            program: "opencode".to_owned(),
-            args: vec![
-                "run".to_owned(),
-                "--format".to_owned(),
-                "default".to_owned(),
-                "--thinking".to_owned(),
-            ],
-            env: BTreeMap::new(),
-            prompt_transport: PromptTransport::Stdin,
-            prompt_env_var: default_prompt_env_var(),
-            question_support: QuestionSupportMode::TextProtocol,
-            shell_template: None,
+        Self::for_agent(CodingAgent::Opencode)
+    }
+}
+
+impl RunnerConfig {
+    pub fn for_agent(agent: CodingAgent) -> Self {
+        match agent {
+            CodingAgent::Opencode => Self {
+                program: "opencode".to_owned(),
+                args: vec![
+                    "run".to_owned(),
+                    "--format".to_owned(),
+                    "default".to_owned(),
+                    "--thinking".to_owned(),
+                ],
+                env: BTreeMap::new(),
+                prompt_transport: PromptTransport::Stdin,
+                prompt_env_var: default_prompt_env_var(),
+                question_support: QuestionSupportMode::TextProtocol,
+                shell_template: None,
+            },
+            CodingAgent::Codex => Self {
+                program: "codex".to_owned(),
+                args: vec![
+                    "exec".to_owned(),
+                    "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+                    "--ephemeral".to_owned(),
+                ],
+                env: BTreeMap::new(),
+                prompt_transport: PromptTransport::Stdin,
+                prompt_env_var: default_prompt_env_var(),
+                question_support: QuestionSupportMode::TextProtocol,
+                shell_template: None,
+            },
+        }
+    }
+
+    pub fn inferred_agent(&self) -> Option<CodingAgent> {
+        match normalized_program_name(&self.program).as_deref() {
+            Some("opencode") => Some(CodingAgent::Opencode),
+            Some("codex") => Some(CodingAgent::Codex),
+            _ => None,
         }
     }
 }
@@ -155,6 +208,18 @@ impl AppConfig {
 
         Ok(config)
     }
+
+    pub fn coding_agent(&self) -> CodingAgent {
+        self.builder
+            .inferred_agent()
+            .or_else(|| self.planner.inferred_agent())
+            .unwrap_or_default()
+    }
+
+    pub fn set_coding_agent(&mut self, agent: CodingAgent) {
+        self.planner = RunnerConfig::for_agent(agent);
+        self.builder = RunnerConfig::for_agent(agent);
+    }
 }
 
 fn read_partial_config(path: &Utf8Path) -> Result<PartialAppConfig> {
@@ -251,4 +316,58 @@ fn default_success_color() -> String {
 
 fn default_warning_color() -> String {
     "yellow".to_owned()
+}
+
+fn normalized_program_name(program: &str) -> Option<String> {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppConfig, CodingAgent, RunnerConfig};
+
+    #[test]
+    fn codex_runner_preset_matches_exec_cli() {
+        let config = RunnerConfig::for_agent(CodingAgent::Codex);
+        assert_eq!(config.program, "codex");
+        assert_eq!(
+            config.args,
+            vec![
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--ephemeral",
+            ]
+        );
+    }
+
+    #[test]
+    fn infers_known_agents_from_program_name() {
+        assert_eq!(
+            RunnerConfig {
+                program: "/opt/homebrew/bin/codex".to_owned(),
+                ..RunnerConfig::default()
+            }
+            .inferred_agent(),
+            Some(CodingAgent::Codex)
+        );
+        assert_eq!(
+            RunnerConfig {
+                program: r"C:\\Tools\\opencode.exe".to_owned(),
+                ..RunnerConfig::default()
+            }
+            .inferred_agent(),
+            Some(CodingAgent::Opencode)
+        );
+    }
+
+    #[test]
+    fn app_config_switches_planner_and_builder_together() {
+        let mut config = AppConfig::default();
+        config.set_coding_agent(CodingAgent::Codex);
+        assert_eq!(config.coding_agent(), CodingAgent::Codex);
+        assert_eq!(config.planner.program, "codex");
+        assert_eq!(config.builder.program, "codex");
+    }
 }
