@@ -150,15 +150,14 @@ Do this:
 - complete that task fully
 - run the relevant checks for that task
 - update progress before finishing
-- emit DONE only when the full spec is complete and verified
 
 Artifacts:
 - spec: {spec_path}
 - progress: {progress_path}
 
 End with exactly one of:
-- <promise>DONE</promise>
-- <promise>CONTINUE</promise>
+- <promise>DONE</promise>   only when the full spec is complete and verified
+- <promise>CONTINUE</promise>  otherwise
 "#,
         spec_path = context.spec_path,
         progress_path = context.progress_path,
