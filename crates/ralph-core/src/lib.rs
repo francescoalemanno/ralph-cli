@@ -8,7 +8,8 @@ mod types;
 
 pub use clarification::parse_clarification_request;
 pub use config::{
-    AppConfig, CodingAgent, PromptTransport, QuestionSupportMode, RunnerConfig, ThemeConfig,
+    AppConfig, CliColorMode, CliConfig, CliOutputMode, CliPagerMode, CliPromptInputMode,
+    CodingAgent, ConfigFileScope, PromptTransport, QuestionSupportMode, RunnerConfig, ThemeConfig,
 };
 pub use markers::{
     BuilderMarker, MarkerError, PlanningMarker, append_persisted_done_marker,

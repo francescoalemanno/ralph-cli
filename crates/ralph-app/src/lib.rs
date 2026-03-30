@@ -115,6 +115,10 @@ where
         &self.config
     }
 
+    pub fn config_mut(&mut self) -> &mut AppConfig {
+        &mut self.config
+    }
+
     pub fn coding_agent(&self) -> CodingAgent {
         self.config.coding_agent()
     }

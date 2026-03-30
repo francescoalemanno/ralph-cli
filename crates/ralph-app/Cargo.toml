@@ -7,8 +7,8 @@ edition.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 camino.workspace = true
-ralph-core = { version = "0.1.0", path = "../ralph-core" }
-ralph-runner = { version = "0.1.0", path = "../ralph-runner" }
+ralph-core = { version = "0.1.1", path = "../ralph-core" }
+ralph-runner = { version = "0.1.1", path = "../ralph-runner" }
 similar.workspace = true
 tokio.workspace = true
 tracing.workspace = true

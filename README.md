@@ -114,29 +114,67 @@ ralph <target>
 
 ## CLI Commands
 
+Ralph keeps two special entry points:
+
+- `ralph`: open the full TUI
+- `ralph <target>`: open the scoped TUI for a single target
+
+Everything else is organized as a guided CLI:
+
 ```text
-ralph tui
-ralph list
-ralph review <target>
-ralph run <target>
-ralph revise <target> [--prompt "..."]
+ralph new [target]
+ralph plan <target>
+ralph build <target>
+ralph status [target]
+ralph show <target> [--artifact spec|progress|feedback|all]
 ralph edit <target>
-ralph create [--prompt "..."]
-ralph replan <target> [--prompt "..."]
+
+ralph agent list
+ralph agent current
+ralph agent set <opencode|codex|raijin> [--scope project|user]
+
+ralph config show [--scope effective|project|user]
+ralph config get <key> [--scope effective|project|user]
+ralph config set <key> <value> [--scope project|user]
+ralph config edit [--scope project|user]
+ralph config path [--scope project|user]
+
+ralph init
+ralph doctor
 ```
 
-What they do:
+Daily workflow:
 
-- `tui`: open the full terminal UI
-- `list`: print known specs and their states
-- `review`: print the spec and progress for a target
-- `run`: execute builder iterations for a target
-- `revise`: send new planning input for an existing target
-- `edit`: open the spec in your editor
-- `create`: create a new spec from a planning request
-- `replan`: replace the plan for an existing target from a fresh request
+- `new`: create a new target and run the planner
+- `plan`: revise an existing target from a new planning request
+- `build`: run builder iterations for a target
+- `status`: list all targets or summarize one target
+- `show`: print durable artifacts
+- `edit`: open the spec in your editor and automatically revise progress if the spec changed
 
-If `--prompt` is omitted for `create`, `revise`, or `replan`, Ralph reads the planning request from stdin or interactively from the terminal.
+Operational commands:
+
+- `agent`: inspect supported agents, see the effective selection, and persist an agent into config
+- `config`: inspect, edit, and update user or project config from the CLI
+- `init`: create `./.ralph/config.toml`
+- `doctor`: verify config, editor, writable project state, and supported agents on `PATH`
+
+The workflow override flags also have persistent config equivalents:
+
+- `--planning-max-iterations` <-> `planning_max_iterations`
+- `--builder-max-iterations` <-> `builder_max_iterations`
+- `--editor-command` <-> `editor_override`
+
+You can persist them with `ralph config set ...` or by editing `~/.config/ralph/config.toml` / `./.ralph/config.toml` directly.
+
+Planning input for `new` and `plan` can come from:
+
+- `--prompt "..."`
+- `--prompt-file path/to/request.txt`
+- `--stdin`
+- `--editor`
+
+If none of those flags are given, Ralph uses `[cli].prompt_input` from config. In `auto` mode it uses the editor on a TTY and stdin otherwise.
 
 ## Artifact Layout
 
@@ -171,6 +209,26 @@ Project config overrides user config.
 
 The TUI persists the selected coding agent into `./.ralph/config.toml`.
 
+The CLI also has its own preferences under `[cli]` for inspect output, paging, and planning-request input behavior.
+
+Common persistent keys:
+
+- `planning_max_iterations`
+- `builder_max_iterations`
+- `editor_override`
+- `cli.output`
+- `cli.pager`
+- `cli.color`
+- `cli.prompt_input`
+
+Examples:
+
+```bash
+ralph config set planning_max_iterations 12 --scope project
+ralph config set builder_max_iterations 40 --scope project
+ralph config set editor_override nvim --scope user
+```
+
 ### Example
 
 ```toml
@@ -189,6 +247,12 @@ question_support = "text_protocol"
 planning_max_iterations = 8
 builder_max_iterations = 25
 editor_override = "nvim"
+
+[cli]
+color = "auto"
+pager = "auto"
+output = "text"
+prompt_input = "auto"
 
 [theme]
 accent_color = "cyan"

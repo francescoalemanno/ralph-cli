@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, env, ffi::OsStr, fs, path::Path};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,48 @@ use serde::{Deserialize, Serialize};
 use crate::store::ARTIFACT_DIR_NAME;
 
 const PROJECT_CONFIG_FILE_NAME: &str = "config.toml";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CliColorMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CliPagerMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CliOutputMode {
+    #[default]
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CliPromptInputMode {
+    #[default]
+    Auto,
+    Stdin,
+    Editor,
+    Prompt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFileScope {
+    User,
+    Project,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -178,6 +220,29 @@ impl Default for ThemeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliConfig {
+    #[serde(default)]
+    pub color: CliColorMode,
+    #[serde(default)]
+    pub pager: CliPagerMode,
+    #[serde(default)]
+    pub output: CliOutputMode,
+    #[serde(default)]
+    pub prompt_input: CliPromptInputMode,
+}
+
+impl Default for CliConfig {
+    fn default() -> Self {
+        Self {
+            color: CliColorMode::Auto,
+            pager: CliPagerMode::Auto,
+            output: CliOutputMode::Text,
+            prompt_input: CliPromptInputMode::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub planner: RunnerConfig,
@@ -191,6 +256,8 @@ pub struct AppConfig {
     pub editor_override: Option<String>,
     #[serde(default)]
     pub theme: ThemeConfig,
+    #[serde(default)]
+    pub cli: CliConfig,
 }
 
 impl Default for AppConfig {
@@ -202,6 +269,7 @@ impl Default for AppConfig {
             builder_max_iterations: default_builder_iterations(),
             editor_override: None,
             theme: ThemeConfig::default(),
+            cli: CliConfig::default(),
         }
     }
 }
@@ -235,6 +303,18 @@ struct PartialThemeConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+struct PartialCliConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    color: Option<CliColorMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pager: Option<CliPagerMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<CliOutputMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_input: Option<CliPromptInputMode>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct PartialAppConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     planner: Option<PartialRunnerConfig>,
@@ -248,6 +328,8 @@ struct PartialAppConfig {
     editor_override: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     theme: Option<PartialThemeConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cli: Option<PartialCliConfig>,
 }
 
 impl AppConfig {
@@ -267,6 +349,8 @@ impl AppConfig {
             config = merge_config(config, partial);
         }
 
+        config.select_detected_coding_agent(&CodingAgent::detected());
+
         Ok(config)
     }
 
@@ -282,26 +366,141 @@ impl AppConfig {
         self.builder = RunnerConfig::for_agent(agent);
     }
 
-    pub fn persist_project_coding_agent(project_dir: &Utf8Path, agent: CodingAgent) -> Result<()> {
-        let project_path = project_config_path(project_dir);
-        let mut partial = if project_path.exists() {
-            read_partial_config(&project_path)?
-        } else {
-            PartialAppConfig::default()
-        };
-        let runner = PartialRunnerConfig::from(RunnerConfig::for_agent(agent));
-        partial.planner = Some(runner.clone());
-        partial.builder = Some(runner);
-
-        let rendered =
-            toml::to_string_pretty(&partial).context("failed to serialize project config")?;
-        if let Some(parent) = project_path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create project config directory at {parent}")
-            })?;
+    pub fn select_detected_coding_agent(&mut self, detected: &[CodingAgent]) -> bool {
+        let current = self.coding_agent();
+        if detected.is_empty() || detected.contains(&current) {
+            return false;
         }
-        fs::write(&project_path, rendered)
-            .with_context(|| format!("failed to write project config at {project_path}"))?;
+
+        self.set_coding_agent(detected[0]);
+        true
+    }
+
+    pub fn persist_project_coding_agent(project_dir: &Utf8Path, agent: CodingAgent) -> Result<()> {
+        Self::persist_scoped_coding_agent(project_dir, ConfigFileScope::Project, agent)
+    }
+
+    pub fn persist_scoped_coding_agent(
+        project_dir: &Utf8Path,
+        scope: ConfigFileScope,
+        agent: CodingAgent,
+    ) -> Result<()> {
+        let path = config_path_for_scope(project_dir, scope)?
+            .ok_or_else(|| anyhow!("unable to resolve config path for scope"))?;
+        let mut document = read_config_document(&path)?;
+        let runner =
+            toml::Value::try_from(PartialRunnerConfig::from(RunnerConfig::for_agent(agent)))
+                .context("failed to serialize runner config")?;
+        set_toml_path(&mut document, &["planner"], runner.clone())?;
+        set_toml_path(&mut document, &["builder"], runner)?;
+        write_config_document(&path, &document)
+    }
+
+    pub fn user_config_path() -> Result<Option<Utf8PathBuf>> {
+        user_config_path()
+    }
+
+    pub fn project_config_path(project_dir: &Utf8Path) -> Utf8PathBuf {
+        project_config_path(project_dir)
+    }
+
+    pub fn config_path_for_scope(
+        project_dir: &Utf8Path,
+        scope: ConfigFileScope,
+    ) -> Result<Option<Utf8PathBuf>> {
+        config_path_for_scope(project_dir, scope)
+    }
+
+    pub fn read_scoped_config(
+        project_dir: &Utf8Path,
+        scope: ConfigFileScope,
+    ) -> Result<Option<toml::Value>> {
+        let Some(path) = config_path_for_scope(project_dir, scope)? else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_config_document(&path).map(Some)
+    }
+
+    pub fn scoped_config_toml(
+        project_dir: &Utf8Path,
+        scope: ConfigFileScope,
+    ) -> Result<Option<String>> {
+        Self::read_scoped_config(project_dir, scope)?
+            .map(|value| toml::to_string_pretty(&value))
+            .transpose()
+            .context("failed to serialize config document")
+    }
+
+    pub fn effective_toml(&self) -> Result<String> {
+        toml::to_string_pretty(self).context("failed to serialize effective config")
+    }
+
+    pub fn set_scoped_config_value(
+        project_dir: &Utf8Path,
+        scope: ConfigFileScope,
+        dotted_key: &str,
+        value: toml::Value,
+    ) -> Result<()> {
+        let path = parse_dotted_key(dotted_key)?;
+        validate_supported_config_path(&path)?;
+        let config_path = config_path_for_scope(project_dir, scope)?
+            .ok_or_else(|| anyhow!("unable to resolve config path for scope"))?;
+        let mut document = read_config_document(&config_path)?;
+        set_toml_path(&mut document, &path, value)?;
+        write_config_document(&config_path, &document)
+    }
+
+    pub fn scoped_config_value(
+        project_dir: &Utf8Path,
+        scope: ConfigFileScope,
+        dotted_key: &str,
+    ) -> Result<Option<toml::Value>> {
+        let path = parse_dotted_key(dotted_key)?;
+        let Some(document) = Self::read_scoped_config(project_dir, scope)? else {
+            return Ok(None);
+        };
+        Ok(lookup_toml_path(&document, &path).cloned())
+    }
+
+    pub fn configured_coding_agent_for_scope(
+        project_dir: &Utf8Path,
+        scope: ConfigFileScope,
+    ) -> Result<Option<CodingAgent>> {
+        let Some(document) = Self::read_scoped_config(project_dir, scope)? else {
+            return Ok(None);
+        };
+        let builder = lookup_toml_path(&document, &["builder", "program"])
+            .and_then(toml::Value::as_str)
+            .and_then(|program| {
+                RunnerConfig {
+                    program: program.to_owned(),
+                    ..RunnerConfig::default()
+                }
+                .inferred_agent()
+            });
+        if builder.is_some() {
+            return Ok(builder);
+        }
+        Ok(lookup_toml_path(&document, &["planner", "program"])
+            .and_then(toml::Value::as_str)
+            .and_then(|program| {
+                RunnerConfig {
+                    program: program.to_owned(),
+                    ..RunnerConfig::default()
+                }
+                .inferred_agent()
+            }))
+    }
+
+    pub fn validate_scoped_config(project_dir: &Utf8Path, scope: ConfigFileScope) -> Result<()> {
+        if let Some(path) = config_path_for_scope(project_dir, scope)?
+            && path.exists()
+        {
+            read_config_document(&path)?;
+        }
         Ok(())
     }
 }
@@ -316,6 +515,130 @@ fn project_config_path(project_dir: &Utf8Path) -> Utf8PathBuf {
     project_dir
         .join(ARTIFACT_DIR_NAME)
         .join(PROJECT_CONFIG_FILE_NAME)
+}
+
+fn config_path_for_scope(
+    project_dir: &Utf8Path,
+    scope: ConfigFileScope,
+) -> Result<Option<Utf8PathBuf>> {
+    match scope {
+        ConfigFileScope::User => user_config_path(),
+        ConfigFileScope::Project => Ok(Some(project_config_path(project_dir))),
+    }
+}
+
+fn read_config_document(path: &Utf8Path) -> Result<toml::Value> {
+    if !path.exists() {
+        return Ok(toml::Value::Table(toml::map::Map::new()));
+    }
+
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file at {path}"))?;
+    let document = raw
+        .parse::<toml::Value>()
+        .with_context(|| format!("failed to parse config file at {path}"))?;
+    validate_config_document(&document)?;
+    Ok(document)
+}
+
+fn write_config_document(path: &Utf8Path, document: &toml::Value) -> Result<()> {
+    validate_config_document(document)?;
+    let rendered =
+        toml::to_string_pretty(document).context("failed to serialize config document")?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config directory at {parent}"))?;
+    }
+    fs::write(path, rendered).with_context(|| format!("failed to write config file at {path}"))
+}
+
+fn validate_config_document(document: &toml::Value) -> Result<()> {
+    let rendered = toml::to_string(document).context("failed to serialize config document")?;
+    toml::from_str::<PartialAppConfig>(&rendered)
+        .context("failed to validate config document")
+        .map(|_| ())
+}
+
+fn parse_dotted_key(dotted_key: &str) -> Result<Vec<&str>> {
+    let segments = dotted_key
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return Err(anyhow!("config key cannot be empty"));
+    }
+    Ok(segments)
+}
+
+fn validate_supported_config_path(path: &[&str]) -> Result<()> {
+    let allowed = matches!(
+        path,
+        [
+            "planner",
+            "program"
+                | "args"
+                | "prompt_transport"
+                | "prompt_env_var"
+                | "question_support"
+                | "shell_template"
+        ] | [
+            "builder",
+            "program"
+                | "args"
+                | "prompt_transport"
+                | "prompt_env_var"
+                | "question_support"
+                | "shell_template"
+        ] | ["planning_max_iterations"]
+            | ["builder_max_iterations"]
+            | ["editor_override"]
+            | ["theme", "accent_color" | "success_color" | "warning_color"]
+            | ["cli", "color" | "pager" | "output" | "prompt_input"]
+    ) || matches!(path, ["planner", "env", _] | ["builder", "env", _]);
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(anyhow!("unsupported config key `{}`", path.join(".")))
+    }
+}
+
+fn set_toml_path(root: &mut toml::Value, path: &[&str], value: toml::Value) -> Result<()> {
+    let toml::Value::Table(table) = root else {
+        return Err(anyhow!("config document root must be a table"));
+    };
+    set_toml_path_in_table(table, path, value);
+    Ok(())
+}
+
+fn set_toml_path_in_table(
+    table: &mut toml::map::Map<String, toml::Value>,
+    path: &[&str],
+    value: toml::Value,
+) {
+    if path.len() == 1 {
+        table.insert(path[0].to_owned(), value);
+        return;
+    }
+
+    let entry = table
+        .entry(path[0].to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if !entry.is_table() {
+        *entry = toml::Value::Table(toml::map::Map::new());
+    }
+    let nested = entry
+        .as_table_mut()
+        .expect("entry is forced to a table above");
+    set_toml_path_in_table(nested, &path[1..], value);
+}
+
+fn lookup_toml_path<'a>(root: &'a toml::Value, path: &[&str]) -> Option<&'a toml::Value> {
+    let mut current = root;
+    for segment in path {
+        current = current.as_table()?.get(*segment)?;
+    }
+    Some(current)
 }
 
 fn merge_config(mut config: AppConfig, partial: PartialAppConfig) -> AppConfig {
@@ -343,6 +666,20 @@ fn merge_config(mut config: AppConfig, partial: PartialAppConfig) -> AppConfig {
         }
         if let Some(color) = theme.warning_color {
             config.theme.warning_color = color;
+        }
+    }
+    if let Some(cli) = partial.cli {
+        if let Some(color) = cli.color {
+            config.cli.color = color;
+        }
+        if let Some(pager) = cli.pager {
+            config.cli.pager = pager;
+        }
+        if let Some(output) = cli.output {
+            config.cli.output = output;
+        }
+        if let Some(prompt_input) = cli.prompt_input {
+            config.cli.prompt_input = prompt_input;
         }
     }
     config
@@ -568,6 +905,27 @@ mod tests {
         assert_eq!(CodingAgent::Codex.next_in(&detected), CodingAgent::Raijin);
         assert_eq!(CodingAgent::Raijin.next_in(&detected), CodingAgent::Codex);
         assert_eq!(CodingAgent::Opencode.next_in(&detected), CodingAgent::Codex);
+    }
+
+    #[test]
+    fn startup_selects_first_detected_agent_when_current_is_unavailable() {
+        let mut config = AppConfig::default();
+
+        assert!(config.select_detected_coding_agent(&[CodingAgent::Raijin]));
+        assert_eq!(config.coding_agent(), CodingAgent::Raijin);
+        assert_eq!(config.planner.program, "raijin");
+        assert_eq!(config.builder.program, "raijin");
+    }
+
+    #[test]
+    fn startup_keeps_current_agent_when_it_is_detected() {
+        let mut config = AppConfig::default();
+        config.set_coding_agent(CodingAgent::Raijin);
+
+        assert!(!config.select_detected_coding_agent(&[CodingAgent::Raijin]));
+        assert_eq!(config.coding_agent(), CodingAgent::Raijin);
+        assert_eq!(config.planner.program, "raijin");
+        assert_eq!(config.builder.program, "raijin");
     }
 
     #[test]
