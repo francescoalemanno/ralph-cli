@@ -1,0 +1,5 @@
+[patch.crates-io]
+ralph-app = { path = "crates/ralph-app" }
+ralph-core = { path = "crates/ralph-core" }
+ralph-runner = { path = "crates/ralph-runner" }
+ralph-tui = { path = "crates/ralph-tui" }

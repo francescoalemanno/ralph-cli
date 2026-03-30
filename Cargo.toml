@@ -11,6 +11,11 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+description = "Durable planning and execution workflow for repositories"
+documentation = "https://docs.rs/ralph"
+readme = "README.md"
+keywords = ["cli", "developer-tools", "planning", "terminal", "tui"]
+categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 anyhow = "1.0.100"
@@ -38,3 +43,9 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 tui-textarea = "0.7.0"
 unicode-width = "0.2.0"
+
+[patch.crates-io]
+ralph-app = { path = "crates/ralph-app" }
+ralph-core = { path = "crates/ralph-core" }
+ralph-runner = { path = "crates/ralph-runner" }
+ralph-tui = { path = "crates/ralph-tui" }
