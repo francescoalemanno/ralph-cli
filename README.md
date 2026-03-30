@@ -4,6 +4,8 @@
 
 It keeps planning state on disk, separates planning from building, and makes agent-driven work resumable instead of ephemeral.
 
+![Ralph TUI](tui.png)
+
 Source:
 
 - [github.com/francescoalemanno/ralph-cli](https://github.com/francescoalemanno/ralph-cli)
