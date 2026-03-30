@@ -190,19 +190,25 @@ warning_color = "yellow"
 
 ## Built-In Agent Presets
 
-Ralph currently includes presets for:
+Ralph currently supports three external coding-agent CLIs via built-in presets. "Supported" here means Ralph knows how to:
 
-- OpenCode
-- Codex
-- Raijin
+- detect the agent on `PATH`
+- persist it in config
+- switch to it in the TUI
+- invoke it with the expected command shape for planner and builder passes
 
-The TUI only cycles among agents detected on `PATH`.
+Supported agents:
 
-Current built-in command shapes:
+- OpenCode: [anomalyco/opencode](https://github.com/anomalyco/opencode)
+  Ralph treats this as the open source terminal coding agent and invokes it as `opencode run --format default --thinking`.
+- Codex: [openai/codex](https://github.com/openai/codex)
+  Ralph treats this as OpenAI's terminal coding agent and invokes it as `codex exec --dangerously-bypass-approvals-and-sandbox --ephemeral`.
+- Raijin: [francescoalemanno/raijin-mono](https://github.com/francescoalemanno/raijin-mono/)
+  Ralph treats this as a fast terminal AI assistant with one-shot CLI support and invokes it as `raijin -ephemeral "$PROMPT"`.
 
-- OpenCode: `opencode run --format default --thinking`
-- Codex: `codex exec --dangerously-bypass-approvals-and-sandbox --ephemeral`
-- Raijin: `raijin -ephemeral "$PROMPT"`
+The TUI only cycles among supported agents that are actually detected on `PATH`.
+
+If you configure a different command manually, Ralph may still run it if the command shape is compatible, but only the three presets above are first-class supported agents.
 
 ## Prompting Model
 
