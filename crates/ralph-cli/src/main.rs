@@ -8,7 +8,7 @@ use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use ralph_app::{ConsoleDelegate, RalphApp};
 use ralph_core::RunControl;
-use ralph_tui::run_tui;
+use ralph_tui::{run_tui, run_tui_scoped};
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug, Parser)]
@@ -53,6 +53,15 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
+    if let Some(target) = direct_tui_target_argument() {
+        let project_dir = current_project_dir()?;
+        let app = RalphApp::load(project_dir)?;
+        if io::stdin().is_terminal() && io::stdout().is_terminal() {
+            run_tui_scoped(app, &target)?;
+            return Ok(());
+        }
+        return Err(anyhow!("interactive TUI requires a TTY"));
+    }
     let cli = Cli::parse();
     let project_dir = current_project_dir()?;
     let app = RalphApp::load(project_dir)?;
@@ -123,6 +132,25 @@ fn init_tracing() {
 fn current_project_dir() -> Result<Utf8PathBuf> {
     let cwd = env::current_dir().context("failed to get current directory")?;
     Utf8PathBuf::from_path_buf(cwd).map_err(|_| anyhow!("current directory is not valid UTF-8"))
+}
+
+fn direct_tui_target_argument() -> Option<String> {
+    let mut args = env::args().skip(1);
+    let first = args.next()?;
+    if args.next().is_some() {
+        return None;
+    }
+    if first.starts_with('-') || is_known_command(&first) {
+        return None;
+    }
+    Some(first)
+}
+
+fn is_known_command(value: &str) -> bool {
+    matches!(
+        value,
+        "tui" | "list" | "review" | "run" | "revise" | "edit" | "create" | "replan"
+    )
 }
 
 fn install_ctrl_c_handler() -> RunControl {
