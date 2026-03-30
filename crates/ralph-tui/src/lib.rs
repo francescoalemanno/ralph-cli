@@ -70,6 +70,29 @@ pub fn run_tui(app: RalphApp) -> Result<()> {
     result
 }
 
+pub fn run_tui_scoped(app: RalphApp, target: &str) -> Result<()> {
+    let summary = app.prepare_target_for_tui(target)?;
+    let handle = Handle::current();
+    enable_raw_mode().context("failed to enable raw mode")?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .context("failed to enter alternate screen")?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("failed to create terminal backend")?;
+
+    let result = TuiApp::new_scoped(app, handle, summary).run(&mut terminal);
+
+    disable_raw_mode().ok();
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
+    .ok();
+    terminal.show_cursor().ok();
+    result
+}
+
 enum UiEvent {
     Tick,
     Key(KeyEvent),
@@ -202,6 +225,7 @@ struct TuiApp {
     focus_spec_path: Option<String>,
     pending_editor_target: Option<String>,
     input_suspended: Arc<AtomicBool>,
+    pinned_spec_path: Option<String>,
     should_quit: bool,
 }
 
@@ -246,8 +270,22 @@ impl TuiApp {
             focus_spec_path: None,
             pending_editor_target: None,
             input_suspended: Arc::new(AtomicBool::new(false)),
+            pinned_spec_path: None,
             should_quit: false,
         }
+    }
+
+    fn new_scoped(app: RalphApp, handle: Handle, summary: SpecSummary) -> Self {
+        let pinned_spec_path = Some(summary.spec_path.to_string());
+        let focus_spec_path = pinned_spec_path.clone();
+        let status = format!("Opened {}", summary.spec_path);
+        let mut tui = Self::new(app, handle);
+        tui.specs = vec![summary];
+        tui.screen = Screen::Scoped;
+        tui.status = status;
+        tui.focus_spec_path = focus_spec_path;
+        tui.pinned_spec_path = pinned_spec_path;
+        tui
     }
 
     fn run(mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
@@ -422,6 +460,7 @@ impl TuiApp {
             UiEvent::SpecsLoaded(result) => match result {
                 Ok(specs) => {
                     self.specs = specs;
+                    self.merge_pinned_spec_if_needed();
                     if let Some(path) = self.focus_spec_path.take() {
                         if let Some(index) = self
                             .specs
@@ -1073,6 +1112,18 @@ impl TuiApp {
                 .get(run_id)
                 .is_some_and(|run| run.target == target)
         })
+    }
+
+    fn merge_pinned_spec_if_needed(&mut self) {
+        let Some(path) = self.pinned_spec_path.clone() else {
+            return;
+        };
+        if self.specs.iter().any(|summary| summary.spec_path.as_str() == path) {
+            return;
+        }
+        if let Ok(summary) = self.app.prepare_target_for_tui(&path) {
+            self.specs.insert(0, summary);
+        }
     }
 
     fn handle_escape(&mut self) -> bool {
