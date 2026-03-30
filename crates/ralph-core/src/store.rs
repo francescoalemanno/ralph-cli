@@ -8,6 +8,9 @@ use crate::{
     append_persisted_done_marker, generate_slug,
 };
 
+pub const ARTIFACT_DIR_NAME: &str = ".ralph";
+#[cfg(test)]
+const LEGACY_ARTIFACT_DIR_NAME: &str = "ralph";
 const RECENT_USER_FEEDBACK_START: &str = "<RECENT-USER-FEEDBACK>";
 const RECENT_USER_FEEDBACK_END: &str = "</RECENT-USER-FEEDBACK>";
 const OLDER_USER_FEEDBACK_START: &str = "<OLDER-USER-FEEDBACK>";
@@ -30,7 +33,7 @@ impl ArtifactStore {
     }
 
     pub fn ralph_dir(&self) -> Utf8PathBuf {
-        self.project_dir.join(".ralph")
+        self.project_dir.join(ARTIFACT_DIR_NAME)
     }
 
     pub fn ensure_ralph_dir(&self) -> Result<()> {
@@ -443,28 +446,45 @@ mod tests {
 
     #[test]
     fn derives_default_progress_path() {
-        let path = Utf8Path::new("/tmp/project/.ralph/spec-otter-thread-sage.md");
-        let progress = ArtifactStore::derive_progress_path(path).unwrap();
+        let path = Utf8PathBuf::from(format!(
+            "/tmp/project/{ARTIFACT_DIR_NAME}/spec-otter-thread-sage.md"
+        ));
+        let progress = ArtifactStore::derive_progress_path(&path).unwrap();
         assert_eq!(
             progress,
-            "/tmp/project/.ralph/progress-otter-thread-sage.txt"
+            format!("/tmp/project/{ARTIFACT_DIR_NAME}/progress-otter-thread-sage.txt")
         );
     }
 
     #[test]
     fn derives_custom_progress_path() {
-        let path = Utf8Path::new("/tmp/project/.ralph/my-feature.md");
-        let progress = ArtifactStore::derive_progress_path(path).unwrap();
-        assert_eq!(progress, "/tmp/project/.ralph/my-feature.progress.txt");
+        let path = Utf8PathBuf::from(format!("/tmp/project/{ARTIFACT_DIR_NAME}/my-feature.md"));
+        let progress = ArtifactStore::derive_progress_path(&path).unwrap();
+        assert_eq!(
+            progress,
+            format!("/tmp/project/{ARTIFACT_DIR_NAME}/my-feature.progress.txt")
+        );
     }
 
     #[test]
     fn derives_feedback_path() {
-        let path = Utf8Path::new("/tmp/project/.ralph/spec-otter-thread-sage.md");
-        let feedback = ArtifactStore::derive_feedback_path(path).unwrap();
+        let path = Utf8PathBuf::from(format!(
+            "/tmp/project/{ARTIFACT_DIR_NAME}/spec-otter-thread-sage.md"
+        ));
+        let feedback = ArtifactStore::derive_feedback_path(&path).unwrap();
         assert_eq!(
             feedback,
-            "/tmp/project/.ralph/feedback-otter-thread-sage.txt"
+            format!("/tmp/project/{ARTIFACT_DIR_NAME}/feedback-otter-thread-sage.txt")
+        );
+    }
+
+    #[test]
+    fn resolves_named_targets_under_hidden_artifact_directory() {
+        let (_temp, store) = store();
+        let paths = store.resolve_target("alpha").unwrap();
+        assert_eq!(
+            paths.spec_path.parent(),
+            Some(store.project_dir().join(ARTIFACT_DIR_NAME).as_path())
         );
     }
 
@@ -662,7 +682,7 @@ mod tests {
     #[test]
     fn ignores_legacy_visible_ralph_directory() {
         let (_temp, store) = store();
-        let legacy_dir = store.project_dir().join("ralph");
+        let legacy_dir = store.project_dir().join(LEGACY_ARTIFACT_DIR_NAME);
         fs::create_dir_all(&legacy_dir).unwrap();
         fs::write(legacy_dir.join("spec-legacy.md"), sample_spec("legacy")).unwrap();
         fs::write(legacy_dir.join("progress-legacy.txt"), "Task 1\n").unwrap();
