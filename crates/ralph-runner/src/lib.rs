@@ -173,17 +173,16 @@ impl RunnerAdapter for CommandRunner {
                 return Err(anyhow!("runner canceled"));
             }
 
-            if sent_cancel_stage >= 1 {
-                if child
+            if sent_cancel_stage >= 1
+                && child
                     .try_wait()
                     .context("failed while polling canceled runner")?
                     .is_some()
-                {
-                    stdout_task.abort();
-                    stderr_task.abort();
-                    drop(temp_prompt);
-                    return Err(anyhow!("runner canceled"));
-                }
+            {
+                stdout_task.abort();
+                stderr_task.abort();
+                drop(temp_prompt);
+                return Err(anyhow!("runner canceled"));
             }
 
             if let Some(status) = child.try_wait().context("failed while polling runner")? {
@@ -349,6 +348,18 @@ fn render_template(
     rendered
 }
 
+fn shell_command() -> Command {
+    if cfg!(windows) {
+        let mut command = Command::new("cmd");
+        command.arg("/C");
+        command
+    } else {
+        let mut command = Command::new("sh");
+        command.arg("-lc");
+        command
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{has_explicit_opencode_config, is_opencode_program, opencode_auto_approve_config};
@@ -383,17 +394,5 @@ mod tests {
             opencode_auto_approve_config(),
             r#"{"$schema":"https://opencode.ai/config.json","permission":"allow"}"#
         );
-    }
-}
-
-fn shell_command() -> Command {
-    if cfg!(windows) {
-        let mut command = Command::new("cmd");
-        command.arg("/C");
-        command
-    } else {
-        let mut command = Command::new("sh");
-        command.arg("-lc");
-        command
     }
 }

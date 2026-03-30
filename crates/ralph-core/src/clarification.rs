@@ -10,36 +10,34 @@ pub fn parse_clarification_request(output: &str) -> Option<ClarificationRequest>
         let payload_start = start + start_tag.len();
         let candidate_from = payload_start;
 
-        loop {
-            let next_start = output[candidate_from..]
-                .find(start_tag)
-                .map(|offset| candidate_from + offset);
-            let next_end = output[candidate_from..]
-                .find(end_tag)
-                .map(|offset| candidate_from + offset);
+        let next_start = output[candidate_from..]
+            .find(start_tag)
+            .map(|offset| candidate_from + offset);
+        let next_end = output[candidate_from..]
+            .find(end_tag)
+            .map(|offset| candidate_from + offset);
 
-            match (next_start, next_end) {
-                (Some(nested_start), Some(end)) if nested_start < end => {
-                    search_from = nested_start;
-                    continue 'scan;
-                }
-                (_, Some(end)) => {
-                    let payload = output[payload_start..end].trim();
-                    if let Ok(request) = serde_json::from_str::<ClarificationRequest>(payload) {
-                        if !request.question.trim().is_empty() {
-                            return Some(request);
-                        }
-                    }
-
-                    search_from = end + end_tag.len();
-                    continue 'scan;
-                }
-                (Some(nested_start), None) => {
-                    search_from = nested_start;
-                    continue 'scan;
-                }
-                (None, None) => return None,
+        match (next_start, next_end) {
+            (Some(nested_start), Some(end)) if nested_start < end => {
+                search_from = nested_start;
+                continue 'scan;
             }
+            (_, Some(end)) => {
+                let payload = output[payload_start..end].trim();
+                if let Ok(request) = serde_json::from_str::<ClarificationRequest>(payload)
+                    && !request.question.trim().is_empty()
+                {
+                    return Some(request);
+                }
+
+                search_from = end + end_tag.len();
+                continue 'scan;
+            }
+            (Some(nested_start), None) => {
+                search_from = nested_start;
+                continue 'scan;
+            }
+            (None, None) => return None,
         }
     }
 

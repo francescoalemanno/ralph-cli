@@ -461,14 +461,13 @@ impl TuiApp {
                 Ok(specs) => {
                     self.specs = specs;
                     self.merge_pinned_spec_if_needed();
-                    if let Some(path) = self.focus_spec_path.take() {
-                        if let Some(index) = self
+                    if let Some(path) = self.focus_spec_path.take()
+                        && let Some(index) = self
                             .specs
                             .iter()
                             .position(|summary| summary.spec_path.as_str() == path)
-                        {
-                            self.selected = index;
-                        }
+                    {
+                        self.selected = index;
                     }
                     if self.selected >= self.specs.len() {
                         self.selected = self.specs.len().saturating_sub(1);
@@ -1118,7 +1117,11 @@ impl TuiApp {
         let Some(path) = self.pinned_spec_path.clone() else {
             return;
         };
-        if self.specs.iter().any(|summary| summary.spec_path.as_str() == path) {
+        if self
+            .specs
+            .iter()
+            .any(|summary| summary.spec_path.as_str() == path)
+        {
             return;
         }
         if let Ok(summary) = self.app.prepare_target_for_tui(&path) {
@@ -1823,7 +1826,7 @@ impl TuiApp {
             .select(self.review_tab)
             .block(
                 Block::default()
-                    .title(self.title_line("Review", &review.spec_path.to_string()))
+                    .title(self.title_line("Review", review.spec_path.as_ref()))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded),
             )
@@ -1926,9 +1929,7 @@ impl TuiApp {
             .len()
             .saturating_sub(usize::from(body_height.max(1))) as u16;
         let mut run_scroll = run.scroll;
-        if run.follow {
-            run_scroll = max_scroll;
-        } else if run_scroll > max_scroll {
+        if run.follow || run_scroll > max_scroll {
             run_scroll = max_scroll;
         }
         if let Some(run) = self.runs.get_mut(&run_id) {
@@ -2154,7 +2155,7 @@ impl TuiApp {
     }
 
     fn run_indicator(&self, run_id: RunId, run: &RunSession) -> Span<'static> {
-        let pulse_on = ((self.tick_count / 2) % 2) == 0;
+        let pulse_on = (self.tick_count / 2).is_multiple_of(2);
         if self
             .clarification
             .as_ref()
@@ -2412,18 +2413,17 @@ fn detect_color_mode() -> ColorMode {
         return color_mode;
     }
 
-    if let Ok(value) = env::var("COLORFGBG") {
-        if let Some(background) = value
+    if let Ok(value) = env::var("COLORFGBG")
+        && let Some(background) = value
             .split(';')
             .next_back()
             .and_then(|token| token.parse::<u8>().ok())
-        {
-            return if background >= 7 {
-                ColorMode::Light
-            } else {
-                ColorMode::Dark
-            };
-        }
+    {
+        return if background >= 7 {
+            ColorMode::Light
+        } else {
+            ColorMode::Dark
+        };
     }
 
     ColorMode::Dark
@@ -2471,7 +2471,7 @@ fn detect_color_mode_via_osc11() -> Option<ColorMode> {
         }
 
         let response = String::from_utf8(buffer).ok()?;
-        return parse_osc11_response(&response);
+        parse_osc11_response(&response)
     }
 
     #[cfg(not(unix))]
@@ -2736,11 +2736,8 @@ fn apply_scroll_delta(current: u16, delta: ScrollDelta, sticky_bottom: bool) -> 
         ScrollDelta::Pages(pages) => current.saturating_add_signed(pages * 12),
         ScrollDelta::Home => 0,
         ScrollDelta::End => {
-            if sticky_bottom {
-                u16::MAX
-            } else {
-                u16::MAX
-            }
+            let _ = sticky_bottom;
+            u16::MAX
         }
     }
 }
@@ -2834,7 +2831,7 @@ fn normalize_stream_chunk(chunk: &str) -> String {
             '\u{1b}' => {
                 if matches!(chars.peek(), Some('[')) {
                     chars.next();
-                    while let Some(next) = chars.next() {
+                    for next in chars.by_ref() {
                         if ('@'..='~').contains(&next) {
                             break;
                         }

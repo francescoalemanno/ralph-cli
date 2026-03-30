@@ -997,13 +997,13 @@ impl RunDelegate for ConsoleDelegate {
                 println!("Answer required. Type a choice, free-form answer, or /quit.");
                 continue;
             }
-            if let Ok(index) = input.parse::<usize>() {
-                if let Some(option) = request.options.get(index.saturating_sub(1)) {
-                    return Ok(Some(ClarificationAnswer {
-                        text: option.label.clone(),
-                        used_option_selection: true,
-                    }));
-                }
+            if let Ok(index) = input.parse::<usize>()
+                && let Some(option) = request.options.get(index.saturating_sub(1))
+            {
+                return Ok(Some(ClarificationAnswer {
+                    text: option.label.clone(),
+                    used_option_selection: true,
+                }));
             }
             return Ok(Some(ClarificationAnswer {
                 text: input.to_owned(),
@@ -1025,13 +1025,16 @@ mod tests {
     use anyhow::anyhow;
     use ralph_core::{RunnerResult, WorkflowState};
 
+    type ScriptedStep = Box<dyn Fn(&RunnerInvocation) -> RunnerResult + Send + Sync>;
+    type SharedScriptedSteps = Arc<Mutex<Vec<ScriptedStep>>>;
+
     #[derive(Clone)]
     struct ScriptedRunner {
-        steps: Arc<Mutex<Vec<Box<dyn Fn(&RunnerInvocation) -> RunnerResult + Send + Sync>>>>,
+        steps: SharedScriptedSteps,
     }
 
     impl ScriptedRunner {
-        fn new(steps: Vec<Box<dyn Fn(&RunnerInvocation) -> RunnerResult + Send + Sync>>) -> Self {
+        fn new(steps: Vec<ScriptedStep>) -> Self {
             Self {
                 steps: Arc::new(Mutex::new(steps)),
             }
@@ -1049,10 +1052,10 @@ mod tests {
         ) -> Result<RunnerResult> {
             let next = self.steps.lock().unwrap().remove(0);
             let result = next(&invocation);
-            if let Some(stream) = stream {
-                if !result.output.is_empty() {
-                    let _ = stream.send(RunnerStreamEvent::Output(result.output.clone()));
-                }
+            if let Some(stream) = stream
+                && !result.output.is_empty()
+            {
+                let _ = stream.send(RunnerStreamEvent::Output(result.output.clone()));
             }
             Ok(result)
         }
@@ -1095,9 +1098,11 @@ mod tests {
     fn app(runner: ScriptedRunner) -> (tempfile::TempDir, RalphApp<ScriptedRunner>) {
         let temp = tempfile::TempDir::new().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let mut config = AppConfig::default();
-        config.planning_max_iterations = 3;
-        config.builder_max_iterations = 3;
+        let config = AppConfig {
+            planning_max_iterations: 3,
+            builder_max_iterations: 3,
+            ..AppConfig::default()
+        };
         (temp, RalphApp::new(project_dir, config, runner))
     }
 
@@ -1205,8 +1210,18 @@ mod tests {
 
         let summary = app.prepare_target_for_tui(target).unwrap();
         assert!(summary.spec_path.as_str().ends_with("custom/feature.md"));
-        assert!(summary.progress_path.as_str().ends_with("custom/feature.progress.txt"));
-        assert!(summary.feedback_path.as_str().ends_with("custom/feature.feedback.txt"));
+        assert!(
+            summary
+                .progress_path
+                .as_str()
+                .ends_with("custom/feature.progress.txt")
+        );
+        assert!(
+            summary
+                .feedback_path
+                .as_str()
+                .ends_with("custom/feature.feedback.txt")
+        );
         assert!(summary.spec_preview.contains("<empty>"));
         assert_eq!(summary.progress_preview, "<empty>");
         assert!(summary.feedback_preview.contains("RECENT-USER-FEEDBACK"));
@@ -1536,8 +1551,10 @@ mod tests {
     async fn builder_cancellation_stops_runner() {
         let temp = tempfile::TempDir::new().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let mut config = AppConfig::default();
-        config.builder_max_iterations = 2;
+        let config = AppConfig {
+            builder_max_iterations: 2,
+            ..AppConfig::default()
+        };
         let app = RalphApp::new(project_dir, config, BlockingRunner);
 
         let paths = app.resolve_target("alpha").unwrap();

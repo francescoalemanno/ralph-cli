@@ -192,11 +192,11 @@ impl AppConfig {
     pub fn load(project_dir: &Utf8Path) -> Result<Self> {
         let mut config = Self::default();
 
-        if let Some(user_path) = user_config_path()? {
-            if user_path.exists() {
-                let partial = read_partial_config(&user_path)?;
-                config = merge_config(config, partial);
-            }
+        if let Some(user_path) = user_config_path()?
+            && user_path.exists()
+        {
+            let partial = read_partial_config(&user_path)?;
+            config = merge_config(config, partial);
         }
 
         let project_path = project_dir.join("ralph.toml");
