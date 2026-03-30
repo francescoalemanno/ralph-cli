@@ -1,12 +1,19 @@
 [package]
-name = "ralph"
+name = "ralph-cli"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
 documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
+
+[[bin]]
+name = "ralph"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
