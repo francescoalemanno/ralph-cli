@@ -1355,8 +1355,36 @@ impl TuiApp {
     }
 
     fn cycle_coding_agent(&mut self) {
-        let next = self.coding_agent().next();
-        self.app.set_coding_agent(next);
+        let current = self.coding_agent();
+        let detected = CodingAgent::detected();
+        if detected.is_empty() {
+            self.status = format!("No supported agents detected; keeping {}", current.label());
+            self.notice = Some(Notice {
+                tone: NoticeTone::Info,
+                message: "No supported agent binaries were found on PATH".to_owned(),
+            });
+            return;
+        }
+        if detected.len() == 1 && detected[0] == current {
+            self.status = format!("Only {} detected", current.label());
+            self.notice = Some(Notice {
+                tone: NoticeTone::Info,
+                message: format!("Only {} is available on PATH", current.label()),
+            });
+            return;
+        }
+
+        let next = current.next_in(&detected);
+        if let Err(error) = self.app.persist_coding_agent(next) {
+            let message = format!("Failed to persist agent selection: {error}");
+            self.status = message.clone();
+            self.notice = Some(Notice {
+                tone: NoticeTone::Error,
+                message,
+            });
+            return;
+        }
+
         self.status = format!("Agent set to {}", next.label());
         if let Some(run) = self.current_run_mut().filter(|run| run.pending) {
             run.control.set_coding_agent(next);
