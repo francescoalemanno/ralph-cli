@@ -136,6 +136,23 @@ where
         self.store.review(&paths)
     }
 
+    pub fn prepare_target_for_tui(&self, target: &str) -> Result<SpecSummary> {
+        let paths = self.store.resolve_target(target)?;
+        if !paths.spec_path.exists() {
+            self.store.write_spec(&paths.spec_path, "")?;
+        }
+        if !paths.progress_path.exists() {
+            self.store.write_progress(&paths.progress_path, "")?;
+        }
+        if !paths.feedback_path.exists() {
+            self.store.write_feedback(
+                &paths.feedback_path,
+                &ArtifactStore::default_feedback_contents(),
+            )?;
+        }
+        self.summary_for_paths(&paths)
+    }
+
     pub fn resolve_target(&self, target: &str) -> Result<SpecPaths> {
         self.store.resolve_target(target)
     }
@@ -1178,6 +1195,21 @@ mod tests {
         assert_eq!(summary.state, WorkflowState::Completed);
         let progress = fs::read_to_string(&paths.progress_path).unwrap();
         assert_eq!(progress, "Task done\n<promise>DONE</promise>\n");
+    }
+
+    #[test]
+    fn prepare_target_for_tui_stubs_missing_support_files() {
+        let runner = ScriptedRunner::new(vec![]);
+        let (_temp, app) = app(runner);
+        let target = "custom/feature.md";
+
+        let summary = app.prepare_target_for_tui(target).unwrap();
+        assert!(summary.spec_path.as_str().ends_with("custom/feature.md"));
+        assert!(summary.progress_path.as_str().ends_with("custom/feature.progress.txt"));
+        assert!(summary.feedback_path.as_str().ends_with("custom/feature.feedback.txt"));
+        assert!(summary.spec_preview.contains("<empty>"));
+        assert_eq!(summary.progress_preview, "<empty>");
+        assert!(summary.feedback_preview.contains("RECENT-USER-FEEDBACK"));
     }
 
     #[tokio::test]
