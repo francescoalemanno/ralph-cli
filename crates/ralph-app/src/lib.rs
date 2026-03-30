@@ -123,6 +123,12 @@ where
         self.config.set_coding_agent(agent);
     }
 
+    pub fn persist_coding_agent(&mut self, agent: CodingAgent) -> Result<()> {
+        AppConfig::persist_project_coding_agent(&self.project_dir, agent)?;
+        self.config.set_coding_agent(agent);
+        Ok(())
+    }
+
     pub fn project_dir(&self) -> &Utf8Path {
         &self.project_dir
     }
