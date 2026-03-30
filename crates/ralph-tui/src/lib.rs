@@ -1991,15 +1991,15 @@ impl TuiApp {
         let Some(modal) = self.clarification.as_mut() else {
             return;
         };
-        let popup = centered_rect(70, 55, area);
+        let popup = clarification_rect(area);
         frame.render_widget(Clear, popup);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(8),
-                Constraint::Length(5),
                 Constraint::Length(8),
+                Constraint::Length(1),
             ])
             .split(popup);
         frame.render_widget(Clear, chunks[0]);
@@ -2045,16 +2045,11 @@ impl TuiApp {
         }
         let top = top.scroll((self.clarification_scroll, 0));
         frame.render_widget(top, chunks[0]);
+        frame.render_widget(&modal.input, chunks[1]);
         let shortcuts = Paragraph::new(clarification_shortcuts_text())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Shortcuts")
-                    .border_type(BorderType::Rounded),
-            )
+            .style(Style::default().fg(self.muted_color()))
             .wrap(Wrap { trim: true });
-        frame.render_widget(shortcuts, chunks[1]);
-        frame.render_widget(&modal.input, chunks[2]);
+        frame.render_widget(shortcuts, chunks[2]);
     }
 
     fn footer_text(&self) -> String {
@@ -2691,25 +2686,6 @@ fn color_from_name(name: &str) -> Option<Color> {
     }
 }
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
-}
-
 fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     disable_raw_mode().context("failed to disable raw mode for editor launch")?;
     execute!(
@@ -2789,7 +2765,22 @@ fn clarification_body_text(request: &ClarificationRequest) -> String {
 }
 
 fn clarification_shortcuts_text() -> &'static str {
-    "1-9 type into input  •  Ctrl-S submit choice or free-form answer  •  Ctrl-W arm abort, Ctrl-W again aborts run  •  PgUp/PgDn/Home/End scroll"
+    "1-9 quick-fill  •  Ctrl-S submit  •  Ctrl-W abort  •  PgUp/PgDn scroll"
+}
+
+fn clarification_rect(area: Rect) -> Rect {
+    let horizontal_margin = area.width.saturating_sub(8).min(4);
+    let vertical_margin = area.height.saturating_sub(8).min(4);
+    Rect {
+        x: area.x.saturating_add(horizontal_margin),
+        y: area.y.saturating_add(vertical_margin),
+        width: area
+            .width
+            .saturating_sub(horizontal_margin.saturating_mul(2)),
+        height: area
+            .height
+            .saturating_sub(vertical_margin.saturating_mul(2)),
+    }
 }
 
 fn feedback_display_string(contents: &str) -> String {
