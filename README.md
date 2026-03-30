@@ -52,6 +52,14 @@ Ralph supports both TUI-first and CLI-first workflows.
 
 ## Installation
 
+Install the latest release binary:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/francescoalemanno/ralph-cli/main/install | bash
+```
+
+The installer places `ralph` in `~/.local/bin` by default and will add that directory to common bash, zsh, and fish startup files if it is not already on `PATH`.
+
 For local development:
 
 ```bash

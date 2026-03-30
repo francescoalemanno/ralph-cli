@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="francescoalemanno/ralph-cli"
+BINARY_NAME="ralph"
+INSTALL_DIR="${RALPH_INSTALL_DIR:-$HOME/.local/bin}"
+VERSION="${RALPH_VERSION:-}"
+PATH_LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
+FISH_PATH_LINE="fish_add_path \"$INSTALL_DIR\""
+MARKER_BEGIN="# >>> ralph-cli >>>"
+MARKER_END="# <<< ralph-cli <<<"
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "error: required command not found: $1" >&2
+    exit 1
+  }
+}
+
+ensure_line_block() {
+  local file="$1" body="$2"
+  mkdir -p "$(dirname "$file")"
+  touch "$file"
+
+  if grep -Fq "$MARKER_BEGIN" "$file"; then
+    return
+  fi
+
+  {
+    printf '\n%s\n' "$MARKER_BEGIN"
+    printf '%s\n' "$body"
+    printf '%s\n' "$MARKER_END"
+  } >>"$file"
+}
+
+detect_target() {
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+
+  case "$os" in
+    Linux) ;;
+    Darwin) ;;
+    *)
+      echo "error: unsupported operating system: $os" >&2
+      exit 1
+      ;;
+  esac
+
+  case "$arch" in
+    x86_64|amd64) arch="x86_64" ;;
+    arm64|aarch64) arch="aarch64" ;;
+    *)
+      echo "error: unsupported architecture: $arch" >&2
+      exit 1
+      ;;
+  esac
+
+  case "$os/$arch" in
+    Linux/x86_64) echo "x86_64-unknown-linux-musl" ;;
+    Linux/aarch64) echo "aarch64-unknown-linux-musl" ;;
+    Darwin/x86_64) echo "x86_64-apple-darwin" ;;
+    Darwin/aarch64) echo "aarch64-apple-darwin" ;;
+  esac
+}
+
+resolve_version() {
+  if [[ -n "$VERSION" ]]; then
+    echo "$VERSION"
+    return
+  fi
+
+  local latest_url
+  latest_url="$(curl -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")"
+  VERSION="${latest_url##*/}"
+
+  if [[ -z "$VERSION" || "$VERSION" == "latest" ]]; then
+    echo "error: failed to resolve latest release for $REPO" >&2
+    exit 1
+  fi
+
+  echo "$VERSION"
+}
+
+ensure_path_in_shells() {
+  local updated=0
+
+  case ":$PATH:" in
+    *":$INSTALL_DIR:"*)
+      return
+      ;;
+  esac
+
+  ensure_line_block "$HOME/.profile" "$PATH_LINE"
+  ensure_line_block "$HOME/.bash_profile" "$PATH_LINE"
+  ensure_line_block "$HOME/.bashrc" "$PATH_LINE"
+  ensure_line_block "$HOME/.zprofile" "$PATH_LINE"
+  ensure_line_block "$HOME/.zshrc" "$PATH_LINE"
+  ensure_line_block "$HOME/.config/fish/config.fish" "$FISH_PATH_LINE"
+  updated=1
+
+  if [[ "$updated" -eq 1 ]]; then
+    echo
+    echo "Added $INSTALL_DIR to PATH in common shell profiles."
+    echo "Open a new shell, or run:"
+    echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
+  fi
+}
+
+main() {
+  require curl
+  require tar
+  require mktemp
+  require install
+
+  local target version archive url temp_dir
+  target="$(detect_target)"
+  version="$(resolve_version)"
+  archive="ralph-cli-${target}.tar.gz"
+  url="https://github.com/$REPO/releases/download/${version}/${archive}"
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf "$temp_dir"' EXIT
+
+  echo "Installing $BINARY_NAME ${version} for ${target}"
+  echo "Download: $url"
+
+  curl -fsSL "$url" -o "$temp_dir/$archive"
+  tar -xzf "$temp_dir/$archive" -C "$temp_dir"
+
+  mkdir -p "$INSTALL_DIR"
+  install -m 0755 "$temp_dir/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+
+  echo
+  echo "Installed to: $INSTALL_DIR/$BINARY_NAME"
+  ensure_path_in_shells
+}
+
+main "$@"
