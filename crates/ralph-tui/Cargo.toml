@@ -9,8 +9,8 @@ async-trait.workspace = true
 crossterm.workspace = true
 libc.workspace = true
 ratatui.workspace = true
-ralph-app = { path = "../ralph-app" }
-ralph-core = { path = "../ralph-core" }
+ralph-app = { version = "0.1.0", path = "../ralph-app" }
+ralph-core = { version = "0.1.0", path = "../ralph-core" }
 syntect.workspace = true
 tokio.workspace = true
 tui-textarea.workspace = true
