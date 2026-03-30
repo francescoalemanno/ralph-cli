@@ -9,12 +9,19 @@ PATH_LINE="export PATH=\"$INSTALL_DIR:\$PATH\""
 FISH_PATH_LINE="fish_add_path \"$INSTALL_DIR\""
 MARKER_BEGIN="# >>> ralph-cli >>>"
 MARKER_END="# <<< ralph-cli <<<"
+TEMP_DIR=""
 
 require() {
   command -v "$1" >/dev/null 2>&1 || {
     echo "error: required command not found: $1" >&2
     exit 1
   }
+}
+
+cleanup() {
+  if [[ -n "${TEMP_DIR:-}" && -d "${TEMP_DIR:-}" ]]; then
+    rm -rf "$TEMP_DIR"
+  fi
 }
 
 ensure_line_block() {
@@ -113,22 +120,22 @@ main() {
   require mktemp
   require install
 
-  local target version archive url temp_dir
+  local target version archive url
   target="$(detect_target)"
   version="$(resolve_version)"
   archive="ralph-cli-${target}.tar.gz"
   url="https://github.com/$REPO/releases/download/${version}/${archive}"
-  temp_dir="$(mktemp -d)"
-  trap 'rm -rf "$temp_dir"' EXIT
+  TEMP_DIR="$(mktemp -d)"
+  trap cleanup EXIT
 
   echo "Installing $BINARY_NAME ${version} for ${target}"
   echo "Download: $url"
 
-  curl -fsSL "$url" -o "$temp_dir/$archive"
-  tar -xzf "$temp_dir/$archive" -C "$temp_dir"
+  curl -fsSL "$url" -o "$TEMP_DIR/$archive"
+  tar -xzf "$TEMP_DIR/$archive" -C "$TEMP_DIR"
 
   mkdir -p "$INSTALL_DIR"
-  install -m 0755 "$temp_dir/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
+  install -m 0755 "$TEMP_DIR/$BINARY_NAME" "$INSTALL_DIR/$BINARY_NAME"
 
   echo
   echo "Installed to: $INSTALL_DIR/$BINARY_NAME"

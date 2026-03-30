@@ -9,8 +9,153 @@ permissions:
   contents: write
 
 jobs:
+  release:
+    name: Prepare Release
+    runs-on: ubuntu-latest
+    outputs:
+      current_tag: ${{ steps.meta.outputs.current_tag }}
+      previous_tag: ${{ steps.meta.outputs.previous_tag }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release range
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_tag="${GITHUB_REF_NAME}"
+          previous_tag="$(git tag --sort=-version:refname | grep -Fxv "$current_tag" | head -n1 || true)"
+          echo "current_tag=$current_tag" >>"$GITHUB_OUTPUT"
+          echo "previous_tag=$previous_tag" >>"$GITHUB_OUTPUT"
+
+      - name: Generate release notes from Conventional Commits
+        env:
+          CURRENT_TAG: ${{ steps.meta.outputs.current_tag }}
+          PREVIOUS_TAG: ${{ steps.meta.outputs.previous_tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import subprocess
+          from collections import OrderedDict
+
+          current_tag = os.environ["CURRENT_TAG"]
+          previous_tag = os.environ.get("PREVIOUS_TAG", "").strip()
+          repository = os.environ["REPOSITORY"]
+          compare_range = f"{previous_tag}..HEAD" if previous_tag else "HEAD"
+
+          raw = subprocess.check_output(
+              ["git", "log", "--no-merges", "--format=%H%x1f%s%x1e", compare_range],
+              text=True,
+          )
+
+          sections = OrderedDict([
+              ("feat", "Features"),
+              ("fix", "Fixes"),
+              ("docs", "Documentation"),
+              ("refactor", "Refactors"),
+              ("perf", "Performance"),
+              ("test", "Tests"),
+              ("build", "Build"),
+              ("ci", "CI"),
+              ("chore", "Chores"),
+              ("revert", "Reverts"),
+              ("other", "Other"),
+          ])
+          grouped = {key: [] for key in sections}
+          pattern = re.compile(
+              r"^(?P<type>feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)"
+              r"(?:\((?P<scope>[^)]+)\))?(?P<breaking>!)?: (?P<desc>.+)$"
+          )
+
+          for record in raw.strip("\x1e").split("\x1e"):
+              if not record.strip():
+                  continue
+              commit, subject = record.strip().split("\x1f", 1)
+              sha = commit[:7]
+              match = pattern.match(subject.strip())
+              if match:
+                  typ = match.group("type")
+                  typ = typ if typ in grouped else "other"
+                  scope = match.group("scope")
+                  desc = match.group("desc")
+                  if scope:
+                      line = f"- `{scope}`: {desc} ([`{sha}`](https://github.com/{repository}/commit/{commit}))"
+                  else:
+                      line = f"- {desc} ([`{sha}`](https://github.com/{repository}/commit/{commit}))"
+                  if match.group("breaking"):
+                      line += " [breaking]"
+                  grouped[typ].append(line)
+              else:
+                  grouped["other"].append(
+                      f"- {subject.strip()} ([`{sha}`](https://github.com/{repository}/commit/{commit}))"
+                  )
+
+          lines = [f"# {current_tag}", ""]
+          if previous_tag:
+              lines.extend(
+                  [
+                      f"Changes since `{previous_tag}`.",
+                      "",
+                      f"Compare: https://github.com/{repository}/compare/{previous_tag}...{current_tag}",
+                      "",
+                  ]
+              )
+          else:
+              lines.extend(
+                  [
+                      "Initial tagged release.",
+                      "",
+                  ]
+              )
+
+          added_section = False
+          for key, title in sections.items():
+              entries = grouped[key]
+              if not entries:
+                  continue
+              added_section = True
+              lines.append(f"## {title}")
+              lines.append("")
+              lines.extend(entries)
+              lines.append("")
+
+          if not added_section:
+              lines.extend(
+                  [
+                      "## Changes",
+                      "",
+                      "- No commits found in the selected release range.",
+                      "",
+                  ]
+              )
+
+          lines.extend(
+              [
+                  "## Assets",
+                  "",
+                  "This release includes prebuilt binaries for Linux and macOS.",
+                  "",
+              ]
+          )
+
+          with open("RELEASE_NOTES.md", "w", encoding="utf-8") as fh:
+              fh.write("\n".join(lines))
+          PY
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: false
+
   build:
     name: ${{ matrix.name }}
+    needs: release
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -27,12 +172,12 @@ jobs:
             archive_name: ralph-cli-aarch64-unknown-linux-musl.tar.gz
             strip_command: llvm-strip
           - name: macos-x86_64
-            runner: macos-13
+            runner: macos-15-intel
             target: x86_64-apple-darwin
             archive_name: ralph-cli-x86_64-apple-darwin.tar.gz
             strip_command: strip -x
           - name: macos-aarch64
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
             archive_name: ralph-cli-aarch64-apple-darwin.tar.gz
             strip_command: strip -x
@@ -83,4 +228,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ matrix.archive_name }}
-          generate_release_notes: true
+          generate_release_notes: false
