@@ -7,6 +7,7 @@ use ralph_core::{
     AppConfig, ArtifactStore, BuildPromptContext, BuilderMarker, ClarificationAnswer,
     ClarificationRequest, CodingAgent, ProgressRevisionPromptContext, ReviewData, RunControl,
     RunnerConfig, RunnerInvocation, RunnerMode, SpecPaths, SpecSummary, build_prompt,
+    default_progress_contents, empty_spec_contents, initial_spec_contents,
     parse_builder_marker_from_output, parse_clarification_request,
     parse_planning_marker_from_output, planning_prompt, progress_revision_prompt,
     strip_persisted_promise_markers,
@@ -149,10 +150,12 @@ where
     pub fn prepare_target_for_tui(&self, target: &str) -> Result<SpecSummary> {
         let paths = self.store.resolve_target(target)?;
         if !paths.spec_path.exists() {
-            self.store.write_spec(&paths.spec_path, "")?;
+            self.store
+                .write_spec(&paths.spec_path, &empty_spec_contents())?;
         }
         if !paths.progress_path.exists() {
-            self.store.write_progress(&paths.progress_path, "")?;
+            self.store
+                .write_progress(&paths.progress_path, &default_progress_contents())?;
         }
         if !paths.feedback_path.exists() {
             self.store.write_feedback(
@@ -176,7 +179,8 @@ where
         let paths = self.store.resolve_target(target)?;
         self.store.ensure_ralph_dir()?;
         if !paths.spec_path.exists() {
-            self.store.write_spec(&paths.spec_path, "")?;
+            self.store
+                .write_spec(&paths.spec_path, &empty_spec_contents())?;
         }
         let current_spec = self.store.read_spec(&paths.spec_path)?;
         let past_spec_path = self.store.past_spec_path(&paths.spec_path)?;
@@ -690,11 +694,12 @@ where
         let mut created = false;
         if !paths.spec_path.exists() {
             self.store
-                .write_spec(&paths.spec_path, &initial_spec_stub(planning_request))?;
+                .write_spec(&paths.spec_path, &initial_spec_contents(planning_request))?;
             created = true;
         }
         if !paths.progress_path.exists() {
-            self.store.write_progress(&paths.progress_path, "")?;
+            self.store
+                .write_progress(&paths.progress_path, &default_progress_contents())?;
             created = true;
         }
         if !paths.feedback_path.exists() {
@@ -931,13 +936,6 @@ fn preview(contents: &str) -> String {
     }
 }
 
-fn initial_spec_stub(planning_request: &str) -> String {
-    let request = planning_request.trim();
-    format!(
-        "# Goal\nInitial planning request: {request}\n\n# User Requirements And Constraints\nInitial request captured before full planning:\n- {request}\n\n# Non-Goals\nTo be defined during planning.\n\n# Proposed Design\nTo be defined during planning.\n\n# Implementation Plan\nTo be defined during planning.\n\n# Acceptance Criteria\nTo be defined during planning.\n\n# Risks\nPlanning was interrupted before a full spec was produced.\n\n# Open Questions\nSee the feedback file for clarification history and unresolved questions.\n"
-    )
-}
-
 fn render_spec_diff(
     previous_spec_path: &Utf8Path,
     current_spec_path: &Utf8Path,
@@ -1013,11 +1011,13 @@ impl RunDelegate for ConsoleDelegate {
                 return Ok(Some(ClarificationAnswer {
                     text: option.label.clone(),
                     used_option_selection: true,
+                    selected_option: Some(option.clone()),
                 }));
             }
             return Ok(Some(ClarificationAnswer {
                 text: input.to_owned(),
                 used_option_selection: false,
+                selected_option: None,
             }));
         }
     }
@@ -1101,6 +1101,7 @@ mod tests {
             Ok(self.answers.remove(0).map(|text| ClarificationAnswer {
                 text,
                 used_option_selection: false,
+                selected_option: None,
             }))
         }
     }
@@ -1114,12 +1115,6 @@ mod tests {
             ..AppConfig::default()
         };
         (temp, RalphApp::new(project_dir, config, runner))
-    }
-
-    fn sample_spec(suffix: &str) -> String {
-        format!(
-            "# Goal\nGoal {suffix}\n\n# User Requirements And Constraints\nRequirements {suffix}\n\n# Non-Goals\nNon-goals {suffix}\n\n# Proposed Design\nDesign {suffix}\n\n# Implementation Plan\nPlan {suffix}\n\n# Acceptance Criteria\nAcceptance {suffix}\n\n# Risks\nRisks {suffix}\n\n# Open Questions\nQuestions {suffix}\n"
-        )
     }
 
     #[tokio::test]
@@ -1139,7 +1134,7 @@ mod tests {
                         .unwrap()
                         .contains("<RECENT-USER-FEEDBACK>")
                 );
-                fs::write(&invocation.spec_path, sample_spec("A")).unwrap();
+                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("A")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\n").unwrap();
                 RunnerResult {
                     output: "not a marker\n".to_owned(),
@@ -1147,7 +1142,7 @@ mod tests {
                 }
             }),
             Box::new(|invocation| {
-                fs::write(&invocation.spec_path, sample_spec("D")).unwrap();
+                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("D")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
                 RunnerResult {
                     output: "<plan-promise>DONE</plan-promise>\n".to_owned(),
@@ -1193,7 +1188,7 @@ mod tests {
         let (_temp, app) = app(runner);
         let paths = app.resolve_target("alpha").unwrap();
         fs::create_dir_all(paths.spec_path.parent().unwrap()).unwrap();
-        fs::write(&paths.spec_path, sample_spec("C")).unwrap();
+        fs::write(&paths.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
         fs::write(
             &paths.progress_path,
             "Task 1\n<promise>CONTINUE</promise>\n",
@@ -1240,7 +1235,7 @@ mod tests {
     #[tokio::test]
     async fn planning_preserves_partial_artifacts_on_cancel() {
         let runner = ScriptedRunner::new(vec![Box::new(|invocation| {
-            fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
+            fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
             fs::write(&invocation.progress_path, "Task 1\n").unwrap();
             RunnerResult {
                 output: "<ralph-question>{\"question\":\"Which?\",\"options\":[]}</ralph-question>"
@@ -1368,7 +1363,7 @@ mod tests {
     #[tokio::test]
     async fn planning_notes_malformed_clarification_blocks() {
         let runner = ScriptedRunner::new(vec![Box::new(|invocation| {
-            fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
+            fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
             fs::write(&invocation.progress_path, "Task 1\n").unwrap();
             RunnerResult {
                 output:
@@ -1403,7 +1398,7 @@ mod tests {
     async fn planning_persists_clarification_history_in_feedback_file() {
         let runner = ScriptedRunner::new(vec![
             Box::new(|invocation| {
-                fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
+                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\n").unwrap();
                 RunnerResult {
                     output: "<ralph-question>{\"question\":\"Which database should the plan assume?\",\"options\":[{\"label\":\"Postgres\",\"description\":\"Use PostgreSQL\"}]}</ralph-question>".to_owned(),
@@ -1422,7 +1417,7 @@ mod tests {
                 assert!(feedback.contains("Q: Which database should the plan assume?"));
                 assert!(feedback.contains("A: Postgres"));
                 assert!(feedback.contains("<OLDER-USER-FEEDBACK>\nNone."));
-                fs::write(&invocation.spec_path, sample_spec("D")).unwrap();
+                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("D")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
                 RunnerResult {
                     output: "<plan-promise>DONE</plan-promise>\n".to_owned(),
@@ -1450,7 +1445,7 @@ mod tests {
     async fn planning_done_succeeds_even_without_artifact_changes_in_final_pass() {
         let runner = ScriptedRunner::new(vec![
             Box::new(|invocation| {
-                fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
+                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\n").unwrap();
                 RunnerResult {
                     output: "<plan-promise>CONTINUE</plan-promise>\n".to_owned(),
@@ -1488,7 +1483,7 @@ mod tests {
     async fn planning_warns_after_continue_without_changes_or_questions() {
         let runner = ScriptedRunner::new(vec![
             Box::new(|invocation| {
-                fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
+                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\n").unwrap();
                 RunnerResult {
                     output: "<plan-promise>CONTINUE</plan-promise>\n".to_owned(),
@@ -1499,7 +1494,7 @@ mod tests {
                 assert!(invocation.prompt_text.contains(
                     "System warning: in the previous planning iteration you emitted CONTINUE without changing spec/progress and without asking clarification."
                 ));
-                fs::write(&invocation.spec_path, sample_spec("C")).unwrap();
+                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
                 fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
                 RunnerResult {
                     output: "<plan-promise>DONE</plan-promise>\n".to_owned(),
@@ -1511,7 +1506,7 @@ mod tests {
         let (_temp, app) = app(runner);
         let paths = app.resolve_target("alpha").unwrap();
         fs::create_dir_all(paths.spec_path.parent().unwrap()).unwrap();
-        fs::write(&paths.spec_path, sample_spec("C")).unwrap();
+        fs::write(&paths.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
         fs::write(&paths.progress_path, "Task 1\n").unwrap();
 
         let mut delegate = TestDelegate {
@@ -1569,7 +1564,7 @@ mod tests {
 
         let paths = app.resolve_target("alpha").unwrap();
         fs::create_dir_all(paths.spec_path.parent().unwrap()).unwrap();
-        fs::write(&paths.spec_path, sample_spec("C")).unwrap();
+        fs::write(&paths.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
         fs::write(&paths.progress_path, "Task 1\n").unwrap();
 
         let control = RunControl::new();
