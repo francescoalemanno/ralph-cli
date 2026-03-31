@@ -23,7 +23,9 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ralph_app::{RalphApp, RunDelegate, RunEvent, format_iteration_banner};
+use ralph_app::{
+    ProgressRevisionRequest, RalphApp, RunDelegate, RunEvent, format_iteration_banner,
+};
 use ralph_core::{
     ClarificationAnswer, ClarificationRequest, CodingAgent, ReviewData, RunControl, RunnerMode,
     SpecSummary, WorkflowState,
@@ -132,11 +134,12 @@ enum ScopedAction {
     Revise,
     Replan,
     OpenRun,
+    Remove,
     Back,
 }
 
 impl ScopedAction {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::Run,
         Self::Review,
         Self::Edit,
@@ -144,6 +147,7 @@ impl ScopedAction {
         Self::Revise,
         Self::Replan,
         Self::OpenRun,
+        Self::Remove,
         Self::Back,
     ];
 
@@ -156,6 +160,7 @@ impl ScopedAction {
             Self::Revise => "Revise in place",
             Self::Replan => "Replan",
             Self::OpenRun => "Open run stream",
+            Self::Remove => "Remove artifacts",
             Self::Back => "Back",
         }
     }
@@ -169,6 +174,7 @@ impl ScopedAction {
             Self::Revise => "Ctrl-U",
             Self::Replan => "Ctrl-P",
             Self::OpenRun => "Ctrl-R",
+            Self::Remove => "Ctrl-D",
             Self::Back => "Ctrl-W",
         }
     }
@@ -183,9 +189,19 @@ struct ClarificationModal {
 
 type RunId = u64;
 
+#[derive(Clone)]
+enum RunReplay {
+    Create { request: String },
+    Revise { target: String, request: String },
+    Replan { target: String, request: String },
+    Build { target: String },
+    ReviseProgress { request: ProgressRevisionRequest },
+}
+
 struct RunSession {
     mode: RunnerMode,
     target: String,
+    rerun: RunReplay,
     stream_lines: Vec<String>,
     stream_cursor_col: usize,
     chunk_count: usize,
@@ -198,10 +214,11 @@ struct RunSession {
 }
 
 impl RunSession {
-    fn new(mode: RunnerMode, target: String, control: RunControl) -> Self {
+    fn new(mode: RunnerMode, target: String, rerun: RunReplay, control: RunControl) -> Self {
         Self {
             mode,
             target,
+            rerun,
             stream_lines: vec![String::new()],
             stream_cursor_col: 0,
             chunk_count: 0,
@@ -270,6 +287,8 @@ struct TuiApp {
     next_run_id: RunId,
     cancel_armed_run: Option<RunId>,
     cancel_armed_until: Option<Instant>,
+    delete_armed_target: Option<String>,
+    delete_armed_until: Option<Instant>,
     tick_count: u64,
     color_mode: ColorMode,
     clarification: Option<ClarificationModal>,
@@ -316,6 +335,8 @@ impl TuiApp {
             next_run_id: 1,
             cancel_armed_run: None,
             cancel_armed_until: None,
+            delete_armed_target: None,
+            delete_armed_until: None,
             tick_count: 0,
             color_mode,
             clarification: None,
@@ -426,6 +447,9 @@ impl TuiApp {
             RunnerMode::Plan,
             "new spec".to_owned(),
             "Running planner…".to_owned(),
+            RunReplay::Create {
+                request: request.clone(),
+            },
         );
         self.status = "Running planner…".to_owned();
         let tx = self.tx.clone();
@@ -445,7 +469,15 @@ impl TuiApp {
 
     fn run_revise(&mut self, target: String, request: String) {
         let status = format!("Revising {target}");
-        let (run_id, control) = self.start_run(RunnerMode::Plan, target.clone(), status.clone());
+        let (run_id, control) = self.start_run(
+            RunnerMode::Plan,
+            target.clone(),
+            status.clone(),
+            RunReplay::Revise {
+                target: target.clone(),
+                request: request.clone(),
+            },
+        );
         self.status = format!("Revising {target}");
         let tx = self.tx.clone();
         let app = self.app.clone();
@@ -464,7 +496,15 @@ impl TuiApp {
 
     fn run_replan(&mut self, target: String, request: String) {
         let status = format!("Replanning {target}");
-        let (run_id, control) = self.start_run(RunnerMode::Plan, target.clone(), status.clone());
+        let (run_id, control) = self.start_run(
+            RunnerMode::Plan,
+            target.clone(),
+            status.clone(),
+            RunReplay::Replan {
+                target: target.clone(),
+                request: request.clone(),
+            },
+        );
         self.status = format!("Replanning {target}");
         let tx = self.tx.clone();
         let app = self.app.clone();
@@ -483,7 +523,14 @@ impl TuiApp {
 
     fn run_builder(&mut self, target: String) {
         let status = format!("Running {target}");
-        let (run_id, control) = self.start_run(RunnerMode::Build, target.clone(), status.clone());
+        let (run_id, control) = self.start_run(
+            RunnerMode::Build,
+            target.clone(),
+            status.clone(),
+            RunReplay::Build {
+                target: target.clone(),
+            },
+        );
         self.status = format!("Running {target}");
         let tx = self.tx.clone();
         let app = self.app.clone();
@@ -500,6 +547,33 @@ impl TuiApp {
         });
     }
 
+    fn run_progress_revision(&mut self, request: ProgressRevisionRequest) {
+        let target = request.target.clone();
+        let status = format!("Revising progress for {target}");
+        let (run_id, control) = self.start_run(
+            RunnerMode::Plan,
+            target.clone(),
+            status.clone(),
+            RunReplay::ReviseProgress {
+                request: request.clone(),
+            },
+        );
+        self.status = status;
+        let tx = self.tx.clone();
+        let app = self.app.clone();
+        self.handle.spawn(async move {
+            let mut delegate = ChannelDelegate {
+                tx: tx.clone(),
+                run_id,
+            };
+            let result = app
+                .revise_progress_after_spec_edit_with_control(request, control, &mut delegate)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(UiEvent::OperationDone(run_id, result));
+        });
+    }
+
     fn run_edit(&mut self, target: String) {
         self.status = format!("Editing spec for {target}");
         self.pending_editor_target = Some(target);
@@ -510,6 +584,7 @@ impl TuiApp {
             UiEvent::Tick => {
                 self.tick_count = self.tick_count.wrapping_add(1);
                 self.expire_cancel_arm_if_needed();
+                self.expire_delete_arm_if_needed();
                 self.expire_clarification_abort_if_needed();
             }
             UiEvent::Resize => {}
@@ -632,12 +707,13 @@ impl TuiApp {
         mode: RunnerMode,
         target: String,
         status: String,
+        rerun: RunReplay,
     ) -> (RunId, RunControl) {
         let run_id = self.next_run_id;
         self.next_run_id = self.next_run_id.saturating_add(1);
         let control = RunControl::new();
         self.runs
-            .insert(run_id, RunSession::new(mode, target, control.clone()));
+            .insert(run_id, RunSession::new(mode, target, rerun, control.clone()));
         self.run_order.retain(|existing| *existing != run_id);
         self.run_order.push(run_id);
         self.screen = Screen::Running(run_id);
@@ -795,6 +871,7 @@ impl TuiApp {
 
         match key.code {
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.reset_delete_arm();
                 self.request_quit();
             }
             KeyCode::Down | KeyCode::Char('j') => {
@@ -880,13 +957,18 @@ impl TuiApp {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.activate_scoped_action(ScopedAction::OpenRun, target)
             }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.activate_scoped_action(ScopedAction::Remove, target)
+            }
             KeyCode::Down | KeyCode::Char('j') => {
+                self.reset_delete_arm();
                 self.move_scoped_action_selection(1);
             }
             KeyCode::Up | KeyCode::Char('k') => {
+                self.reset_delete_arm();
                 self.move_scoped_action_selection(-1);
             }
-            _ => {}
+            _ => self.reset_delete_arm(),
         }
     }
 
@@ -972,6 +1054,9 @@ impl TuiApp {
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cycle_coding_agent();
             }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.rerun_current_run();
+            }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.screen = Screen::Dashboard
             }
@@ -1015,13 +1100,13 @@ impl TuiApp {
         if self.cancel_armed_run != Some(run_id) {
             self.cancel_armed_run = Some(run_id);
             self.cancel_armed_until = Some(Instant::now() + Duration::from_secs(2));
-            self.status = "Ctrl-C again to kill loop".to_owned();
+            self.status = "Ctrl-C x2 kills agent".to_owned();
             if let Some(run) = self.runs.get_mut(&run_id) {
-                run.signal = "Ctrl-C again to kill loop".to_owned();
+                run.signal = "Ctrl-C x2 kills agent".to_owned();
             }
             self.append_run_log(
                 run_id,
-                "kill armed; press Ctrl-C again to kill loop".to_owned(),
+                "kill armed; Ctrl-C x2 kills agent".to_owned(),
             );
             return;
         }
@@ -1034,6 +1119,109 @@ impl TuiApp {
             run.signal = "Force kill requested".to_owned();
         }
         self.append_run_log(run_id, "force kill requested".to_owned());
+    }
+
+    fn expire_delete_arm_if_needed(&mut self) {
+        let Some(deadline) = self.delete_armed_until else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+
+        self.reset_delete_arm();
+        self.status = "Delete disarmed".to_owned();
+    }
+
+    fn reset_delete_arm(&mut self) {
+        self.delete_armed_target = None;
+        self.delete_armed_until = None;
+    }
+
+    fn has_pending_run_for_target(&self, target: &str) -> bool {
+        self.runs
+            .values()
+            .any(|run| run.pending && run.target == target)
+    }
+
+    fn drop_runs_for_target(&mut self, target: &str) {
+        self.runs.retain(|_, run| run.target != target);
+        self.run_order
+            .retain(|run_id| self.runs.contains_key(run_id));
+    }
+
+    fn remove_target_with_confirmation(&mut self, target: String) {
+        if self.has_pending_run_for_target(&target) {
+            self.reset_delete_arm();
+            self.status = "Cannot remove while run is active".to_owned();
+            self.notice = Some(Notice {
+                tone: NoticeTone::Error,
+                message: "Stop the active planner or builder before removing its artifacts"
+                    .to_owned(),
+            });
+            return;
+        }
+
+        if self.delete_armed_target.as_deref() != Some(target.as_str()) {
+            self.delete_armed_target = Some(target.clone());
+            self.delete_armed_until = Some(Instant::now() + Duration::from_secs(2));
+            self.status = "Ctrl-D again removes spec, progress, feedback".to_owned();
+            self.notice = Some(Notice {
+                tone: NoticeTone::Info,
+                message: format!("Delete armed for {target}; press Ctrl-D again within 2s"),
+            });
+            return;
+        }
+
+        self.reset_delete_arm();
+        match self.app.delete_target(&target) {
+            Ok(()) => {
+                self.drop_runs_for_target(&target);
+                if self.focus_spec_path.as_deref() == Some(target.as_str()) {
+                    self.focus_spec_path = None;
+                }
+                if self.pinned_spec_path.as_deref() == Some(target.as_str()) {
+                    self.pinned_spec_path = None;
+                }
+                self.screen = Screen::Dashboard;
+                self.status = format!("Removed {target}");
+                self.notice = Some(Notice {
+                    tone: NoticeTone::Success,
+                    message: format!("Removed spec, progress, and feedback for {target}"),
+                });
+                self.load_specs();
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.status = message.clone();
+                self.notice = Some(Notice {
+                    tone: NoticeTone::Error,
+                    message,
+                });
+            }
+        }
+    }
+
+    fn rerun_current_run(&mut self) {
+        let Some(run) = self.current_run() else {
+            return;
+        };
+        if run.pending {
+            self.status = "Run already active".to_owned();
+            self.notice = Some(Notice {
+                tone: NoticeTone::Info,
+                message: "Wait for this run to finish or cancel it before rerunning".to_owned(),
+            });
+            return;
+        }
+
+        match run.rerun.clone() {
+            RunReplay::Create { request } => self.run_create(request),
+            RunReplay::Revise { target, request } => self.run_revise(target, request),
+            RunReplay::Replan { target, request } => self.run_replan(target, request),
+            RunReplay::Build { target } => self.run_builder(target),
+            RunReplay::ReviseProgress { request } => self.run_progress_revision(request),
+        }
     }
 
     fn handle_clarification_key(&mut self, key: KeyEvent) {
@@ -1161,6 +1349,9 @@ impl TuiApp {
     }
 
     fn activate_scoped_action(&mut self, action: ScopedAction, target: String) {
+        if action != ScopedAction::Remove {
+            self.reset_delete_arm();
+        }
         match action {
             ScopedAction::Run => self.run_builder(target),
             ScopedAction::Review => {
@@ -1178,6 +1369,7 @@ impl TuiApp {
                 self.screen = Screen::Composer(ComposerKind::Replan(target));
             }
             ScopedAction::OpenRun => self.focus_run_for_selected_target(),
+            ScopedAction::Remove => self.remove_target_with_confirmation(target),
             ScopedAction::Back => self.screen = Screen::Dashboard,
         }
     }
@@ -1254,6 +1446,7 @@ impl TuiApp {
         match self.screen {
             Screen::Dashboard => false,
             Screen::Scoped => {
+                self.reset_delete_arm();
                 self.screen = Screen::Dashboard;
                 true
             }
@@ -1415,27 +1608,7 @@ impl TuiApp {
                     .map_err(|error| error.to_string());
                 match revision {
                     Ok(Some(request)) => {
-                        let status = format!("Revising progress for {target}");
-                        let (run_id, control) =
-                            self.start_run(RunnerMode::Plan, target.clone(), status.clone());
-                        self.status = format!("Revising progress for {target}");
-                        let tx = self.tx.clone();
-                        let app = self.app.clone();
-                        self.handle.spawn(async move {
-                            let mut delegate = ChannelDelegate {
-                                tx: tx.clone(),
-                                run_id,
-                            };
-                            let result = app
-                                .revise_progress_after_spec_edit_with_control(
-                                    request,
-                                    control,
-                                    &mut delegate,
-                                )
-                                .await
-                                .map_err(|error| error.to_string());
-                            let _ = tx.send(UiEvent::OperationDone(run_id, result));
-                        });
+                        self.run_progress_revision(request);
                     }
                     Ok(None) => {
                         self.status = "Spec unchanged".to_owned();
@@ -1859,6 +2032,7 @@ impl TuiApp {
                     ScopedAction::SwitchAgent | ScopedAction::Revise | ScopedAction::Replan => {
                         key_style(self.warning_color())
                     }
+                    ScopedAction::Remove => key_style(self.warning_color()),
                     ScopedAction::OpenRun | ScopedAction::Back => key_style(self.muted_color()),
                 };
                 ListItem::new(Line::from(vec![
@@ -2034,7 +2208,7 @@ impl TuiApp {
         };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(8), Constraint::Min(1)])
+            .constraints([Constraint::Length(7), Constraint::Min(1)])
             .split(area);
         frame.render_widget(Clear, chunks[0]);
         frame.render_widget(Clear, chunks[1]);
@@ -2056,13 +2230,6 @@ impl TuiApp {
                 Span::styled(&run.signal, Style::default().fg(self.text_color())),
             ]),
             self.run_telemetry_line(run),
-            Line::from(vec![
-                Span::styled(" shortcuts ", key_style(self.muted_color())),
-                Span::styled(
-                    "Ctrl-A switch next agent  •  Ctrl-C arm kill  •  Ctrl-C again kills it  •  Ctrl-W back to plans  •  PgUp/PgDn/Home/End scroll",
-                    Style::default().fg(self.muted_color()),
-                ),
-            ]),
         ]))
         .block(
             Block::default()
@@ -2182,7 +2349,7 @@ impl TuiApp {
                 self.status
             ),
             Screen::Scoped => format!(
-                "{}    ◆  ↑/↓ select action  •  Enter open  •  PgUp/PgDn/Home/End scroll detail  •  Ctrl-B run  •  Ctrl-V review  •  Ctrl-E edit  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-R stream  •  Ctrl-W back",
+                "{}    ◆  ↑/↓ select action  •  Enter open  •  PgUp/PgDn/Home/End scroll detail  •  Ctrl-B run  •  Ctrl-V review  •  Ctrl-E edit  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-R stream  •  Ctrl-D remove  •  Ctrl-W back",
                 self.status
             ),
             Screen::Composer(_) => format!(
@@ -2194,9 +2361,18 @@ impl TuiApp {
                 self.status
             ),
             Screen::Running(_) => format!(
-                "{}    ◆  Ctrl-A switch next agent  •  Ctrl-C arm kill  •  Ctrl-C again kills it  •  Ctrl-W back to plans  •  auto-follow on new output",
-                self.status
+                "{}    ◆  {}  •  Ctrl-A next agent  •  Ctrl-W back to plans  •  auto-follow new output",
+                self.status,
+                self.running_footer_action(),
             ),
+        }
+    }
+
+    fn running_footer_action(&self) -> &'static str {
+        if self.current_run().is_some_and(|run| run.pending) {
+            "Ctrl-C x2 kills agent"
+        } else {
+            "Ctrl-B rerun agent"
         }
     }
 
@@ -3174,66 +3350,69 @@ mod tests {
         WorkflowState,
     };
 
+    fn build_run() -> super::RunSession {
+        super::RunSession::new(
+            RunnerMode::Build,
+            "alpha".to_owned(),
+            super::RunReplay::Build {
+                target: "alpha".to_owned(),
+            },
+            RunControl::new(),
+        )
+    }
+
     #[test]
     fn stream_output_overwrites_current_line_on_carriage_return() {
-        let mut run =
-            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        let mut run = build_run();
         super::apply_terminal_output(&mut run, "abcdef\rxy");
         assert_eq!(run.stream_lines.join("\n"), "xycdef");
     }
 
     #[test]
     fn stream_output_treats_crlf_as_single_newline() {
-        let mut run =
-            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        let mut run = build_run();
         super::apply_terminal_output(&mut run, "abc\r\ndef");
         assert_eq!(run.stream_lines.join("\n"), "abc\ndef");
     }
 
     #[test]
     fn stream_output_supports_erase_in_line_after_carriage_return() {
-        let mut run =
-            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        let mut run = build_run();
         super::apply_terminal_output(&mut run, "abcdef\r\u{1b}[Kxy");
         assert_eq!(run.stream_lines.join("\n"), "xy");
     }
 
     #[test]
     fn stream_output_uses_eight_column_tab_stops() {
-        let mut run =
-            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        let mut run = build_run();
         super::apply_terminal_output(&mut run, "ab\tc");
         assert_eq!(run.stream_lines.join("\n"), "ab      c");
     }
 
     #[test]
     fn stream_output_supports_horizontal_absolute_cursor() {
-        let mut run =
-            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        let mut run = build_run();
         super::apply_terminal_output(&mut run, "abcdef\u{1b}[3GZ");
         assert_eq!(run.stream_lines.join("\n"), "abZdef");
     }
 
     #[test]
     fn stream_output_supports_cursor_forward() {
-        let mut run =
-            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        let mut run = build_run();
         super::apply_terminal_output(&mut run, "ab\u{1b}[3CX");
         assert_eq!(run.stream_lines.join("\n"), "ab   X");
     }
 
     #[test]
     fn stream_output_supports_cursor_backward() {
-        let mut run =
-            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        let mut run = build_run();
         super::apply_terminal_output(&mut run, "abcdef\u{1b}[2DZ");
         assert_eq!(run.stream_lines.join("\n"), "abcdZf");
     }
 
     #[test]
     fn stream_output_ignores_bell() {
-        let mut run =
-            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        let mut run = build_run();
         super::apply_terminal_output(&mut run, "abc\u{7}def");
         assert_eq!(run.stream_lines.join("\n"), "abcdef");
     }
@@ -3365,7 +3544,12 @@ mod tests {
     fn scoped_action_menu_keeps_run_first_and_back_last() {
         assert_eq!(ScopedAction::ALL.first().copied(), Some(ScopedAction::Run));
         assert_eq!(ScopedAction::ALL.last().copied(), Some(ScopedAction::Back));
+        assert_eq!(
+            ScopedAction::ALL.get(ScopedAction::ALL.len().saturating_sub(2)).copied(),
+            Some(ScopedAction::Remove)
+        );
         assert_eq!(ScopedAction::Review.shortcut(), "Ctrl-V");
+        assert_eq!(ScopedAction::Remove.shortcut(), "Ctrl-D");
         assert_eq!(ScopedAction::OpenRun.label(), "Open run stream");
     }
 
