@@ -5,7 +5,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::{
     ClarificationAnswer, ClarificationRequest, ReviewData, SpecPaths, SpecSummary, WorkflowState,
-    append_persisted_done_marker, generate_slug,
+    append_persisted_done_marker, default_feedback_contents as default_feedback_template,
+    generate_slug,
 };
 
 pub const ARTIFACT_DIR_NAME: &str = ".ralph";
@@ -171,7 +172,7 @@ impl ArtifactStore {
     }
 
     pub fn default_feedback_contents() -> String {
-        feedback_file_contents("None.", "None.")
+        default_feedback_template()
     }
 
     pub fn append_feedback_clarification(
@@ -400,7 +401,22 @@ fn format_feedback_exchange(
             )
         }));
     }
-    lines.push(format!("A: {}", answer.text.trim()));
+    let answer_text = if answer.used_option_selection {
+        answer
+            .selected_option
+            .as_ref()
+            .map(|option| {
+                if option.description.trim().is_empty() {
+                    option.label.trim().to_owned()
+                } else {
+                    format!("{} - {}", option.label.trim(), option.description.trim())
+                }
+            })
+            .unwrap_or_else(|| answer.text.trim().to_owned())
+    } else {
+        answer.text.trim().to_owned()
+    };
+    lines.push(format!("A: {answer_text}"));
     lines.join("\n")
 }
 
@@ -429,12 +445,6 @@ fn preview(contents: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    fn sample_spec(suffix: &str) -> String {
-        format!(
-            "# Goal\nGoal {suffix}\n\n# User Requirements And Constraints\nRequirements {suffix}\n\n# Non-Goals\nNon-goals {suffix}\n\n# Proposed Design\nDesign {suffix}\n\n# Implementation Plan\nPlan {suffix}\n\n# Acceptance Criteria\nAcceptance {suffix}\n\n# Risks\nRisks {suffix}\n\n# Open Questions\nQuestions {suffix}\n"
-        )
-    }
 
     fn store() -> (TempDir, ArtifactStore) {
         let temp = TempDir::new().unwrap();
@@ -495,7 +505,7 @@ mod tests {
         assert_eq!(store.state_for_paths(&empty).unwrap(), WorkflowState::Empty);
 
         store
-            .write_spec(&empty.spec_path, &sample_spec("X"))
+            .write_spec(&empty.spec_path, &crate::sample_spec_contents("X"))
             .unwrap();
         assert_eq!(
             store.state_for_paths(&empty).unwrap(),
@@ -522,6 +532,7 @@ mod tests {
         let answer_one = ClarificationAnswer {
             text: "Postgres".to_owned(),
             used_option_selection: false,
+            selected_option: None,
         };
         store
             .append_feedback_clarification(&paths.feedback_path, &request_one, &answer_one)
@@ -534,6 +545,7 @@ mod tests {
         let answer_two = ClarificationAnswer {
             text: "Tokio".to_owned(),
             used_option_selection: false,
+            selected_option: None,
         };
         store
             .append_feedback_clarification(&paths.feedback_path, &request_two, &answer_two)
@@ -564,6 +576,7 @@ mod tests {
         let answer = ClarificationAnswer {
             text: "I like option 2, but use Bubbletea instead of Tview".to_owned(),
             used_option_selection: false,
+            selected_option: None,
         };
 
         store
@@ -592,6 +605,10 @@ mod tests {
         let answer = ClarificationAnswer {
             text: "Tokio".to_owned(),
             used_option_selection: true,
+            selected_option: Some(crate::ClarificationOption {
+                label: "Tokio".to_owned(),
+                description: "Async runtime".to_owned(),
+            }),
         };
 
         store
@@ -600,7 +617,7 @@ mod tests {
 
         let feedback = store.read_feedback(&paths.feedback_path).unwrap();
         assert!(feedback.contains("Q: Which runtime?"));
-        assert!(feedback.contains("A: Tokio"));
+        assert!(feedback.contains("A: Tokio - Async runtime"));
         assert!(!feedback.contains("Options:"));
     }
 
@@ -609,12 +626,12 @@ mod tests {
         let (_temp, store) = store();
         let active = store.resolve_target("active").unwrap();
         store
-            .write_spec(&active.spec_path, &sample_spec("active"))
+            .write_spec(&active.spec_path, &crate::sample_spec_contents("active"))
             .unwrap();
 
         let completed = store.resolve_target("done").unwrap();
         store
-            .write_spec(&completed.spec_path, &sample_spec("done"))
+            .write_spec(&completed.spec_path, &crate::sample_spec_contents("done"))
             .unwrap();
         store
             .write_progress(&completed.progress_path, "<promise>DONE</promise>\n")
@@ -658,6 +675,7 @@ mod tests {
         let db_answer = ClarificationAnswer {
             text: "Postgres".to_owned(),
             used_option_selection: false,
+            selected_option: None,
         };
         store
             .append_feedback_clarification(&paths.feedback_path, &db_request, &db_answer)
@@ -669,6 +687,7 @@ mod tests {
         let runtime_answer = ClarificationAnswer {
             text: "Tokio".to_owned(),
             used_option_selection: false,
+            selected_option: None,
         };
         store
             .append_feedback_clarification(&paths.feedback_path, &runtime_request, &runtime_answer)
@@ -684,7 +703,11 @@ mod tests {
         let (_temp, store) = store();
         let legacy_dir = store.project_dir().join(LEGACY_ARTIFACT_DIR_NAME);
         fs::create_dir_all(&legacy_dir).unwrap();
-        fs::write(legacy_dir.join("spec-legacy.md"), sample_spec("legacy")).unwrap();
+        fs::write(
+            legacy_dir.join("spec-legacy.md"),
+            crate::sample_spec_contents("legacy"),
+        )
+        .unwrap();
         fs::write(legacy_dir.join("progress-legacy.txt"), "Task 1\n").unwrap();
 
         let specs = store.list_specs().unwrap();

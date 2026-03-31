@@ -78,6 +78,7 @@ pub struct ClarificationRequest {
 pub struct ClarificationAnswer {
     pub text: String,
     pub used_option_selection: bool,
+    pub selected_option: Option<ClarificationOption>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
