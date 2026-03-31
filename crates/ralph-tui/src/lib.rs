@@ -123,6 +123,57 @@ enum ComposerKind {
     Replan(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScopedAction {
+    Run,
+    Review,
+    Edit,
+    SwitchAgent,
+    Revise,
+    Replan,
+    OpenRun,
+    Back,
+}
+
+impl ScopedAction {
+    const ALL: [Self; 8] = [
+        Self::Run,
+        Self::Review,
+        Self::Edit,
+        Self::SwitchAgent,
+        Self::Revise,
+        Self::Replan,
+        Self::OpenRun,
+        Self::Back,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Run => "Run spec",
+            Self::Review => "Review",
+            Self::Edit => "Edit + revise",
+            Self::SwitchAgent => "Switch agent",
+            Self::Revise => "Revise in place",
+            Self::Replan => "Replan",
+            Self::OpenRun => "Open run stream",
+            Self::Back => "Back",
+        }
+    }
+
+    fn shortcut(self) -> &'static str {
+        match self {
+            Self::Run => "Ctrl-B",
+            Self::Review => "Ctrl-V",
+            Self::Edit => "Ctrl-E",
+            Self::SwitchAgent => "Ctrl-A",
+            Self::Revise => "Ctrl-U",
+            Self::Replan => "Ctrl-P",
+            Self::OpenRun => "Ctrl-R",
+            Self::Back => "Ctrl-W",
+        }
+    }
+}
+
 struct ClarificationModal {
     run_id: RunId,
     request: ClarificationRequest,
@@ -207,6 +258,7 @@ struct TuiApp {
     review_tab: usize,
     review_pending: bool,
     dashboard_preview_scroll: u16,
+    scoped_action_selected: usize,
     scoped_scroll: u16,
     review_scroll: u16,
     runs: BTreeMap<RunId, RunSession>,
@@ -252,6 +304,7 @@ impl TuiApp {
             review_tab: 0,
             review_pending: false,
             dashboard_preview_scroll: 0,
+            scoped_action_selected: 0,
             scoped_scroll: 0,
             review_scroll: 0,
             runs: BTreeMap::new(),
@@ -775,46 +828,41 @@ impl TuiApp {
 
         match key.code {
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.screen = Screen::Dashboard
+                self.activate_scoped_action(ScopedAction::Back, target)
             }
             KeyCode::Enter => {
-                self.review_scroll = 0;
-                self.load_review(target)
+                let action = self.selected_scoped_action();
+                self.activate_scoped_action(action, target);
             }
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.request_quit();
             }
             KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.review_scroll = 0;
-                self.load_review(target)
+                self.activate_scoped_action(ScopedAction::Review, target)
             }
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.run_builder(target)
+                self.activate_scoped_action(ScopedAction::Run, target)
             }
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.run_edit(target)
+                self.activate_scoped_action(ScopedAction::Edit, target)
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.composer = fresh_composer("Revise Spec", self.accent_color());
-                self.screen = Screen::Composer(ComposerKind::Revise(target));
+                self.activate_scoped_action(ScopedAction::Revise, target)
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.composer = fresh_composer("Replan From Scratch", self.accent_color());
-                self.screen = Screen::Composer(ComposerKind::Replan(target));
+                self.activate_scoped_action(ScopedAction::Replan, target)
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.cycle_coding_agent();
+                self.activate_scoped_action(ScopedAction::SwitchAgent, target)
             }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.focus_run_for_selected_target();
+                self.activate_scoped_action(ScopedAction::OpenRun, target)
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.scoped_scroll =
-                    apply_scroll_delta(self.scoped_scroll, ScrollDelta::Lines(1), false);
+                self.move_scoped_action_selection(1);
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.scoped_scroll =
-                    apply_scroll_delta(self.scoped_scroll, ScrollDelta::Lines(-1), false);
+                self.move_scoped_action_selection(-1);
             }
             _ => {}
         }
@@ -1064,6 +1112,41 @@ impl TuiApp {
         self.specs
             .get(self.selected)
             .map(|summary| summary.spec_path.to_string())
+    }
+
+    fn selected_scoped_action(&self) -> ScopedAction {
+        ScopedAction::ALL
+            .get(self.scoped_action_selected)
+            .copied()
+            .unwrap_or(ScopedAction::Run)
+    }
+
+    fn move_scoped_action_selection(&mut self, delta: isize) {
+        let max_index = ScopedAction::ALL.len().saturating_sub(1) as isize;
+        let next = (self.scoped_action_selected as isize + delta).clamp(0, max_index);
+        self.scoped_action_selected = next as usize;
+    }
+
+    fn activate_scoped_action(&mut self, action: ScopedAction, target: String) {
+        match action {
+            ScopedAction::Run => self.run_builder(target),
+            ScopedAction::Review => {
+                self.review_scroll = 0;
+                self.load_review(target);
+            }
+            ScopedAction::Edit => self.run_edit(target),
+            ScopedAction::SwitchAgent => self.cycle_coding_agent(),
+            ScopedAction::Revise => {
+                self.composer = fresh_composer("Revise Spec", self.accent_color());
+                self.screen = Screen::Composer(ComposerKind::Revise(target));
+            }
+            ScopedAction::Replan => {
+                self.composer = fresh_composer("Replan From Scratch", self.accent_color());
+                self.screen = Screen::Composer(ComposerKind::Replan(target));
+            }
+            ScopedAction::OpenRun => self.focus_run_for_selected_target(),
+            ScopedAction::Back => self.screen = Screen::Dashboard,
+        }
     }
 
     fn focused_run_is_pending(&self) -> bool {
@@ -1700,85 +1783,60 @@ impl TuiApp {
         frame.render_widget(Clear, chunks[0]);
         frame.render_widget(Clear, chunks[1]);
         let summary = self.specs.get(self.selected);
-        let actions = vec![
-            Line::from(vec![
-                Span::styled("Ctrl-B", key_style(self.accent_color())),
-                Span::raw("  Run spec"),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl-V", key_style(self.accent_color())),
-                Span::raw("  Review spec and progress"),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl-E", key_style(self.accent_color())),
-                Span::raw("  Edit spec, then revise progress"),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl-A", key_style(self.warning_color())),
-                Span::raw("  Switch coding agent"),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl-U", key_style(self.warning_color())),
-                Span::raw("  Revise the plan in place"),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl-P", key_style(self.warning_color())),
-                Span::raw("  Replan from scratch"),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Ctrl-W", key_style(self.muted_color())),
-                Span::raw("  Back to dashboard"),
-            ]),
-            Line::from(vec![
-                Span::styled("Ctrl-R", key_style(self.muted_color())),
-                Span::raw("  Open selected task stream"),
-            ]),
-            Line::from(vec![
-                Span::styled("PgUp/PgDn", key_style(self.muted_color())),
-                Span::raw("  Scroll the detail pane"),
-            ]),
-            Line::from(vec![
-                Span::styled("↑ ↓ / j k", key_style(self.muted_color())),
-                Span::raw("  Line-scroll the detail pane"),
-            ]),
-        ];
-        let action_panel = Paragraph::new(actions)
+        let items: Vec<ListItem> = ScopedAction::ALL
+            .iter()
+            .copied()
+            .map(|action| {
+                let shortcut_style = match action {
+                    ScopedAction::Run | ScopedAction::Review | ScopedAction::Edit => {
+                        key_style(self.accent_color())
+                    }
+                    ScopedAction::SwitchAgent | ScopedAction::Revise | ScopedAction::Replan => {
+                        key_style(self.warning_color())
+                    }
+                    ScopedAction::OpenRun | ScopedAction::Back => key_style(self.muted_color()),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(action.label(), Style::default().fg(self.text_color())),
+                    Span::raw("  "),
+                    Span::styled(action.shortcut(), shortcut_style),
+                ]))
+            })
+            .collect();
+        let mut list_state = ListState::default();
+        list_state.select(Some(
+            self.scoped_action_selected.min(ScopedAction::ALL.len() - 1),
+        ));
+        let action_panel = List::new(items)
             .block(
                 Block::default()
-                    .title(self.title_line("Actions", "One spec, many moves"))
+                    .title(self.title_line("Actions", "Select with Enter"))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded),
             )
-            .wrap(Wrap { trim: false });
-        frame.render_widget(action_panel, chunks[0]);
+            .highlight_symbol("▶ ")
+            .highlight_style(
+                Style::default()
+                    .fg(self.text_color())
+                    .bg(self.panel_highlight())
+                    .add_modifier(Modifier::BOLD),
+            );
+        frame.render_stateful_widget(action_panel, chunks[0], &mut list_state);
 
         let (contents_text, contents_source) = if let Some(summary) = summary {
             let task_status = self.task_status(summary);
             let feedback_display = feedback_display_string(&summary.feedback_preview);
-            let source = format!(
-                "Shortcuts\nCtrl-B run  •  Ctrl-V review  •  Ctrl-E edit spec + revise progress  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-R selected stream  •  Ctrl-W back\nScroll\n↑/↓ or j/k line scroll  •  PgUp/PgDn/Home/End page scroll\n\n{}\n{}\n{}\n\n◆ Agent\n{}\n\n◆ Live Runs\n{}\n\n◆ Status\n{}\n\n◆ State\n{}\n\n◆ Spec Preview\n{}\n\n◆ Progress Preview\n{}\n\n◆ Feedback Preview\n{}\n",
-                summary.spec_path,
-                summary.progress_path,
-                summary.feedback_path,
+            let header = scoped_preview_header(
+                summary,
                 self.coding_agent().label(),
                 self.active_run_count(),
-                task_status_label(task_status),
-                state_label(summary.state),
-                summary.spec_preview,
-                summary.progress_preview,
-                feedback_display,
+                task_status,
             );
-            let mut text = plain_text_from_string(format!(
-                "Shortcuts\nCtrl-B run  •  Ctrl-V review  •  Ctrl-E edit spec + revise progress  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-R selected stream  •  Ctrl-W back\nScroll\n↑/↓ or j/k line scroll  •  PgUp/PgDn/Home/End page scroll\n\n{}\n{}\n{}\n\n◆ Agent\n{}\n\n◆ Live Runs\n{}\n\n◆ Status\n{}\n\n◆ State\n{}\n\n◆ Spec Preview\n",
-                summary.spec_path,
-                summary.progress_path,
-                summary.feedback_path,
-                self.coding_agent().label(),
-                self.active_run_count(),
-                task_status_label(task_status),
-                state_label(summary.state),
-            ));
+            let source = format!(
+                "{}{}\n\n◆ Progress Preview\n{}\n\n◆ Feedback Preview\n{}\n",
+                header, summary.spec_preview, summary.progress_preview, feedback_display,
+            );
+            let mut text = plain_text_from_string(header);
             append_text(
                 &mut text,
                 highlight_markdown(summary.spec_preview.as_str(), self.color_mode),
@@ -2059,7 +2117,7 @@ impl TuiApp {
                 self.status
             ),
             Screen::Scoped => format!(
-                "{}    ◆  Ctrl-B run  •  Ctrl-V review  •  Ctrl-E edit spec + revise progress  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-R selected stream  •  Ctrl-W back  •  ↑/↓ scroll",
+                "{}    ◆  ↑/↓ select action  •  Enter open  •  PgUp/PgDn/Home/End scroll detail  •  Ctrl-B run  •  Ctrl-V review  •  Ctrl-E edit  •  Ctrl-A switch agent  •  Ctrl-U revise  •  Ctrl-P replan  •  Ctrl-R stream  •  Ctrl-W back",
                 self.status
             ),
             Screen::Composer(_) => format!(
@@ -2808,6 +2866,24 @@ fn feedback_display_string(contents: &str) -> String {
     }
 }
 
+fn scoped_preview_header(
+    summary: &SpecSummary,
+    coding_agent_label: &str,
+    active_run_count: usize,
+    task_status: TaskStatus,
+) -> String {
+    format!(
+        "{}\n{}\n{}\n\n◆ Agent\n{}\n\n◆ Live Runs\n{}\n\n◆ Status\n{}\n\n◆ State\n{}\n\n◆ Spec Preview\n",
+        summary.spec_path,
+        summary.progress_path,
+        summary.feedback_path,
+        coding_agent_label,
+        active_run_count,
+        task_status_label(task_status),
+        state_label(summary.state),
+    )
+}
+
 fn extract_feedback_section_for_display(
     contents: &str,
     start_tag: &str,
@@ -2902,11 +2978,14 @@ fn wrap_visual_lines(text: &str, width: u16) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ColorMode, TaskStatus, clarification_body_text, clarification_shortcuts_text,
+        ColorMode, ScopedAction, TaskStatus, clarification_body_text, clarification_shortcuts_text,
         feedback_display_string, max_scroll_for_text, normalize_stream_chunk,
-        parse_osc_hex_channel, parse_osc11_response, task_status_for, wrap_visual_lines,
+        parse_osc_hex_channel, parse_osc11_response, scoped_preview_header, task_status_for,
+        wrap_visual_lines,
     };
-    use ralph_core::{ClarificationOption, ClarificationRequest, RunnerMode, WorkflowState};
+    use ralph_core::{
+        ClarificationOption, ClarificationRequest, RunnerMode, SpecSummary, WorkflowState,
+    };
 
     #[test]
     fn normalizes_carriage_returns_and_ansi_sequences() {
@@ -3017,5 +3096,31 @@ mod tests {
         assert!(rendered.contains("Q: Which db?"));
         assert!(!rendered.contains("<RECENT-USER-FEEDBACK>"));
         assert!(!rendered.contains("<OLDER-USER-FEEDBACK>"));
+    }
+
+    #[test]
+    fn scoped_preview_header_starts_with_paths_not_shortcuts() {
+        let summary = SpecSummary {
+            spec_path: "/tmp/project/.ralph/spec-spark.md".parse().unwrap(),
+            progress_path: "/tmp/project/.ralph/progress-spark.txt".parse().unwrap(),
+            feedback_path: "/tmp/project/.ralph/feedback-spark.txt".parse().unwrap(),
+            state: WorkflowState::Completed,
+            spec_preview: "# Goal".to_owned(),
+            progress_preview: "# Tasks".to_owned(),
+            feedback_preview: "None.".to_owned(),
+        };
+
+        let header = scoped_preview_header(&summary, "Raijin", 2, TaskStatus::Idle);
+        assert!(header.starts_with("/tmp/project/.ralph/spec-spark.md"));
+        assert!(!header.contains("Shortcuts"));
+        assert!(!header.contains("Scroll"));
+    }
+
+    #[test]
+    fn scoped_action_menu_keeps_run_first_and_back_last() {
+        assert_eq!(ScopedAction::ALL.first().copied(), Some(ScopedAction::Run));
+        assert_eq!(ScopedAction::ALL.last().copied(), Some(ScopedAction::Back));
+        assert_eq!(ScopedAction::Review.shortcut(), "Ctrl-V");
+        assert_eq!(ScopedAction::OpenRun.label(), "Open run stream");
     }
 }
