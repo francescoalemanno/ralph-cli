@@ -186,7 +186,9 @@ type RunId = u64;
 struct RunSession {
     mode: RunnerMode,
     target: String,
-    logs: Vec<String>,
+    stream_lines: Vec<String>,
+    stream_cursor_col: usize,
+    chunk_count: usize,
     scroll: u16,
     follow: bool,
     iteration: Option<(usize, usize)>,
@@ -200,7 +202,9 @@ impl RunSession {
         Self {
             mode,
             target,
-            logs: Vec::new(),
+            stream_lines: vec![String::new()],
+            stream_cursor_col: 0,
+            chunk_count: 0,
             scroll: 0,
             follow: true,
             iteration: None,
@@ -335,6 +339,7 @@ impl TuiApp {
         let mut tui = Self::new(app, handle);
         tui.specs = vec![summary];
         tui.screen = Screen::Scoped;
+        tui.selected = 1;
         tui.status = status;
         tui.focus_spec_path = focus_spec_path;
         tui.pinned_spec_path = pinned_spec_path;
@@ -520,13 +525,14 @@ impl TuiApp {
                             .iter()
                             .position(|summary| summary.spec_path.as_str() == path)
                     {
-                        self.selected = index;
+                        self.selected = index + 1;
                     }
-                    if self.selected >= self.specs.len() {
-                        self.selected = self.specs.len().saturating_sub(1);
+                    let entry_count = dashboard_entry_count(self.specs.len());
+                    if self.selected >= entry_count {
+                        self.selected = entry_count.saturating_sub(1);
                     }
                     self.status = if self.specs.is_empty() {
-                        "No specs yet. Press n to create one.".to_owned()
+                        "No specs yet. Press Ctrl-N to create one.".to_owned()
                     } else {
                         format!("Loaded {} specs", self.specs.len())
                     };
@@ -606,7 +612,16 @@ impl TuiApp {
 
     fn append_run_log(&mut self, run_id: RunId, line: String) {
         if let Some(run) = self.runs.get_mut(&run_id) {
-            run.logs.push(line);
+            append_run_entry(run, &line);
+            run.follow = true;
+            run.scroll = u16::MAX;
+        }
+    }
+
+    fn append_run_output_chunk(&mut self, run_id: RunId, chunk: &str) {
+        if let Some(run) = self.runs.get_mut(&run_id) {
+            apply_terminal_output(run, chunk);
+            run.chunk_count = run.chunk_count.saturating_add(1);
             run.follow = true;
             run.scroll = u16::MAX;
         }
@@ -673,7 +688,7 @@ impl TuiApp {
                     format_iteration_banner(mode, iteration, max_iterations),
                 );
             }
-            RunEvent::Output(chunk) => self.append_run_log(run_id, normalize_stream_chunk(&chunk)),
+            RunEvent::Output(chunk) => self.append_run_output_chunk(run_id, &chunk),
             RunEvent::Note(note) => {
                 if let Some(run) = self.runs.get_mut(&run_id) {
                     run.signal = compact_text(&note, 88);
@@ -783,7 +798,7 @@ impl TuiApp {
                 self.request_quit();
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected + 1 < self.specs.len() {
+                if self.selected + 1 < dashboard_entry_count(self.specs.len()) {
                     self.selected += 1;
                     self.dashboard_preview_scroll = 0;
                 }
@@ -792,18 +807,25 @@ impl TuiApp {
                 self.selected = self.selected.saturating_sub(1);
                 self.dashboard_preview_scroll = 0;
             }
-            KeyCode::Char('o')
-                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.specs.is_empty() =>
-            {
-                self.screen = Screen::Scoped
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.selected == 0 {
+                    self.open_create_composer();
+                } else {
+                    self.screen = Screen::Scoped;
+                }
             }
-            KeyCode::Enter if !self.specs.is_empty() => self.screen = Screen::Scoped,
+            KeyCode::Enter => {
+                if self.selected == 0 {
+                    self.open_create_composer();
+                } else {
+                    self.screen = Screen::Scoped;
+                }
+            }
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.focus_run_for_selected_target();
             }
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.composer = fresh_composer("Create New Spec", self.accent_color());
-                self.screen = Screen::Composer(ComposerKind::Create);
+                self.open_create_composer();
             }
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cycle_coding_agent();
@@ -1056,15 +1078,18 @@ impl TuiApp {
                         .map(|option| ClarificationAnswer {
                             text: option.label.clone(),
                             used_option_selection: true,
+                            selected_option: Some(option.clone()),
                         })
                         .unwrap_or(ClarificationAnswer {
                             text: raw_answer,
                             used_option_selection: false,
+                            selected_option: None,
                         })
                 } else {
                     ClarificationAnswer {
                         text: raw_answer,
                         used_option_selection: false,
+                        selected_option: None,
                     }
                 };
                 if answer.text.trim().is_empty() {
@@ -1109,9 +1134,17 @@ impl TuiApp {
     }
 
     fn selected_target(&self) -> Option<String> {
-        self.specs
-            .get(self.selected)
+        self.selected_summary()
             .map(|summary| summary.spec_path.to_string())
+    }
+
+    fn selected_summary(&self) -> Option<&SpecSummary> {
+        selected_spec_index(self.selected, self.specs.len()).and_then(|index| self.specs.get(index))
+    }
+
+    fn open_create_composer(&mut self) {
+        self.composer = fresh_composer("Create New Spec", self.accent_color());
+        self.screen = Screen::Composer(ComposerKind::Create);
     }
 
     fn selected_scoped_action(&self) -> ScopedAction {
@@ -1472,10 +1505,13 @@ impl TuiApp {
         if let Some(run) = self.current_run_mut().filter(|run| run.pending) {
             run.control.set_coding_agent(next);
             run.signal = format!("Next iteration will use {}", next.label());
-            run.logs.push(format!(
-                "agent switched to {}; next iteration will use it",
-                next.label()
-            ));
+            append_run_entry(
+                run,
+                &format!(
+                    "agent switched to {}; next iteration will use it",
+                    next.label()
+                ),
+            );
             run.follow = true;
             run.scroll = u16::MAX;
         } else {
@@ -1619,78 +1655,89 @@ impl TuiApp {
         frame.render_widget(Clear, chunks[0]);
         frame.render_widget(Clear, chunks[1]);
 
-        let items = if self.specs.is_empty() {
-            vec![ListItem::new(Line::from(vec![
-                Span::styled("◌", Style::default().fg(self.muted_color())),
-                Span::raw(" No specs yet"),
-            ]))]
-        } else {
-            self.specs
-                .iter()
-                .map(|summary| {
-                    let task_status = self.task_status(summary);
-                    let title = Line::from(vec![
-                        Span::styled(
-                            format!("{} ", state_badge(summary.state)),
-                            state_style(
-                                summary.state,
-                                self.accent_color(),
-                                self.success_color(),
-                                self.muted_color(),
-                            ),
-                        ),
-                        Span::styled(
-                            summary
-                                .spec_path
-                                .file_name()
-                                .unwrap_or(summary.spec_path.as_str())
-                                .to_owned(),
-                            Style::default()
-                                .fg(self.text_color())
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw("  "),
-                        Span::styled(
-                            format!(" {} ", task_status_label(task_status)),
-                            task_status_style(
-                                task_status,
-                                self.accent_color(),
-                                self.success_color(),
-                                self.warning_color(),
-                                self.muted_color(),
-                            )
-                            .add_modifier(Modifier::BOLD),
-                        ),
-                    ]);
-                    let meta = Line::from(vec![
-                        Span::styled(
-                            state_label(summary.state).to_uppercase(),
-                            state_style(
-                                summary.state,
-                                self.accent_color(),
-                                self.success_color(),
-                                self.muted_color(),
-                            )
-                            .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!("  ◆  {}", task_status_label(task_status)),
-                            Style::default().fg(self.muted_color()),
-                        ),
-                        Span::styled(
-                            format!("  ◆  {}", summary.progress_path),
-                            Style::default().fg(self.muted_color()),
-                        ),
-                    ]);
-                    ListItem::new(vec![title, meta])
-                })
-                .collect()
-        };
+        let mut items = vec![ListItem::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    "+ ",
+                    Style::default()
+                        .fg(self.accent_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "New Spec",
+                    Style::default()
+                        .fg(self.text_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("CREATE", key_style(self.accent_color())),
+                Span::styled(
+                    "  ◆  Start a new planning request",
+                    Style::default().fg(self.muted_color()),
+                ),
+            ]),
+        ])];
+        items.extend(self.specs.iter().map(|summary| {
+            let task_status = self.task_status(summary);
+            let title = Line::from(vec![
+                Span::styled(
+                    format!("{} ", state_badge(summary.state)),
+                    state_style(
+                        summary.state,
+                        self.accent_color(),
+                        self.success_color(),
+                        self.muted_color(),
+                    ),
+                ),
+                Span::styled(
+                    summary
+                        .spec_path
+                        .file_name()
+                        .unwrap_or(summary.spec_path.as_str())
+                        .to_owned(),
+                    Style::default()
+                        .fg(self.text_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!(" {} ", task_status_label(task_status)),
+                    task_status_style(
+                        task_status,
+                        self.accent_color(),
+                        self.success_color(),
+                        self.warning_color(),
+                        self.muted_color(),
+                    )
+                    .add_modifier(Modifier::BOLD),
+                ),
+            ]);
+            let meta = Line::from(vec![
+                Span::styled(
+                    state_label(summary.state).to_uppercase(),
+                    state_style(
+                        summary.state,
+                        self.accent_color(),
+                        self.success_color(),
+                        self.muted_color(),
+                    )
+                    .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  ◆  {}", task_status_label(task_status)),
+                    Style::default().fg(self.muted_color()),
+                ),
+                Span::styled(
+                    format!("  ◆  {}", summary.progress_path),
+                    Style::default().fg(self.muted_color()),
+                ),
+            ]);
+            ListItem::new(vec![title, meta])
+        }));
 
         let mut list_state = ListState::default();
-        if !self.specs.is_empty() {
-            list_state.select(Some(self.selected));
-        }
+        list_state.select(Some(self.selected.min(items.len().saturating_sub(1))));
 
         let list = List::new(items)
             .block(
@@ -1708,7 +1755,7 @@ impl TuiApp {
             );
         frame.render_stateful_widget(list, chunks[0], &mut list_state);
 
-        let (preview_text, preview_source) = if let Some(summary) = self.specs.get(self.selected) {
+        let (preview_text, preview_source) = if let Some(summary) = self.selected_summary() {
             let task_status = self.task_status(summary);
             let feedback_display = feedback_display_string(&summary.feedback_preview);
             let source = format!(
@@ -1750,8 +1797,26 @@ impl TuiApp {
             (text, source)
         } else {
             (
-                plain_text_from_string("Create a spec with n to begin.".to_owned()),
-                "Create a spec with n to begin.".to_owned(),
+                plain_text_from_string(format!(
+                    "Shortcuts\nCtrl-N create  •  Ctrl-O open  •  Ctrl-R selected stream  •  Ctrl-A switch agent  •  Ctrl-L reload  •  Ctrl-Q quit\nScroll\nPgUp/PgDn/Home/End\n\n◆ Agent      {}\n◆ Live Runs  {}\n◆ Status     {}\n\nSelect New Spec and press Enter, Ctrl-O, or Ctrl-N to start a new planning request.",
+                    self.coding_agent().label(),
+                    self.active_run_count(),
+                    if self.specs.is_empty() {
+                        "To Plan"
+                    } else {
+                        "Ready"
+                    },
+                )),
+                format!(
+                    "Shortcuts\nCtrl-N create  •  Ctrl-O open  •  Ctrl-R selected stream  •  Ctrl-A switch agent  •  Ctrl-L reload  •  Ctrl-Q quit\nScroll\nPgUp/PgDn/Home/End\n\n◆ Agent      {}\n◆ Live Runs  {}\n◆ Status     {}\n\nSelect New Spec and press Enter, Ctrl-O, or Ctrl-N to start a new planning request.",
+                    self.coding_agent().label(),
+                    self.active_run_count(),
+                    if self.specs.is_empty() {
+                        "To Plan"
+                    } else {
+                        "Ready"
+                    },
+                ),
             )
         };
 
@@ -1782,7 +1847,7 @@ impl TuiApp {
             .split(area);
         frame.render_widget(Clear, chunks[0]);
         frame.render_widget(Clear, chunks[1]);
-        let summary = self.specs.get(self.selected);
+        let summary = self.selected_summary();
         let items: Vec<ListItem> = ScopedAction::ALL
             .iter()
             .copied()
@@ -2007,7 +2072,7 @@ impl TuiApp {
         );
         frame.render_widget(header, chunks[0]);
 
-        let joined = run.logs.join("\n");
+        let joined = run.stream_lines.join("\n");
         let body_width = chunks[1].width.saturating_sub(2);
         let body_height = chunks[1].height.saturating_sub(2);
         let wrapped_lines = wrap_visual_lines(&joined, body_width);
@@ -2196,8 +2261,8 @@ impl TuiApp {
         };
         let logs = format!(
             "{} log chunk{}",
-            run.logs.len(),
-            if run.logs.len() == 1 { "" } else { "s" }
+            run.chunk_count,
+            if run.chunk_count == 1 { "" } else { "s" }
         );
 
         Line::from(vec![
@@ -2917,8 +2982,8 @@ fn max_scroll_for_text(text: &str, width: u16, height: u16) -> u16 {
     rendered_line_count.saturating_sub(visible_lines) as u16
 }
 
-fn normalize_stream_chunk(chunk: &str) -> String {
-    let mut normalized = String::new();
+fn apply_terminal_output(run: &mut RunSession, chunk: &str) {
+    ensure_stream_line(run);
     let mut chars = chunk.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -2926,21 +2991,134 @@ fn normalize_stream_chunk(chunk: &str) -> String {
             '\u{1b}' => {
                 if matches!(chars.peek(), Some('[')) {
                     chars.next();
+                    let mut params = String::new();
                     for next in chars.by_ref() {
                         if ('@'..='~').contains(&next) {
+                            match next {
+                                'C' => apply_cursor_forward(run, &params),
+                                'D' => apply_cursor_backward(run, &params),
+                                'G' => apply_cursor_horizontal_absolute(run, &params),
+                                'K' => apply_erase_in_line(run, &params),
+                                _ => {}
+                            }
                             break;
                         }
+                        params.push(next);
                     }
                 }
             }
-            '\r' => normalized.push('\n'),
-            '\t' => normalized.push_str("    "),
-            '\u{8}' => {}
-            _ => normalized.push(ch),
+            '\u{7}' => {}
+            '\r' => {
+                if matches!(chars.peek(), Some('\n')) {
+                    chars.next();
+                    run.stream_lines.push(String::new());
+                    run.stream_cursor_col = 0;
+                } else {
+                    run.stream_cursor_col = 0;
+                }
+            }
+            '\n' => {
+                run.stream_lines.push(String::new());
+                run.stream_cursor_col = 0;
+            }
+            '\t' => write_tab(run),
+            '\u{8}' => {
+                run.stream_cursor_col = run.stream_cursor_col.saturating_sub(1);
+            }
+            _ => write_stream_char(run, ch),
         }
     }
+}
 
-    normalized
+fn append_run_entry(run: &mut RunSession, entry: &str) {
+    ensure_stream_line(run);
+    if !run.stream_lines.last().is_some_and(|line| line.is_empty()) || run.stream_cursor_col != 0 {
+        run.stream_lines.push(String::new());
+        run.stream_cursor_col = 0;
+    }
+    apply_terminal_output(run, entry);
+    run.stream_lines.push(String::new());
+    run.stream_cursor_col = 0;
+    run.chunk_count = run.chunk_count.saturating_add(1);
+}
+
+fn ensure_stream_line(run: &mut RunSession) {
+    if run.stream_lines.is_empty() {
+        run.stream_lines.push(String::new());
+    }
+}
+
+fn write_stream_char(run: &mut RunSession, ch: char) {
+    ensure_stream_line(run);
+    let line = run.stream_lines.last_mut().expect("stream line must exist");
+    let mut chars = line.chars().collect::<Vec<_>>();
+    if run.stream_cursor_col < chars.len() {
+        chars[run.stream_cursor_col] = ch;
+    } else {
+        while chars.len() < run.stream_cursor_col {
+            chars.push(' ');
+        }
+        chars.push(ch);
+    }
+    *line = chars.into_iter().collect();
+    run.stream_cursor_col = run.stream_cursor_col.saturating_add(1);
+}
+
+fn write_tab(run: &mut RunSession) {
+    let next_stop = ((run.stream_cursor_col / 8) + 1) * 8;
+    while run.stream_cursor_col < next_stop {
+        write_stream_char(run, ' ');
+    }
+}
+
+fn apply_cursor_horizontal_absolute(run: &mut RunSession, params: &str) {
+    ensure_stream_line(run);
+    let column = first_csi_param(params).unwrap_or(1).max(1);
+    run.stream_cursor_col = column.saturating_sub(1);
+}
+
+fn apply_cursor_forward(run: &mut RunSession, params: &str) {
+    let amount = first_csi_param(params).unwrap_or(1);
+    run.stream_cursor_col = run.stream_cursor_col.saturating_add(amount);
+}
+
+fn apply_cursor_backward(run: &mut RunSession, params: &str) {
+    let amount = first_csi_param(params).unwrap_or(1);
+    run.stream_cursor_col = run.stream_cursor_col.saturating_sub(amount);
+}
+
+fn apply_erase_in_line(run: &mut RunSession, params: &str) {
+    ensure_stream_line(run);
+    let mode = first_csi_param(params).unwrap_or(0);
+    let line = run.stream_lines.last_mut().expect("stream line must exist");
+    let mut chars = line.chars().collect::<Vec<_>>();
+    match mode {
+        1 => {
+            let end = run.stream_cursor_col.min(chars.len());
+            for slot in chars.iter_mut().take(end) {
+                *slot = ' ';
+            }
+        }
+        2 => {
+            chars.clear();
+            run.stream_cursor_col = 0;
+        }
+        _ => {
+            chars.truncate(run.stream_cursor_col.min(chars.len()));
+        }
+    }
+    *line = chars.into_iter().collect();
+}
+
+fn first_csi_param(params: &str) -> Option<usize> {
+    params.split(';').next().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            trimmed.parse::<usize>().ok()
+        }
+    })
 }
 
 fn wrap_visual_lines(text: &str, width: u16) -> Vec<String> {
@@ -2975,22 +3153,89 @@ fn wrap_visual_lines(text: &str, width: u16) -> Vec<String> {
     wrapped
 }
 
+fn dashboard_entry_count(spec_count: usize) -> usize {
+    spec_count.saturating_add(1)
+}
+
+fn selected_spec_index(selected: usize, spec_count: usize) -> Option<usize> {
+    selected.checked_sub(1).filter(|index| *index < spec_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ColorMode, ScopedAction, TaskStatus, clarification_body_text, clarification_shortcuts_text,
-        feedback_display_string, max_scroll_for_text, normalize_stream_chunk,
-        parse_osc_hex_channel, parse_osc11_response, scoped_preview_header, task_status_for,
+        dashboard_entry_count, feedback_display_string, max_scroll_for_text, parse_osc_hex_channel,
+        parse_osc11_response, scoped_preview_header, selected_spec_index, task_status_for,
         wrap_visual_lines,
     };
     use ralph_core::{
-        ClarificationOption, ClarificationRequest, RunnerMode, SpecSummary, WorkflowState,
+        ClarificationOption, ClarificationRequest, RunControl, RunnerMode, SpecSummary,
+        WorkflowState,
     };
 
     #[test]
-    fn normalizes_carriage_returns_and_ansi_sequences() {
-        let normalized = normalize_stream_chunk("abc\rdef\u{1b}[31mred\u{1b}[0m");
-        assert_eq!(normalized, "abc\ndefred");
+    fn stream_output_overwrites_current_line_on_carriage_return() {
+        let mut run =
+            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        super::apply_terminal_output(&mut run, "abcdef\rxy");
+        assert_eq!(run.stream_lines.join("\n"), "xycdef");
+    }
+
+    #[test]
+    fn stream_output_treats_crlf_as_single_newline() {
+        let mut run =
+            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        super::apply_terminal_output(&mut run, "abc\r\ndef");
+        assert_eq!(run.stream_lines.join("\n"), "abc\ndef");
+    }
+
+    #[test]
+    fn stream_output_supports_erase_in_line_after_carriage_return() {
+        let mut run =
+            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        super::apply_terminal_output(&mut run, "abcdef\r\u{1b}[Kxy");
+        assert_eq!(run.stream_lines.join("\n"), "xy");
+    }
+
+    #[test]
+    fn stream_output_uses_eight_column_tab_stops() {
+        let mut run =
+            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        super::apply_terminal_output(&mut run, "ab\tc");
+        assert_eq!(run.stream_lines.join("\n"), "ab      c");
+    }
+
+    #[test]
+    fn stream_output_supports_horizontal_absolute_cursor() {
+        let mut run =
+            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        super::apply_terminal_output(&mut run, "abcdef\u{1b}[3GZ");
+        assert_eq!(run.stream_lines.join("\n"), "abZdef");
+    }
+
+    #[test]
+    fn stream_output_supports_cursor_forward() {
+        let mut run =
+            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        super::apply_terminal_output(&mut run, "ab\u{1b}[3CX");
+        assert_eq!(run.stream_lines.join("\n"), "ab   X");
+    }
+
+    #[test]
+    fn stream_output_supports_cursor_backward() {
+        let mut run =
+            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        super::apply_terminal_output(&mut run, "abcdef\u{1b}[2DZ");
+        assert_eq!(run.stream_lines.join("\n"), "abcdZf");
+    }
+
+    #[test]
+    fn stream_output_ignores_bell() {
+        let mut run =
+            super::RunSession::new(RunnerMode::Build, "alpha".to_owned(), RunControl::new());
+        super::apply_terminal_output(&mut run, "abc\u{7}def");
+        assert_eq!(run.stream_lines.join("\n"), "abcdef");
     }
 
     #[test]
@@ -3122,5 +3367,15 @@ mod tests {
         assert_eq!(ScopedAction::ALL.last().copied(), Some(ScopedAction::Back));
         assert_eq!(ScopedAction::Review.shortcut(), "Ctrl-V");
         assert_eq!(ScopedAction::OpenRun.label(), "Open run stream");
+    }
+
+    #[test]
+    fn dashboard_list_keeps_new_spec_at_top() {
+        assert_eq!(dashboard_entry_count(0), 1);
+        assert_eq!(dashboard_entry_count(3), 4);
+        assert_eq!(selected_spec_index(0, 3), None);
+        assert_eq!(selected_spec_index(1, 3), Some(0));
+        assert_eq!(selected_spec_index(3, 3), Some(2));
+        assert_eq!(selected_spec_index(4, 3), None);
     }
 }
