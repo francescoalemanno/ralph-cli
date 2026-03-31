@@ -170,6 +170,11 @@ where
         self.store.resolve_target(target)
     }
 
+    pub fn delete_target(&self, target: &str) -> Result<()> {
+        let paths = self.store.resolve_target(target)?;
+        self.store.delete_pair(&paths)
+    }
+
     pub fn edit_target(&self, target: &str) -> Result<()> {
         let session = self.begin_spec_edit(target)?;
         self.open_in_editor(&session.paths.spec_path)
