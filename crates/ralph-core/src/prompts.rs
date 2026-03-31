@@ -1,4 +1,4 @@
-use crate::QuestionSupportMode;
+use crate::{QuestionSupportMode, required_spec_format_outline};
 
 #[derive(Debug, Clone)]
 pub struct PlanningPromptContext {
@@ -53,7 +53,8 @@ Do this:
 - use the planning request and all clarification feedback to update the spec
 - make the spec reflect the latest authoritative user intent
 - keep the spec in the required format
-- update the progress file surgically into the concrete builder task list a careful engineer should execute next
+- keep implementation sequencing and task breakdown out of the spec
+- update the progress file surgically into the concrete implementation plan and builder task list a careful engineer should execute next
 - produce planning artifacts only
 - finish with exactly one valid planning marker
 
@@ -68,29 +69,7 @@ Feedback file contract:
 - treat the full feedback file as authoritative user guidance unless superseded by newer entries
 
 Required spec format:
-# Goal
-...
-
-# User Requirements And Constraints
-...
-
-# Non-Goals
-...
-
-# Proposed Design
-...
-
-# Implementation Plan
-...
-
-# Acceptance Criteria
-...
-
-# Risks
-...
-
-# Open Questions
-...
+{required_spec_format}
 
 Planning request:
 {planning_request}
@@ -108,6 +87,7 @@ End with exactly one of:
         spec_path = context.spec_path,
         progress_path = context.progress_path,
         feedback_path = context.feedback_path,
+        required_spec_format = required_spec_format_outline(),
         planning_request = context.planning_request.trim(),
         controller_warnings = controller_warnings,
         clarification_protocol = clarification_protocol,
@@ -122,7 +102,7 @@ Do this:
 - read the spec, progress, and feedback from disk first
 - treat the spec as read-only
 - treat the feedback file as authoritative user intent and constraints
-- choose the one highest-leverage open task from progress
+- choose the single highest-leverage open task from progress
 - complete that task fully
 - run the relevant checks for that task
 - update progress before finishing
@@ -205,7 +185,6 @@ mod tests {
         assert!(prompt.contains("# User Requirements And Constraints"));
         assert!(prompt.contains("# Non-Goals"));
         assert!(prompt.contains("# Proposed Design"));
-        assert!(prompt.contains("# Implementation Plan"));
         assert!(prompt.contains("# Acceptance Criteria"));
         assert!(prompt.contains("# Risks"));
         assert!(prompt.contains("# Open Questions"));
@@ -213,8 +192,11 @@ mod tests {
             "use the planning request and all clarification feedback to update the spec"
         ));
         assert!(prompt.contains(
-            "update the progress file surgically into the concrete builder task list a careful engineer should execute next"
+            "update the progress file surgically into the concrete implementation plan and builder task list a careful engineer should execute next"
         ));
+        assert!(
+            prompt.contains("keep implementation sequencing and task breakdown out of the spec")
+        );
         assert!(!prompt.contains("Existing spec:"));
         assert!(!prompt.contains("Existing progress:"));
         assert!(!prompt.contains("Q: Which database?"));

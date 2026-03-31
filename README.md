@@ -103,7 +103,7 @@ cargo run -p ralph-cli --
 Typical flow:
 
 1. Open the TUI.
-2. Press `n` to create a new spec from a planning request.
+2. Press `Ctrl-N` to create a new spec from a planning request.
 3. Press `Ctrl-B` on a selected spec to run the builder.
 4. Press `Ctrl-V` to review spec, progress, and feedback.
 5. Press `Ctrl-E` to edit the spec and automatically revise progress afterward.
@@ -295,6 +295,7 @@ Planner prompts include:
 - the feedback path
 - clarification rules
 - controller warnings
+- an instruction to keep implementation sequencing in `progress`, not in `spec`
 
 Builder prompts include:
 
