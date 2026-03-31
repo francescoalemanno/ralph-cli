@@ -1,3 +1,4 @@
+mod artifact_templates;
 mod clarification;
 mod config;
 mod markers;
@@ -6,6 +7,10 @@ mod slug;
 mod store;
 mod types;
 
+pub use artifact_templates::{
+    REQUIRED_SPEC_HEADINGS, default_feedback_contents, default_progress_contents,
+    empty_spec_contents, initial_spec_contents, required_spec_format_outline, sample_spec_contents,
+};
 pub use clarification::parse_clarification_request;
 pub use config::{
     AppConfig, CliColorMode, CliConfig, CliOutputMode, CliPagerMode, CliPromptInputMode,
