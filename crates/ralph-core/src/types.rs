@@ -35,15 +35,15 @@ impl LastRunStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ScaffoldId {
     #[default]
+    Default,
     Blank,
-    Playbook,
 }
 
 impl ScaffoldId {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Default => "default",
             Self::Blank => "blank",
-            Self::Playbook => "playbook",
         }
     }
 }
@@ -53,6 +53,8 @@ pub struct TargetConfig {
     pub id: String,
     #[serde(default)]
     pub scaffold: Option<ScaffoldId>,
+    #[serde(default)]
+    pub created_at: Option<u64>,
     #[serde(default)]
     pub max_iterations: Option<usize>,
     #[serde(default)]
@@ -87,6 +89,7 @@ pub struct TargetSummary {
     pub prompt_files: Vec<PromptFile>,
     pub files: Vec<TargetFile>,
     pub scaffold: Option<ScaffoldId>,
+    pub created_at: Option<u64>,
     pub last_prompt: Option<String>,
     pub last_run_status: LastRunStatus,
 }
@@ -214,6 +217,7 @@ mod tests {
     #[test]
     fn status_and_scaffold_have_stable_labels() {
         assert_eq!(LastRunStatus::Completed.label(), "completed");
-        assert_eq!(ScaffoldId::Playbook.as_str(), "playbook");
+        assert_eq!(ScaffoldId::Default.as_str(), "default");
+        assert_eq!(ScaffoldId::Blank.as_str(), "blank");
     }
 }
