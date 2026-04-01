@@ -48,15 +48,15 @@ enum OutputArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ScaffoldArg {
+    Default,
     Blank,
-    Playbook,
 }
 
 impl From<ScaffoldArg> for ScaffoldId {
     fn from(value: ScaffoldArg) -> Self {
         match value {
+            ScaffoldArg::Default => ScaffoldId::Default,
             ScaffoldArg::Blank => ScaffoldId::Blank,
-            ScaffoldArg::Playbook => ScaffoldId::Playbook,
         }
     }
 }
@@ -134,7 +134,7 @@ enum Commands {
 struct NewArgs {
     #[arg(value_name = "TARGET")]
     target: String,
-    #[arg(long, value_enum, default_value_t = ScaffoldArg::Playbook)]
+    #[arg(long, value_enum, default_value_t = ScaffoldArg::Default)]
     scaffold: ScaffoldArg,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     edit: bool,
@@ -270,7 +270,7 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
             if args.edit {
                 let prompt = match args.prompt.as_deref() {
                     Some(name) => Some(name),
-                    None if args.scaffold == ScaffoldArg::Playbook => Some("playbook_plan.md"),
+                    None if args.scaffold == ScaffoldArg::Default => Some("0_plan.md"),
                     None => None,
                 };
                 app.edit_prompt(&args.target, prompt)?;

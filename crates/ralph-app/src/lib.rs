@@ -9,6 +9,18 @@ use ralph_core::{
 };
 use ralph_runner::{CommandRunner, RunnerAdapter, RunnerStreamEvent};
 
+const WATCH_TAG_PREFIX: &str = "<<ralph-watch:";
+const RALPH_ENV_PROJECT_DIR: &str = "{ralph-env:PROJECT_DIR}";
+const RALPH_ENV_TARGET_DIR: &str = "{ralph-env:TARGET_DIR}";
+const RALPH_ENV_PROMPT_PATH: &str = "{ralph-env:PROMPT_PATH}";
+const RALPH_ENV_PROMPT_NAME: &str = "{ralph-env:PROMPT_NAME}";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedPrompt {
+    prompt_text: String,
+    watched_files: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub enum RunEvent {
     IterationStarted {
@@ -153,7 +165,15 @@ where
     {
         let target_summary = self.store.load_target(target)?;
         let prompt = self.select_prompt(&target_summary, prompt_name)?;
-        let prompt_text = self.store.read_file(&prompt.path)?;
+        let raw_prompt = self.store.read_file(&prompt.path)?;
+        let interpolated_prompt = interpolate_prompt_env(
+            &raw_prompt,
+            &self.project_dir,
+            &target_summary.dir,
+            &prompt.path,
+            &prompt.name,
+        )?;
+        let parsed_prompt = parse_prompt_directives(&interpolated_prompt);
         let max_iterations = self
             .store
             .read_target_config(target)?
@@ -164,12 +184,7 @@ where
         }
 
         for iteration in 1..=max_iterations {
-            let implementation_plan_before =
-                if target_summary.scaffold == Some(ScaffoldId::Playbook) {
-                    self.read_implementation_plan_snapshot()?
-                } else {
-                    None
-                };
+            let watched_before = self.read_watched_files(&parsed_prompt.watched_files)?;
 
             if control.is_cancelled() {
                 self.store
@@ -190,7 +205,7 @@ where
                 .execute_runner(
                     &config,
                     RunnerInvocation {
-                        prompt_text: prompt_text.clone(),
+                        prompt_text: parsed_prompt.prompt_text.clone(),
                         project_dir: self.project_dir.clone(),
                         target_dir: target_summary.dir.clone(),
                         prompt_path: prompt.path.clone(),
@@ -214,8 +229,8 @@ where
                 return Err(anyhow!(message));
             }
 
-            if target_summary.scaffold == Some(ScaffoldId::Playbook)
-                && implementation_plan_before == self.read_implementation_plan_snapshot()?
+            if !parsed_prompt.watched_files.is_empty()
+                && watched_before == self.read_watched_files(&parsed_prompt.watched_files)?
             {
                 self.store
                     .set_last_run(target, &prompt.name, LastRunStatus::Completed)?;
@@ -242,15 +257,25 @@ where
         Ok(summary)
     }
 
-    fn read_implementation_plan_snapshot(&self) -> Result<Option<String>> {
-        let path = self.project_dir.join("IMPLEMENTATION_PLAN.md");
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => Ok(Some(contents)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => {
-                Err(error).with_context(|| format!("failed to read implementation plan {}", path))
-            }
-        }
+    fn read_watched_files(&self, watched_files: &[String]) -> Result<Vec<Option<String>>> {
+        watched_files
+            .iter()
+            .map(|name| {
+                let watch_path = Utf8Path::new(name);
+                let path = if watch_path.is_absolute() {
+                    watch_path.to_path_buf()
+                } else {
+                    self.project_dir.join(watch_path)
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(contents) => Ok(Some(contents)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => {
+                        Err(error).with_context(|| format!("failed to read watched file {}", path))
+                    }
+                }
+            })
+            .collect()
     }
 
     pub fn resolve_prompt(
@@ -322,11 +347,19 @@ where
     }
 
     fn runner_config_for(&self, control: &RunControl) -> RunnerConfig {
+        let detected = CodingAgent::detected();
         if let Some(agent) = control.coding_agent() {
-            RunnerConfig::for_agent(agent)
-        } else {
-            self.config.runner.clone()
+            return RunnerConfig::for_agent(resolve_available_agent(agent, &detected));
         }
+
+        if let Some(agent) = self.config.runner.inferred_agent() {
+            let resolved = resolve_available_agent(agent, &detected);
+            if resolved != agent {
+                return RunnerConfig::for_agent(resolved);
+            }
+        }
+
+        self.config.runner.clone()
     }
 
     async fn execute_runner<D>(
@@ -391,6 +424,82 @@ where
     }
 }
 
+fn parse_prompt_directives(prompt_text: &str) -> ParsedPrompt {
+    let mut watched_files = Vec::new();
+    let mut cleaned_lines = Vec::new();
+
+    for line in prompt_text.lines() {
+        let mut remaining = line;
+        let mut cleaned = String::new();
+
+        while let Some(start) = remaining.find(WATCH_TAG_PREFIX) {
+            cleaned.push_str(&remaining[..start]);
+            let after_prefix = &remaining[start + WATCH_TAG_PREFIX.len()..];
+            let Some(end) = after_prefix.find(">>") else {
+                cleaned.push_str(&remaining[start..]);
+                remaining = "";
+                break;
+            };
+
+            let watched = after_prefix[..end].trim();
+            if !watched.is_empty() && !watched_files.iter().any(|item| item == watched) {
+                watched_files.push(watched.to_owned());
+            }
+            remaining = &after_prefix[end + 2..];
+        }
+
+        cleaned.push_str(remaining);
+        if !cleaned.trim().is_empty() {
+            cleaned_lines.push(cleaned);
+        }
+    }
+
+    ParsedPrompt {
+        prompt_text: cleaned_lines.join("\n"),
+        watched_files,
+    }
+}
+
+fn interpolate_prompt_env(
+    prompt_text: &str,
+    project_dir: &Utf8Path,
+    target_dir: &Utf8Path,
+    prompt_path: &Utf8Path,
+    prompt_name: &str,
+) -> Result<String> {
+    let replacements = [
+        (RALPH_ENV_PROJECT_DIR, absolute_unix_path(project_dir)?),
+        (RALPH_ENV_TARGET_DIR, absolute_unix_path(target_dir)?),
+        (RALPH_ENV_PROMPT_PATH, absolute_unix_path(prompt_path)?),
+        (RALPH_ENV_PROMPT_NAME, prompt_name.to_owned()),
+    ];
+
+    let mut interpolated = prompt_text.to_owned();
+    for (needle, value) in replacements {
+        interpolated = interpolated.replace(needle, &value);
+    }
+    Ok(interpolated)
+}
+
+fn absolute_unix_path(path: &Utf8Path) -> Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let cwd = Utf8PathBuf::from_path_buf(std::env::current_dir().context("failed to read cwd")?)
+            .map_err(|_| anyhow!("current directory is not valid UTF-8"))?;
+        cwd.join(path)
+    };
+    Ok(absolute.as_str().replace('\\', "/"))
+}
+
+fn resolve_available_agent(preferred: CodingAgent, detected: &[CodingAgent]) -> CodingAgent {
+    if detected.is_empty() || detected.contains(&preferred) {
+        preferred
+    } else {
+        detected[0]
+    }
+}
+
 #[derive(Default)]
 pub struct ConsoleDelegate;
 
@@ -427,11 +536,14 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
-    use ralph_core::{AppConfig, RunControl, RunnerInvocation, RunnerResult, ScaffoldId};
+    use ralph_core::{AppConfig, CodingAgent, RunControl, RunnerInvocation, RunnerResult, ScaffoldId};
     use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
     use tokio::sync::mpsc::UnboundedSender;
 
-    use crate::{RalphApp, RunDelegate, RunEvent};
+    use crate::{
+        RalphApp, RunDelegate, RunEvent, interpolate_prompt_env, parse_prompt_directives,
+        resolve_available_agent,
+    };
 
     #[derive(Clone)]
     struct ScriptedRunner {
@@ -469,7 +581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playbook_targets_complete_when_implementation_plan_is_unchanged() {
+    async fn watched_prompts_complete_when_watched_files_are_unchanged() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         std::fs::write(project_dir.join("IMPLEMENTATION_PLAN.md"), "- item\n").unwrap();
@@ -481,14 +593,15 @@ mod tests {
                 exit_code: 0,
             },
         );
-        app.create_target("demo", Some(ScaffoldId::Playbook))
-            .unwrap();
+        app.create_target("demo", Some(ScaffoldId::Blank)).unwrap();
+        std::fs::write(
+            project_dir.join(".ralph/targets/demo/prompt_main.md"),
+            "<<ralph-watch:IMPLEMENTATION_PLAN.md>>\n\n# Prompt\n",
+        )
+        .unwrap();
 
         let mut delegate = TestDelegate;
-        let summary = app
-            .run_target("demo", Some("playbook_plan.md"), &mut delegate)
-            .await
-            .unwrap();
+        let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
 
         assert_eq!(
             summary.last_run_status,
@@ -511,6 +624,11 @@ mod tests {
             },
         );
         app.create_target("demo", Some(ScaffoldId::Blank)).unwrap();
+        std::fs::write(
+            project_dir.join(".ralph/targets/demo/prompt_main.md"),
+            "# Prompt\n\nNo watch directives here.\n",
+        )
+        .unwrap();
 
         let mut delegate = TestDelegate;
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
@@ -518,6 +636,55 @@ mod tests {
         assert_eq!(
             summary.last_run_status,
             ralph_core::LastRunStatus::MaxIterations
+        );
+    }
+
+    #[test]
+    fn prompt_directives_are_trimmed_before_runner_input() {
+        let parsed = parse_prompt_directives(
+            "<<ralph-watch:IMPLEMENTATION_PLAN.md>>\n# Prompt\nBody\n<<ralph-watch: specs/api.md >>",
+        );
+
+        assert_eq!(
+            parsed.watched_files,
+            vec!["IMPLEMENTATION_PLAN.md", "specs/api.md"]
+        );
+        assert_eq!(parsed.prompt_text, "# Prompt\nBody");
+    }
+
+    #[test]
+    fn ralph_env_target_dir_is_interpolated_to_absolute_unix_path() {
+        let project_dir = Utf8PathBuf::from("/tmp/project");
+        let target_dir = Utf8PathBuf::from("/tmp/project/.ralph/targets/demo");
+        let prompt_path = target_dir.join("prompt_main.md");
+        let interpolated = interpolate_prompt_env(
+            "<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>\nRead {ralph-env:TARGET_DIR}/progress.txt",
+            &project_dir,
+            &target_dir,
+            &prompt_path,
+            "prompt_main.md",
+        )
+        .unwrap();
+
+        assert_eq!(
+            interpolated,
+            "<<ralph-watch:/tmp/project/.ralph/targets/demo/progress.txt>>\nRead /tmp/project/.ralph/targets/demo/progress.txt"
+        );
+    }
+
+    #[test]
+    fn agent_resolution_falls_back_to_first_detected_agent() {
+        assert_eq!(
+            resolve_available_agent(CodingAgent::Codex, &[CodingAgent::Opencode, CodingAgent::Raijin]),
+            CodingAgent::Opencode
+        );
+        assert_eq!(
+            resolve_available_agent(CodingAgent::Codex, &[CodingAgent::Codex, CodingAgent::Opencode]),
+            CodingAgent::Codex
+        );
+        assert_eq!(
+            resolve_available_agent(CodingAgent::Raijin, &[]),
+            CodingAgent::Raijin
         );
     }
 }
