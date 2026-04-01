@@ -105,6 +105,21 @@ struct RunningState {
     follow: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ShortcutTone {
+    Accent,
+    Success,
+    Warning,
+    Neutral,
+}
+
+#[derive(Clone, Copy)]
+struct ShortcutHint {
+    key: &'static str,
+    label: &'static str,
+    tone: ShortcutTone,
+}
+
 struct TuiApp {
     app: RalphApp,
     handle: Handle,
@@ -196,7 +211,7 @@ impl TuiApp {
         match self.screen {
             Screen::Dashboard => self.handle_dashboard_key(key, terminal),
             Screen::NewTarget => self.handle_new_target_key(key),
-            Screen::Running => self.handle_running_key(key),
+            Screen::Running => self.handle_running_key(key, terminal),
         }
     }
 
@@ -312,7 +327,11 @@ impl TuiApp {
         Ok(())
     }
 
-    fn handle_running_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn handle_running_key(
+        &mut self,
+        key: KeyEvent,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
         match key.code {
             KeyCode::Esc => {
                 if self
@@ -341,6 +360,18 @@ impl TuiApp {
             KeyCode::Char('a') => {
                 let running_control = self.running.as_ref().map(|running| running.control.clone());
                 self.cycle_agent(running_control)?;
+            }
+            KeyCode::Char('e') => {
+                let Some(running) = self.running.as_ref() else {
+                    return Ok(());
+                };
+                let target_id = running.target_id.clone();
+                let prompt_name = running.prompt_name.clone();
+                suspend_terminal(terminal)?;
+                let result = self.app.edit_prompt(&target_id, Some(&prompt_name));
+                resume_terminal(terminal)?;
+                result?;
+                self.message = format!("opened {prompt_name} for steering");
             }
             KeyCode::Up => self.scroll_running(1),
             KeyCode::Down => self.scroll_running(-1),
@@ -537,25 +568,81 @@ impl TuiApp {
     }
 
     fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect) {
-        let footer = Paragraph::new(Line::from(vec![
-            Span::styled("N", key_style(self.accent_color())),
-            Span::styled(" new  ", Style::default().fg(self.muted_color())),
-            Span::styled("R", key_style(self.success_color())),
-            Span::styled(" run  ", Style::default().fg(self.muted_color())),
-            Span::styled("E", key_style(self.accent_color())),
-            Span::styled(" edit  ", Style::default().fg(self.muted_color())),
-            Span::styled("D", key_style(self.warning_color())),
-            Span::styled(" delete  ", Style::default().fg(self.muted_color())),
-            Span::styled("A", key_style(self.accent_color())),
-            Span::styled(" agent  ", Style::default().fg(self.muted_color())),
-            Span::styled("Arrows", key_style(self.text_color())),
-            Span::styled(" navigate  ", Style::default().fg(self.muted_color())),
-            Span::styled("Q", key_style(self.warning_color())),
-            Span::styled(" quit/cancel", Style::default().fg(self.muted_color())),
-        ]))
-        .style(Style::default().fg(self.muted_color()))
-        .wrap(Wrap { trim: true });
+        let footer = Paragraph::new(Line::from(self.footer_spans()))
+            .style(Style::default().fg(self.muted_color()))
+            .wrap(Wrap { trim: true });
         frame.render_widget(footer, area);
+    }
+
+    fn footer_spans(&self) -> Vec<Span<'static>> {
+        match self.screen {
+            Screen::Dashboard => shortcut_spans(
+                &[
+                    ShortcutHint {
+                        key: "N",
+                        label: "new",
+                        tone: ShortcutTone::Accent,
+                    },
+                    ShortcutHint {
+                        key: "R",
+                        label: "run",
+                        tone: ShortcutTone::Success,
+                    },
+                    ShortcutHint {
+                        key: "E",
+                        label: "edit",
+                        tone: ShortcutTone::Accent,
+                    },
+                    ShortcutHint {
+                        key: "D",
+                        label: "delete",
+                        tone: ShortcutTone::Warning,
+                    },
+                    ShortcutHint {
+                        key: "A",
+                        label: "agent",
+                        tone: ShortcutTone::Accent,
+                    },
+                    ShortcutHint {
+                        key: "Arrows",
+                        label: "navigate",
+                        tone: ShortcutTone::Neutral,
+                    },
+                    ShortcutHint {
+                        key: "Q",
+                        label: "quit/cancel",
+                        tone: ShortcutTone::Warning,
+                    },
+                ],
+                self,
+            ),
+            Screen::NewTarget => shortcut_spans(
+                &[
+                    ShortcutHint {
+                        key: "Tab",
+                        label: "switch scaffold",
+                        tone: ShortcutTone::Accent,
+                    },
+                    ShortcutHint {
+                        key: "Enter",
+                        label: "create",
+                        tone: ShortcutTone::Success,
+                    },
+                    ShortcutHint {
+                        key: "Backspace",
+                        label: "erase",
+                        tone: ShortcutTone::Warning,
+                    },
+                    ShortcutHint {
+                        key: "Esc",
+                        label: "cancel",
+                        tone: ShortcutTone::Warning,
+                    },
+                ],
+                self,
+            ),
+            Screen::Running => shortcut_spans(&self.running_shortcuts(), self),
+        }
     }
 
     fn draw_dashboard(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -911,9 +998,9 @@ impl TuiApp {
                     Span::styled("  ◆  ", Style::default().fg(self.subtle_color())),
                     Span::styled(
                         if running.finished {
-                            "R reruns  ◆  Esc returns to dashboard"
+                            "E steers prompt  ◆  R reruns  ◆  Esc returns"
                         } else {
-                            "Q sends cancel"
+                            "E steers prompt  ◆  A switches agent  ◆  Q cancels"
                         },
                         Style::default().fg(self.muted_color()),
                     ),
@@ -1050,6 +1137,63 @@ impl TuiApp {
         }
         self.message = format!("agent={}", next.label());
         Ok(())
+    }
+
+    fn running_shortcuts(&self) -> Vec<ShortcutHint> {
+        let finished = self
+            .running
+            .as_ref()
+            .is_some_and(|running| running.finished);
+        let mut hints = vec![
+            ShortcutHint {
+                key: "E",
+                label: "edit prompt",
+                tone: ShortcutTone::Accent,
+            },
+            ShortcutHint {
+                key: "A",
+                label: "agent",
+                tone: ShortcutTone::Accent,
+            },
+        ];
+
+        if finished {
+            hints.push(ShortcutHint {
+                key: "R",
+                label: "rerun",
+                tone: ShortcutTone::Success,
+            });
+            hints.push(ShortcutHint {
+                key: "Esc",
+                label: "dashboard",
+                tone: ShortcutTone::Warning,
+            });
+        } else {
+            hints.push(ShortcutHint {
+                key: "Q",
+                label: "cancel",
+                tone: ShortcutTone::Warning,
+            });
+        }
+
+        hints.extend([
+            ShortcutHint {
+                key: "↑↓",
+                label: "scroll",
+                tone: ShortcutTone::Neutral,
+            },
+            ShortcutHint {
+                key: "PgUp/PgDn",
+                label: "page",
+                tone: ShortcutTone::Neutral,
+            },
+            ShortcutHint {
+                key: "Home/End",
+                label: "jump",
+                tone: ShortcutTone::Neutral,
+            },
+        ]);
+        hints
     }
 
     fn scroll_running(&mut self, delta: i32) {
@@ -1229,6 +1373,33 @@ fn styled_title(
 
 fn key_style(color: Color) -> Style {
     Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+fn shortcut_spans(hints: &[ShortcutHint], app: &TuiApp) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, hint) in hints.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ", Style::default().fg(app.muted_color())));
+        }
+        spans.push(Span::styled(
+            hint.key,
+            key_style(match hint.tone {
+                ShortcutTone::Accent => app.accent_color(),
+                ShortcutTone::Success => app.success_color(),
+                ShortcutTone::Warning => app.warning_color(),
+                ShortcutTone::Neutral => app.text_color(),
+            }),
+        ));
+        spans.push(Span::styled(
+            format!(
+                " {}{}",
+                hint.label,
+                if index + 1 == hints.len() { "" } else { "" }
+            ),
+            Style::default().fg(app.muted_color()),
+        ));
+    }
+    spans
 }
 
 fn process_terminal_text(terminal: &mut vt100::Parser, text: &str) {
