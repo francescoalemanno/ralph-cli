@@ -135,7 +135,7 @@ impl TuiApp {
             selected_prompt: 0,
             screen: Screen::Dashboard,
             new_target_name: String::new(),
-            new_scaffold: ScaffoldId::Blank,
+            new_scaffold: ScaffoldId::Playbook,
             message: String::new(),
             running: None,
             tick_count: 0,
@@ -243,7 +243,7 @@ impl TuiApp {
             KeyCode::Char('n') => {
                 self.screen = Screen::NewTarget;
                 self.new_target_name.clear();
-                self.new_scaffold = ScaffoldId::Blank;
+                self.new_scaffold = ScaffoldId::Playbook;
             }
             KeyCode::Char('r') => self.start_run()?,
             KeyCode::Char('e') => {
@@ -846,7 +846,7 @@ impl TuiApp {
         let widget = Paragraph::new(text)
             .block(
                 Block::default()
-                    .title(self.title_line("New Target", "Blank or playbook scaffold"))
+                    .title(self.title_line("New Target", "Playbook or blank scaffold"))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded),
             )

@@ -134,7 +134,7 @@ enum Commands {
 struct NewArgs {
     #[arg(value_name = "TARGET")]
     target: String,
-    #[arg(long, value_enum, default_value_t = ScaffoldArg::Blank)]
+    #[arg(long, value_enum, default_value_t = ScaffoldArg::Playbook)]
     scaffold: ScaffoldArg,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     edit: bool,

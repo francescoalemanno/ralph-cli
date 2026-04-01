@@ -101,7 +101,7 @@ impl TargetStore {
         };
         self.write_target_config(&config)?;
 
-        match scaffold.unwrap_or_default() {
+        match scaffold.unwrap_or(ScaffoldId::Playbook) {
             ScaffoldId::Blank => {
                 self.write_target_file(
                     target_id,
@@ -386,5 +386,22 @@ mod tests {
         );
         assert!(!plan_prompt.contains("Update [project-specific goal] placeholder below."));
         assert!(!build_prompt.contains("[project-specific goal]"));
+    }
+
+    #[test]
+    fn create_target_defaults_to_playbook_scaffold() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TargetStore::new(
+            camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
+        );
+
+        let summary = store.create_target("demo", None).unwrap();
+        let prompt_names = summary
+            .prompt_files
+            .iter()
+            .map(|prompt| prompt.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(prompt_names, vec!["playbook_build.md", "playbook_plan.md"]);
     }
 }
