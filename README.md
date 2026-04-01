@@ -1,8 +1,8 @@
 # Ralph
 
-`ralph` is a Rust CLI and terminal UI for running a durable planning and execution workflow inside a repository.
+`ralph` is a Rust CLI and terminal UI for running durable agent loops against target folders inside a repository.
 
-It keeps planning state on disk, separates planning from building, and makes agent-driven work resumable instead of ephemeral.
+It keeps prompts on disk, treats target folders as the source of truth, and lets prompt files drive completion through explicit watch directives instead of hidden controller modes.
 
 ![Ralph TUI](tui.png)
 
@@ -12,45 +12,69 @@ Source:
 
 ## Lineage
 
-This project is inspired by Geoffrey Huntley's original Ralph technique: a simple, persistent agent loop centered on specs, iteration, and durable on-disk state.
+This project is inspired by Geoffrey Huntley's original Ralph technique: a simple, persistent loop around prompts, repo state, and operator judgment.
 
-Original writeup:
+Primary references:
 
 - [Ralph Wiggum as a "software engineer"](https://ghuntley.com/ralph/)
+- [ClaytonFarr/ralph-playbook](https://github.com/ClaytonFarr/ralph-playbook)
 
-The framing here is intentionally narrower and more user-ready. Huntley's original concept is hacker-first and extremely lightweight: a loop, a prompt, and operator skill. This repository turns that idea into a simpler end-user tool with a TUI, explicit artifacts, local config, agent presets, review screens, and a more structured planner/builder workflow.
+This repository packages that style into a local tool with:
+
+- target folders under `.ralph/targets/`
+- runnable prompt files discovered from disk
+- a TUI and CLI
+- persisted config and agent presets
+- explicit prompt-side watch directives
 
 ## What Ralph Does
 
-Ralph manages a loop around three persistent artifacts:
+Ralph manages repository-local targets under:
 
-- a spec file
-- a progress file
-- a feedback file
+```text
+.ralph/targets/<target-id>/
+```
 
-The planner updates the spec and rewrites the progress plan. The builder reads the spec, executes the next highest-leverage task, and updates progress. Clarifications are persisted into feedback so future iterations keep the latest user intent.
+Each target is just a folder. All `*.md` files directly inside that folder are runnable prompts.
 
-By default, project artifacts live under `./.ralph/`.
+Example:
+
+```text
+.ralph/targets/json-cli/
+  target.toml
+  0_plan.md
+  1_build.md
+```
+
+Or:
+
+```text
+.ralph/targets/bugfix/
+  target.toml
+  prompt_main.md
+  notes.md
+```
+
+At runtime Ralph:
+
+1. loads a selected prompt file from the target folder
+2. interpolates prompt env placeholders such as `{ralph-env:TARGET_DIR}`
+3. parses `<<ralph-watch:...>>` directives from the prompt
+4. removes those directives before sending the prompt to the agent
+5. runs the selected coding agent in a loop
+6. marks the run complete when watched files stay unchanged after an iteration, or when the agent emits the done token
 
 ## Why It Exists
 
-Most agent workflows lose context between runs or bury the state inside chat history. Ralph keeps the working state in files so you can:
+Most agent workflows either hide their state in chat history or couple too much workflow logic to the controller.
 
-- inspect and edit the plan directly
-- pause and resume work across sessions
-- switch agents without losing state
-- review exactly what changed
-- keep user clarifications as durable input instead of transient messages
+Ralph keeps the loop simple and file-driven so you can:
 
-## Core Workflow
-
-1. Create or open a target.
-2. Run a planning pass.
-3. Run builder iterations until the spec is complete.
-4. Review the resulting spec and progress.
-5. Edit the spec manually when needed, then let Ralph revise progress to match.
-
-Ralph supports both TUI-first and CLI-first workflows.
+- inspect prompts directly on disk
+- keep target state durable across sessions
+- swap agents without changing the target layout
+- use explicit watch files for completion
+- resume, rerun, and edit targets from a local TUI
 
 ## Installation
 
@@ -68,22 +92,10 @@ For local development:
 cargo run -p ralph-cli -- --help
 ```
 
-To install the CLI from the workspace:
+To install from the workspace:
 
 ```bash
 cargo install --path crates/ralph-cli
-```
-
-To install from crates.io once published:
-
-```bash
-cargo install ralph-cli
-```
-
-The installed command remains:
-
-```bash
-ralph
 ```
 
 ## Quick Start
@@ -94,7 +106,7 @@ Start the TUI:
 ralph
 ```
 
-Or run it from the workspace without installing:
+Or run it from the workspace:
 
 ```bash
 cargo run -p ralph-cli --
@@ -103,12 +115,13 @@ cargo run -p ralph-cli --
 Typical flow:
 
 1. Open the TUI.
-2. Press `Ctrl-N` to create a new spec from a planning request.
-3. Press `Ctrl-B` on a selected spec to run the builder.
-4. Press `Ctrl-V` to review spec, progress, and feedback.
-5. Press `Ctrl-E` to edit the spec and automatically revise progress afterward.
+2. Press `N` to create a new target.
+3. Pick the default or blank scaffold.
+4. Press `R` to run the selected prompt.
+5. Press `E` to edit a prompt.
+6. Press `A` to cycle and persist the coding agent.
 
-You can also jump directly into a scoped TUI for one target:
+You can also open the TUI scoped to one target:
 
 ```bash
 ralph <target>
@@ -116,138 +129,146 @@ ralph <target>
 
 ## CLI Commands
 
-Ralph keeps two special entry points:
-
-- `ralph`: open the full TUI
-- `ralph <target>`: open the scoped TUI for a single target
-
-Everything else is organized as a guided CLI:
+The current CLI model is:
 
 ```text
-ralph new [target]
-ralph plan <target>
-ralph build <target>
-ralph status [target]
-ralph show <target> [--artifact spec|progress|feedback|all]
-ralph edit <target>
+ralph
+ralph <target>
+
+ralph new <target> [--scaffold default|blank] [--edit] [--prompt <file>]
+ralph run <target> [--prompt <file>]
+ralph ls
+ralph show <target> [--file <name>]
+ralph edit <target> [--prompt <file>]
 
 ralph agent list
 ralph agent current
 ralph agent set <opencode|codex|raijin> [--scope project|user]
 
 ralph config show [--scope effective|project|user]
-ralph config get <key> [--scope effective|project|user]
-ralph config set <key> <value> [--scope project|user]
-ralph config edit [--scope project|user]
-ralph config path [--scope project|user]
-
+ralph config path
 ralph init
 ralph doctor
 ```
 
 Daily workflow:
 
-- `new`: create a new target and run the planner
-- `plan`: revise an existing target from a new planning request
-- `build`: run builder iterations for a target
-- `status`: list all targets or summarize one target
-- `show`: print durable artifacts
-- `edit`: open the spec in your editor and automatically revise progress if the spec changed
+- `new`: create a target folder and initialize scaffold files
+- `run`: run one prompt loop for a target
+- `ls`: list known targets
+- `show`: inspect target files
+- `edit`: open one selected prompt in your editor
 
-Operational commands:
+## Target Model
 
-- `agent`: inspect supported agents, see the effective selection, and persist an agent into config
-- `config`: inspect, edit, and update user or project config from the CLI
-- `init`: create `./.ralph/config.toml`
-- `doctor`: verify config, editor, writable project state, and supported agents on `PATH`
+Target discovery is directory-based:
 
-The workflow override flags also have persistent config equivalents:
+- every folder directly under `.ralph/targets/` is a target
+- the folder name is the target id
+- `target.toml` is optional metadata, not the source of truth
 
-- `--planning-max-iterations` <-> `planning_max_iterations`
-- `--builder-max-iterations` <-> `builder_max_iterations`
-- `--editor-command` <-> `editor_override`
+Prompt discovery is file-based:
 
-You can persist them with `ralph config set ...` or by editing `~/.config/ralph/config.toml` / `./.ralph/config.toml` directly.
+- every file ending in `.md` directly inside the target folder is runnable
+- non-`.md` files in the target folder are ordinary companion files
 
-Planning input for `new` and `plan` can come from:
+Target metadata in `target.toml` currently includes:
 
-- `--prompt "..."`
-- `--prompt-file path/to/request.txt`
-- `--stdin`
-- `--editor`
+- `id`
+- `scaffold`
+- `created_at`
+- `max_iterations`
+- `last_prompt`
+- `last_run_status`
 
-If none of those flags are given, Ralph uses `[cli].prompt_input` from config. In `auto` mode it uses the editor on a TTY and stdin otherwise.
+Targets are sorted newest-first using `created_at` when available.
 
-## Artifact Layout
+## Scaffolds
 
-By default, Ralph stores project-local state in:
+Ralph currently ships two initialization scaffolds.
 
-```text
-./.ralph/
-  config.toml
-  spec-<slug>.md
-  progress-<slug>.txt
-  feedback-<slug>.txt
-  <custom>.progress.txt
-  <custom>.feedback.txt
-  <spec>.past-spec.md
-  <spec>.spec-edit.diff.txt
+Default scaffold:
+
+- `0_plan.md`
+- `1_build.md`
+
+These prompts watch `IMPLEMENTATION_PLAN.md` through prompt-local watch directives.
+
+Blank scaffold:
+
+- `prompt_main.md`
+
+The blank prompt template uses runtime interpolation:
+
+```md
+# Requests (not sorted by priority)
+- A
+- B
+- C
+
+# Execution policy
+1. Read {ralph-env:TARGET_DIR}/progress.txt.
+2. Execute the single most high leverage item in "Requests".
+3. Update your progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item
+4. Stop
+
+<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>
 ```
 
-Notes:
+## Prompt Directives
 
-- Named targets are stored as `spec-<target>.md` under `./.ralph/`.
-- Path-like targets such as `docs/feature.md` are respected as explicit locations.
-- When a spec lives outside `./.ralph/`, its derived progress, feedback, and edit sidecars are written beside that spec.
+Ralph recognizes watch directives inside prompt files:
+
+```md
+<<ralph-watch:IMPLEMENTATION_PLAN.md>>
+<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>
+```
+
+Behavior:
+
+- watch directives are parsed from the prompt before execution
+- watch directives are removed before prompt text is sent to the LLM
+- watched files are compared before and after each iteration
+- if watched files do not change, Ralph marks the run complete
+
+## Runtime Prompt Env Interpolation
+
+Prompt files can contain runtime placeholders:
+
+- `{ralph-env:PROJECT_DIR}`
+- `{ralph-env:TARGET_DIR}`
+- `{ralph-env:PROMPT_PATH}`
+- `{ralph-env:PROMPT_NAME}`
+
+These are expanded before watch parsing and before runner invocation.
+
+For example:
+
+```md
+<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>
+```
+
+becomes an absolute Unix-style target path at runtime.
 
 ## Configuration
 
-Ralph loads configuration from two places:
+Ralph loads configuration from:
 
-- user defaults: `~/.config/ralph/config.toml`
-- project overrides: `./.ralph/config.toml`
+- user config: `~/.config/ralph/config.toml`
+- project config: `.ralph/config.toml`
 
 Project config overrides user config.
 
-The TUI persists the selected coding agent into `./.ralph/config.toml`.
-
-The CLI also has its own preferences under `[cli]` for inspect output, paging, and planning-request input behavior.
-
-Common persistent keys:
-
-- `planning_max_iterations`
-- `builder_max_iterations`
-- `editor_override`
-- `cli.output`
-- `cli.pager`
-- `cli.color`
-- `cli.prompt_input`
-
-Examples:
-
-```bash
-ralph config set planning_max_iterations 12 --scope project
-ralph config set builder_max_iterations 40 --scope project
-ralph config set editor_override nvim --scope user
-```
-
-### Example
+Current app config shape:
 
 ```toml
-[planner]
+[runner]
 program = "codex"
 args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--ephemeral"]
 prompt_transport = "stdin"
-question_support = "text_protocol"
+prompt_env_var = "PROMPT"
 
-[builder]
-program = "codex"
-args = ["exec", "--dangerously-bypass-approvals-and-sandbox", "--ephemeral"]
-prompt_transport = "stdin"
-question_support = "text_protocol"
-
-planning_max_iterations = 8
-builder_max_iterations = 25
+max_iterations = 40
 editor_override = "nvim"
 
 [cli]
@@ -264,68 +285,49 @@ warning_color = "yellow"
 
 ## Built-In Agent Presets
 
-Ralph currently supports three external coding-agent CLIs via built-in presets. "Supported" here means Ralph knows how to:
-
-- detect the agent on `PATH`
-- persist it in config
-- switch to it in the TUI
-- invoke it with the expected command shape for planner and builder passes
-
-Supported agents:
+Ralph supports three built-in coding-agent presets:
 
 - OpenCode: [anomalyco/opencode](https://github.com/anomalyco/opencode)
-  Ralph treats this as the open source terminal coding agent and invokes it as `opencode run --format default --thinking`.
 - Codex: [openai/codex](https://github.com/openai/codex)
-  Ralph treats this as OpenAI's terminal coding agent and invokes it as `codex exec --dangerously-bypass-approvals-and-sandbox --ephemeral`.
 - Raijin: [francescoalemanno/raijin-mono](https://github.com/francescoalemanno/raijin-mono/)
-  Ralph treats this as a fast terminal AI assistant with one-shot CLI support and invokes it as `raijin -ephemeral "$PROMPT"`.
 
-The TUI only cycles among supported agents that are actually detected on `PATH`.
+Default command shapes:
 
-If you configure a different command manually, Ralph may still run it if the command shape is compatible, but only the three presets above are first-class supported agents.
+- OpenCode: `opencode run --format default --thinking`
+- Codex: `codex exec --dangerously-bypass-approvals-and-sandbox --ephemeral`
+- Raijin: `raijin -ephemeral "$PROMPT"`
 
-## Prompting Model
+Agent selection behavior:
 
-Ralph does not inline artifact contents into prompts by default. Instead, it tells the planner or builder which files to read from disk first. This keeps prompts smaller and makes the files on disk the source of truth.
+- Ralph detects supported agents on `PATH` at boot
+- if the configured agent is unavailable and another supported agent is detected, Ralph falls back to the first detected one
+- the TUI only cycles through agents actually detected on `PATH`
+- TUI agent changes are persisted into project config
 
-Planner prompts include:
+## TUI Notes
 
-- the spec path
-- the progress path
-- the feedback path
-- clarification rules
-- controller warnings
-- an instruction to keep implementation sequencing in `progress`, not in `spec`
+Main keys:
 
-Builder prompts include:
+- `N`: create target
+- `R`: run selected prompt
+- `E`: edit selected prompt
+- `D`: delete selected target
+- `A`: cycle agent and persist the choice
+- `Q`: quit from dashboard or cancel an active run
 
-- the spec path
-- the progress path
-- the feedback path
+Run screen:
 
-Spec-edit revision prompts include:
-
-- the previous spec snapshot
-- the current spec
-- the progress file
-- the spec diff
-
-## Clarifications
-
-When clarification is enabled, the planner can emit a single structured question block. Ralph surfaces it in the UI, records the answer, and persists the exchange into the feedback artifact so later runs inherit the answer.
-
-The feedback file keeps:
-
-- the newest authoritative clarification in `<RECENT-USER-FEEDBACK>`
-- older clarification history in `<OLDER-USER-FEEDBACK>`
+- `A`: switch the agent for subsequent iterations and persist it
+- `R`: rerun the same target/prompt after the run has finished
+- `Esc`: return to dashboard after a finished run
 
 ## Project Structure
 
 This workspace is split into focused crates:
 
-- `crates/ralph-core`: prompts, config, artifact storage, shared types
+- `crates/ralph-core`: target storage, config, shared types
 - `crates/ralph-runner`: process execution and runner transport
-- `crates/ralph-app`: orchestration and workflow logic
+- `crates/ralph-app`: orchestration, prompt parsing, watch logic
 - `crates/ralph-tui`: terminal UI
 - `crates/ralph-cli`: command-line entrypoint
 
@@ -347,4 +349,4 @@ cargo package -p ralph-cli --allow-dirty --no-verify
 
 ## Current Status
 
-Ralph is usable as a local workflow tool and is designed around durable repo-local state, editable specs, and pluggable agents. The sharp edge to keep in mind is that explicit path targets intentionally allow artifacts to live outside `./.ralph/` when you point Ralph at a spec elsewhere in the repository.
+Ralph is a local durable loop tool centered on target folders, markdown prompts, prompt-local watch directives, and pluggable terminal coding agents.
