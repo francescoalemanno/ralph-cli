@@ -221,8 +221,9 @@ impl TargetStore {
                 return Ok(self.fallback_target_config(target_id));
             }
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to read target config {}", paths.config_path));
+                return Err(error).with_context(|| {
+                    format!("failed to read target config {}", paths.config_path)
+                });
             }
         };
         let mut config: TargetConfig =
@@ -419,12 +420,8 @@ mod tests {
         );
         assert_eq!(summary.last_run_status, LastRunStatus::NeverRun);
 
-        let plan_prompt = store
-            .read_named_target_file("demo", "0_plan.md")
-            .unwrap();
-        let build_prompt = store
-            .read_named_target_file("demo", "1_build.md")
-            .unwrap();
+        let plan_prompt = store.read_named_target_file("demo", "0_plan.md").unwrap();
+        let build_prompt = store.read_named_target_file("demo", "1_build.md").unwrap();
         assert!(
             plan_prompt.contains("ULTIMATE GOAL - We want to achieve:\n[project-specific goal].")
         );
@@ -500,7 +497,10 @@ mod tests {
         let targets = store.list_targets().unwrap();
 
         assert_eq!(
-            targets.iter().map(|target| target.id.as_str()).collect::<Vec<_>>(),
+            targets
+                .iter()
+                .map(|target| target.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["newer", "older"]
         );
     }
@@ -512,16 +512,16 @@ mod tests {
             camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
         );
 
-        store.create_target("demo", Some(ScaffoldId::Blank)).unwrap();
+        store
+            .create_target("demo", Some(ScaffoldId::Blank))
+            .unwrap();
         let prompt = store
             .read_named_target_file("demo", "prompt_main.md")
             .unwrap();
 
         assert!(prompt.contains("<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>"));
         assert!(prompt.contains("# Requests (not sorted by priority)"));
-        assert!(
-            prompt.contains("1. Read {ralph-env:TARGET_DIR}/progress.txt.")
-        );
+        assert!(prompt.contains("1. Read {ralph-env:TARGET_DIR}/progress.txt."));
         assert!(
             prompt.contains(
                 "3. Update your progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item"
