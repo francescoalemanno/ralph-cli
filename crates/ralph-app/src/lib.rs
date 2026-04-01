@@ -1,67 +1,37 @@
-use std::{env, fs, process::Command};
+use std::{env, process::Command};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
-    AppConfig, ArtifactStore, BuildPromptContext, BuilderMarker, ClarificationAnswer,
-    ClarificationRequest, CodingAgent, ProgressRevisionPromptContext, ReviewData, RunControl,
-    RunnerConfig, RunnerInvocation, RunnerMode, SpecPaths, SpecSummary, build_prompt,
-    default_progress_contents, empty_spec_contents, initial_spec_contents,
-    parse_builder_marker_from_output, parse_clarification_request,
-    parse_planning_marker_from_output, planning_prompt, progress_revision_prompt,
-    strip_persisted_promise_markers,
+    AppConfig, CodingAgent, LastRunStatus, RunControl, RunnerConfig, RunnerInvocation, ScaffoldId,
+    TargetReview, TargetStore, TargetSummary,
 };
 use ralph_runner::{CommandRunner, RunnerAdapter, RunnerStreamEvent};
-use similar::TextDiff;
-use tracing::debug;
 
 #[derive(Debug, Clone)]
 pub enum RunEvent {
-    ArtifactsCreated {
-        spec_path: String,
-        progress_path: String,
-        feedback_path: String,
-    },
     IterationStarted {
-        mode: RunnerMode,
+        prompt_name: String,
         iteration: usize,
         max_iterations: usize,
     },
     Output(String),
     Note(String),
     Finished {
-        mode: RunnerMode,
-        completed: bool,
+        status: LastRunStatus,
         summary: String,
     },
 }
 
-#[derive(Debug, Clone)]
-pub struct SpecEditSession {
-    pub target: String,
-    pub paths: SpecPaths,
-    pub past_spec_path: Utf8PathBuf,
-}
-
-#[derive(Debug, Clone)]
-pub struct ProgressRevisionRequest {
-    pub target: String,
-    pub paths: SpecPaths,
-    pub past_spec_path: Utf8PathBuf,
-    pub diff_path: Utf8PathBuf,
-}
-
 pub fn format_iteration_banner(
-    mode: RunnerMode,
+    prompt_name: &str,
     iteration: usize,
     max_iterations: usize,
 ) -> String {
     let title = format!(
         " {} ITERATION {}/{} ",
-        mode.as_str().to_ascii_uppercase(),
-        iteration,
-        max_iterations
+        prompt_name, iteration, max_iterations
     );
     let width = title.len().max(44);
     let rule = "=".repeat(width);
@@ -71,17 +41,12 @@ pub fn format_iteration_banner(
 #[async_trait]
 pub trait RunDelegate: Send {
     async fn on_event(&mut self, event: RunEvent) -> Result<()>;
-
-    async fn ask_clarification(
-        &mut self,
-        request: ClarificationRequest,
-    ) -> Result<Option<ClarificationAnswer>>;
 }
 
 #[derive(Debug, Clone)]
 pub struct RalphApp<R = CommandRunner> {
     project_dir: Utf8PathBuf,
-    store: ArtifactStore,
+    store: TargetStore,
     config: AppConfig,
     runner: R,
 }
@@ -91,7 +56,7 @@ impl RalphApp<CommandRunner> {
         let project_dir = project_dir.into();
         let config = AppConfig::load(&project_dir)?;
         Ok(Self {
-            store: ArtifactStore::new(project_dir.clone()),
+            store: TargetStore::new(project_dir.clone()),
             project_dir,
             config,
             runner: CommandRunner,
@@ -105,7 +70,7 @@ where
 {
     pub fn new(project_dir: Utf8PathBuf, config: AppConfig, runner: R) -> Self {
         Self {
-            store: ArtifactStore::new(project_dir.clone()),
+            store: TargetStore::new(project_dir.clone()),
             project_dir,
             config,
             runner,
@@ -138,755 +103,235 @@ where
         &self.project_dir
     }
 
-    pub fn list_specs(&self) -> Result<Vec<SpecSummary>> {
-        self.store.list_specs()
+    pub fn list_targets(&self) -> Result<Vec<TargetSummary>> {
+        self.store.list_targets()
     }
 
-    pub fn review_target(&self, target: &str) -> Result<ReviewData> {
-        let paths = self.store.resolve_target(target)?;
-        self.store.review(&paths)
+    pub fn create_target(
+        &self,
+        target_id: &str,
+        scaffold: Option<ScaffoldId>,
+    ) -> Result<TargetSummary> {
+        self.store.create_target(target_id, scaffold)
     }
 
-    pub fn prepare_target_for_tui(&self, target: &str) -> Result<SpecSummary> {
-        let paths = self.store.resolve_target(target)?;
-        if !paths.spec_path.exists() {
-            self.store
-                .write_spec(&paths.spec_path, &empty_spec_contents())?;
-        }
-        if !paths.progress_path.exists() {
-            self.store
-                .write_progress(&paths.progress_path, &default_progress_contents())?;
-        }
-        if !paths.feedback_path.exists() {
-            self.store.write_feedback(
-                &paths.feedback_path,
-                &ArtifactStore::default_feedback_contents(),
-            )?;
-        }
-        self.summary_for_paths(&paths)
-    }
-
-    pub fn resolve_target(&self, target: &str) -> Result<SpecPaths> {
-        self.store.resolve_target(target)
+    pub fn review_target(&self, target: &str) -> Result<TargetReview> {
+        self.store.review_target(target)
     }
 
     pub fn delete_target(&self, target: &str) -> Result<()> {
-        let paths = self.store.resolve_target(target)?;
-        self.store.delete_pair(&paths)
+        self.store.delete_target(target)
     }
 
-    pub fn edit_target(&self, target: &str) -> Result<()> {
-        let session = self.begin_spec_edit(target)?;
-        self.open_in_editor(&session.paths.spec_path)
+    pub fn edit_prompt(&self, target: &str, prompt_name: Option<&str>) -> Result<()> {
+        let prompt = self.resolve_prompt(target, prompt_name)?;
+        self.open_in_editor(&prompt.path)
     }
 
-    pub fn begin_spec_edit(&self, target: &str) -> Result<SpecEditSession> {
-        let paths = self.store.resolve_target(target)?;
-        self.store.ensure_ralph_dir()?;
-        if !paths.spec_path.exists() {
-            self.store
-                .write_spec(&paths.spec_path, &empty_spec_contents())?;
-        }
-        let current_spec = self.store.read_spec(&paths.spec_path)?;
-        let past_spec_path = self.store.past_spec_path(&paths.spec_path)?;
-        self.store.write_auxiliary(&past_spec_path, &current_spec)?;
-
-        Ok(SpecEditSession {
-            target: target.to_owned(),
-            paths,
-            past_spec_path,
-        })
-    }
-
-    pub fn finish_spec_edit(
-        &self,
-        session: SpecEditSession,
-    ) -> Result<Option<ProgressRevisionRequest>> {
-        let previous_spec = self.store.read_spec(&session.past_spec_path)?;
-        let current_spec = self.store.read_spec(&session.paths.spec_path)?;
-        if previous_spec == current_spec {
-            self.remove_optional_file(&session.past_spec_path)?;
-            return Ok(None);
-        }
-
-        let diff_path = self.store.spec_edit_diff_path(&session.paths.spec_path)?;
-        let diff = render_spec_diff(
-            &session.past_spec_path,
-            &session.paths.spec_path,
-            &previous_spec,
-            &current_spec,
-        );
-        self.store.write_auxiliary(&diff_path, &diff)?;
-
-        Ok(Some(ProgressRevisionRequest {
-            target: session.target,
-            paths: session.paths,
-            past_spec_path: session.past_spec_path,
-            diff_path,
-        }))
-    }
-
-    pub fn edit_spec_session(&self, session: &SpecEditSession) -> Result<()> {
-        self.open_in_editor(&session.paths.spec_path)
-    }
-
-    fn open_in_editor(&self, path: &Utf8Path) -> Result<()> {
-        let editor = self
-            .config
-            .editor_override
-            .clone()
-            .or_else(|| env::var("VISUAL").ok())
-            .or_else(|| env::var("EDITOR").ok())
-            .unwrap_or_else(|| "vi".to_owned());
-
-        let status = Command::new(&editor)
-            .arg(path.as_std_path())
-            .status()
-            .with_context(|| format!("failed to open editor {editor}"))?;
-        if !status.success() {
-            return Err(anyhow!("editor exited with status {}", status));
-        }
-        Ok(())
-    }
-
-    fn remove_optional_file(&self, path: &Utf8Path) -> Result<()> {
-        if !path.exists() {
-            return Ok(());
-        }
-        fs::remove_file(path).with_context(|| format!("failed to remove {path}"))
-    }
-
-    pub async fn create_new<D>(
-        &self,
-        planning_request: &str,
-        delegate: &mut D,
-    ) -> Result<SpecSummary>
-    where
-        D: RunDelegate,
-    {
-        self.create_new_with_control(planning_request, RunControl::new(), delegate)
-            .await
-    }
-
-    pub async fn create_new_with_control<D>(
-        &self,
-        planning_request: &str,
-        control: RunControl,
-        delegate: &mut D,
-    ) -> Result<SpecSummary>
-    where
-        D: RunDelegate,
-    {
-        let paths = self.store.allocate_spec_pair()?;
-        self.plan_paths(paths, planning_request, false, control, delegate)
-            .await
-    }
-
-    pub async fn revise_target<D>(
+    pub async fn run_target<D>(
         &self,
         target: &str,
-        planning_request: &str,
+        prompt_name: Option<&str>,
         delegate: &mut D,
-    ) -> Result<SpecSummary>
+    ) -> Result<TargetSummary>
     where
         D: RunDelegate,
     {
-        self.revise_target_with_control(target, planning_request, RunControl::new(), delegate)
-            .await
-    }
-
-    pub async fn revise_target_with_control<D>(
-        &self,
-        target: &str,
-        planning_request: &str,
-        control: RunControl,
-        delegate: &mut D,
-    ) -> Result<SpecSummary>
-    where
-        D: RunDelegate,
-    {
-        let paths = self.store.resolve_target(target)?;
-        self.plan_paths(paths, planning_request, false, control, delegate)
-            .await
-    }
-
-    pub async fn replan_target<D>(
-        &self,
-        target: &str,
-        planning_request: &str,
-        delegate: &mut D,
-    ) -> Result<SpecSummary>
-    where
-        D: RunDelegate,
-    {
-        self.replan_target_with_control(target, planning_request, RunControl::new(), delegate)
-            .await
-    }
-
-    pub async fn replan_target_with_control<D>(
-        &self,
-        target: &str,
-        planning_request: &str,
-        control: RunControl,
-        delegate: &mut D,
-    ) -> Result<SpecSummary>
-    where
-        D: RunDelegate,
-    {
-        let paths = self.store.resolve_target(target)?;
-        self.plan_paths(paths, planning_request, true, control, delegate)
-            .await
-    }
-
-    pub async fn revise_progress_after_spec_edit_with_control<D>(
-        &self,
-        request: ProgressRevisionRequest,
-        control: RunControl,
-        delegate: &mut D,
-    ) -> Result<SpecSummary>
-    where
-        D: RunDelegate,
-    {
-        self.store.ensure_ralph_dir()?;
-
-        for iteration in 1..=self.config.planning_max_iterations {
-            let planner_config = self.runner_config_for(RunnerMode::Plan, &control);
-            if control.is_cancelled() {
-                return Err(anyhow!("operation canceled"));
-            }
-            delegate
-                .on_event(RunEvent::IterationStarted {
-                    mode: RunnerMode::Plan,
-                    iteration,
-                    max_iterations: self.config.planning_max_iterations,
-                })
-                .await?;
-
-            let current_spec_before = self.store.read_spec(&request.paths.spec_path)?;
-            let past_spec_before = self.store.read_spec(&request.past_spec_path)?;
-            let progress_before = self.store.read_progress(&request.paths.progress_path)?;
-            let prompt = progress_revision_prompt(&ProgressRevisionPromptContext {
-                previous_spec_path: request.past_spec_path.to_string(),
-                current_spec_path: request.paths.spec_path.to_string(),
-                progress_path: request.paths.progress_path.to_string(),
-                diff_path: request.diff_path.to_string(),
-            });
-
-            let result = match self
-                .execute_runner(
-                    &planner_config,
-                    RunnerInvocation {
-                        prompt_text: prompt,
-                        project_dir: self.project_dir.clone(),
-                        mode: RunnerMode::Plan,
-                        spec_path: request.paths.spec_path.clone(),
-                        progress_path: request.paths.progress_path.clone(),
-                        feedback_path: request.paths.feedback_path.clone(),
-                    },
-                    &control,
-                    delegate,
-                )
-                .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    if control.is_cancelled() {
-                        return Err(anyhow!("operation canceled"));
-                    }
-                    self.store.append_controller_note(
-                        &request.paths.progress_path,
-                        &format!("progress revisor failed: {error}"),
-                    )?;
-                    delegate
-                        .on_event(RunEvent::Note(format!(
-                            "Progress revisor failed on iteration {iteration}: {error}"
-                        )))
-                        .await?;
-                    continue;
-                }
-            };
-
-            if result.exit_code != 0 {
-                if control.is_cancelled() {
-                    return Err(anyhow!("operation canceled"));
-                }
-                let note = format!("progress revisor exited with code {}", result.exit_code);
-                self.store
-                    .append_controller_note(&request.paths.progress_path, &note)?;
-                delegate.on_event(RunEvent::Note(note)).await?;
-                continue;
-            }
-
-            let current_spec_after = self.store.read_spec(&request.paths.spec_path)?;
-            if current_spec_after != current_spec_before {
-                self.store
-                    .write_spec(&request.paths.spec_path, &current_spec_before)?;
-                let note = "progress revisor must not modify the edited spec".to_owned();
-                self.store
-                    .append_controller_note(&request.paths.progress_path, &note)?;
-                delegate.on_event(RunEvent::Note(note)).await?;
-                continue;
-            }
-
-            let past_spec_after = self.store.read_spec(&request.past_spec_path)?;
-            if past_spec_after != past_spec_before {
-                self.store
-                    .write_auxiliary(&request.past_spec_path, &past_spec_before)?;
-                let note = "progress revisor must not modify the past spec snapshot".to_owned();
-                self.store
-                    .append_controller_note(&request.paths.progress_path, &note)?;
-                delegate.on_event(RunEvent::Note(note)).await?;
-                continue;
-            }
-
-            let marker = match parse_planning_marker_from_output(&result.output) {
-                Ok(marker) => marker,
-                Err(error) => {
-                    let note = format!("progress revisor marker validation failed: {error}");
-                    self.store
-                        .append_controller_note(&request.paths.progress_path, &note)?;
-                    delegate.on_event(RunEvent::Note(note)).await?;
-                    continue;
-                }
-            };
-
-            let progress_after = self.store.read_progress(&request.paths.progress_path)?;
-            if progress_after.trim().is_empty() {
-                let note = "progress revisor did not leave a non-empty progress file".to_owned();
-                self.store
-                    .append_controller_note(&request.paths.progress_path, &note)?;
-                delegate.on_event(RunEvent::Note(note)).await?;
-                continue;
-            }
-
-            if marker == ralph_core::PlanningMarker::Done {
-                self.remove_optional_file(&request.past_spec_path)?;
-                self.remove_optional_file(&request.diff_path)?;
-                let summary = self.summary_for_paths(&request.paths)?;
-                delegate
-                    .on_event(RunEvent::Finished {
-                        mode: RunnerMode::Plan,
-                        completed: true,
-                        summary: format!("Progress revised for {}", summary.spec_path),
-                    })
-                    .await?;
-                return Ok(summary);
-            }
-
-            if progress_after == progress_before {
-                let note = "progress revisor did not change progress".to_owned();
-                self.store
-                    .append_controller_note(&request.paths.progress_path, &note)?;
-                delegate.on_event(RunEvent::Note(note)).await?;
-            }
-        }
-
-        Err(anyhow!(
-            "progress revisor exceeded {} iterations",
-            self.config.planning_max_iterations
-        ))
-    }
-
-    pub async fn run_target<D>(&self, target: &str, delegate: &mut D) -> Result<SpecSummary>
-    where
-        D: RunDelegate,
-    {
-        self.run_target_with_control(target, RunControl::new(), delegate)
+        self.run_target_with_control(target, prompt_name, RunControl::new(), delegate)
             .await
     }
 
     pub async fn run_target_with_control<D>(
         &self,
         target: &str,
+        prompt_name: Option<&str>,
         control: RunControl,
         delegate: &mut D,
-    ) -> Result<SpecSummary>
+    ) -> Result<TargetSummary>
     where
         D: RunDelegate,
     {
-        let paths = self.store.resolve_target(target)?;
-        self.run_builder(paths, control, delegate).await
-    }
-
-    async fn plan_paths<D>(
-        &self,
-        paths: SpecPaths,
-        planning_request: &str,
-        reset: bool,
-        control: RunControl,
-        delegate: &mut D,
-    ) -> Result<SpecSummary>
-    where
-        D: RunDelegate,
-    {
-        self.store.ensure_ralph_dir()?;
-        if reset {
-            self.store.delete_pair(&paths)?;
-        }
-        if self.ensure_planning_artifacts(&paths, planning_request)? {
-            delegate
-                .on_event(RunEvent::ArtifactsCreated {
-                    spec_path: paths.spec_path.to_string(),
-                    progress_path: paths.progress_path.to_string(),
-                    feedback_path: paths.feedback_path.to_string(),
-                })
-                .await?;
+        let target_summary = self.store.load_target(target)?;
+        let prompt = self.select_prompt(&target_summary, prompt_name)?;
+        let prompt_text = self.store.read_file(&prompt.path)?;
+        let max_iterations = self
+            .store
+            .read_target_config(target)?
+            .max_iterations
+            .unwrap_or(self.config.max_iterations);
+        if max_iterations == 0 {
+            return Err(anyhow!("max_iterations must be greater than zero"));
         }
 
-        let mut controller_warnings = Vec::new();
-        for iteration in 1..=self.config.planning_max_iterations {
-            let planner_config = self.runner_config_for(RunnerMode::Plan, &control);
-            if control.is_cancelled() {
-                return Err(anyhow!("operation canceled"));
-            }
-            delegate
-                .on_event(RunEvent::IterationStarted {
-                    mode: RunnerMode::Plan,
-                    iteration,
-                    max_iterations: self.config.planning_max_iterations,
-                })
-                .await?;
-
-            let spec_before = self.store.read_spec(&paths.spec_path)?;
-            let progress_before = self.store.read_progress(&paths.progress_path)?;
-            let prompt = planning_prompt(&ralph_core::PlanningPromptContext {
-                planning_request: planning_request.to_owned(),
-                spec_path: paths.spec_path.to_string(),
-                progress_path: paths.progress_path.to_string(),
-                feedback_path: paths.feedback_path.to_string(),
-                controller_warnings: controller_warnings.clone(),
-                question_support: planner_config.question_support,
-            });
-
-            let result = match self
-                .execute_runner(
-                    &planner_config,
-                    RunnerInvocation {
-                        prompt_text: prompt,
-                        project_dir: self.project_dir.clone(),
-                        mode: RunnerMode::Plan,
-                        spec_path: paths.spec_path.clone(),
-                        progress_path: paths.progress_path.clone(),
-                        feedback_path: paths.feedback_path.clone(),
-                    },
-                    &control,
-                    delegate,
-                )
-                .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    if control.is_cancelled() {
-                        return Err(anyhow!("operation canceled"));
-                    }
-                    self.store.append_controller_note(
-                        &paths.progress_path,
-                        &format!("planning runner failed: {error}"),
-                    )?;
-                    delegate
-                        .on_event(RunEvent::Note(format!(
-                            "Planner runner failed on iteration {iteration}: {error}"
-                        )))
-                        .await?;
-                    continue;
-                }
-            };
-
-            if result.exit_code != 0 {
-                if control.is_cancelled() {
-                    return Err(anyhow!("operation canceled"));
-                }
-                let note = format!("planner exited with code {}", result.exit_code);
-                self.store
-                    .append_controller_note(&paths.progress_path, &note)?;
-                delegate.on_event(RunEvent::Note(note)).await?;
-                continue;
-            }
-
-            let asked_clarification = if let Some(request) =
-                parse_clarification_request(&result.output)
-            {
-                let answer = delegate.ask_clarification(request.clone()).await?;
-                let Some(answer) = answer else {
-                    return Err(anyhow!("planning canceled during clarification"));
+        for iteration in 1..=max_iterations {
+            let implementation_plan_before =
+                if target_summary.scaffold == Some(ScaffoldId::Playbook) {
+                    self.read_implementation_plan_snapshot()?
+                } else {
+                    None
                 };
-                self.store.append_feedback_clarification(
-                    &paths.feedback_path,
-                    &request,
-                    &answer,
-                )?;
-                true
-            } else {
-                if result.output.contains("<ralph-question>") {
-                    let note = "planner emitted clarification tags but no valid clarification block could be parsed".to_owned();
-                    self.store
-                        .append_controller_note(&paths.progress_path, &note)?;
-                    delegate.on_event(RunEvent::Note(note)).await?;
-                }
-                false
-            };
-            if asked_clarification {
-                continue;
-            }
 
             if control.is_cancelled() {
+                self.store
+                    .set_last_run(target, &prompt.name, LastRunStatus::Canceled)?;
                 return Err(anyhow!("operation canceled"));
             }
 
-            let spec_after = self.store.read_spec(&paths.spec_path)?;
-            let progress_after = self.store.read_progress(&paths.progress_path)?;
-
-            if spec_after.trim().is_empty() {
-                let note = "planner did not produce a non-empty spec".to_owned();
-                self.store
-                    .append_controller_note(&paths.progress_path, &note)?;
-                delegate.on_event(RunEvent::Note(note)).await?;
-                continue;
-            }
-            if progress_after.trim().is_empty() {
-                let note = "planner did not produce a non-empty progress file".to_owned();
-                self.store
-                    .append_controller_note(&paths.progress_path, &note)?;
-                delegate.on_event(RunEvent::Note(note)).await?;
-                continue;
-            }
-
-            let marker = match parse_planning_marker_from_output(&result.output) {
-                Ok(marker) => marker,
-                Err(error) => {
-                    let note = format!("planner marker validation failed: {error}");
-                    self.store
-                        .append_controller_note(&paths.progress_path, &note)?;
-                    delegate.on_event(RunEvent::Note(note)).await?;
-                    continue;
-                }
-            };
-
-            if marker == ralph_core::PlanningMarker::Done {
-                let summary = self.summary_for_paths(&paths)?;
-                delegate
-                    .on_event(RunEvent::Finished {
-                        mode: RunnerMode::Plan,
-                        completed: true,
-                        summary: format!("Planning complete for {}", summary.spec_path),
-                    })
-                    .await?;
-                return Ok(summary);
-            }
-
-            if spec_after == spec_before && progress_after == progress_before {
-                let note = "planner did not change spec or progress".to_owned();
-                self.store
-                    .append_controller_note(&paths.progress_path, &note)?;
-                delegate.on_event(RunEvent::Note(note)).await?;
-                if marker == ralph_core::PlanningMarker::Continue {
-                    let warning = "System warning: in the previous planning iteration you emitted CONTINUE without changing spec/progress and without asking clarification. This is irrational. In the next iteration you must either modify the plan artifacts, ask a clarification question, or emit DONE.".to_owned();
-                    if !controller_warnings.contains(&warning) {
-                        controller_warnings.push(warning);
-                    }
-                }
-                continue;
-            }
-        }
-
-        Err(anyhow!(
-            "planning exceeded {} iterations",
-            self.config.planning_max_iterations
-        ))
-    }
-
-    fn ensure_planning_artifacts(&self, paths: &SpecPaths, planning_request: &str) -> Result<bool> {
-        let mut created = false;
-        if !paths.spec_path.exists() {
-            self.store
-                .write_spec(&paths.spec_path, &initial_spec_contents(planning_request))?;
-            created = true;
-        }
-        if !paths.progress_path.exists() {
-            self.store
-                .write_progress(&paths.progress_path, &default_progress_contents())?;
-            created = true;
-        }
-        if !paths.feedback_path.exists() {
-            self.store.write_feedback(
-                &paths.feedback_path,
-                &ArtifactStore::default_feedback_contents(),
-            )?;
-            created = true;
-        }
-        Ok(created)
-    }
-
-    async fn run_builder<D>(
-        &self,
-        paths: SpecPaths,
-        control: RunControl,
-        delegate: &mut D,
-    ) -> Result<SpecSummary>
-    where
-        D: RunDelegate,
-    {
-        self.store.ensure_ralph_dir()?;
-
-        let spec = self.store.read_spec(&paths.spec_path)?;
-        if spec.trim().is_empty() {
-            return Err(anyhow!("cannot run builder without a non-empty spec"));
-        }
-        if !paths.feedback_path.exists() {
-            self.store.write_feedback(
-                &paths.feedback_path,
-                &ArtifactStore::default_feedback_contents(),
-            )?;
-        }
-
-        for iteration in 1..=self.config.builder_max_iterations {
-            let builder_config = self.runner_config_for(RunnerMode::Build, &control);
-            if control.is_cancelled() {
-                return Err(anyhow!("operation canceled"));
-            }
             delegate
                 .on_event(RunEvent::IterationStarted {
-                    mode: RunnerMode::Build,
+                    prompt_name: prompt.name.clone(),
                     iteration,
-                    max_iterations: self.config.builder_max_iterations,
+                    max_iterations,
                 })
                 .await?;
 
-            let progress_before = self.store.read_progress(&paths.progress_path)?;
-            let stripped = strip_persisted_promise_markers(&progress_before);
-            if stripped != progress_before {
-                self.store.write_progress(&paths.progress_path, &stripped)?;
-            }
-
-            let prompt = build_prompt(&BuildPromptContext {
-                spec_path: paths.spec_path.to_string(),
-                progress_path: paths.progress_path.to_string(),
-                feedback_path: paths.feedback_path.to_string(),
-            });
-
-            let result = match self
+            let config = self.runner_config_for(&control);
+            let result = self
                 .execute_runner(
-                    &builder_config,
+                    &config,
                     RunnerInvocation {
-                        prompt_text: prompt,
+                        prompt_text: prompt_text.clone(),
                         project_dir: self.project_dir.clone(),
-                        mode: RunnerMode::Build,
-                        spec_path: paths.spec_path.clone(),
-                        progress_path: paths.progress_path.clone(),
-                        feedback_path: paths.feedback_path.clone(),
+                        target_dir: target_summary.dir.clone(),
+                        prompt_path: prompt.path.clone(),
+                        prompt_name: prompt.name.clone(),
                     },
                     &control,
                     delegate,
                 )
                 .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    if control.is_cancelled() {
-                        return Err(anyhow!("operation canceled"));
-                    }
-                    self.store.append_controller_note(
-                        &paths.progress_path,
-                        &format!("builder runner failed: {error}"),
-                    )?;
-                    delegate
-                        .on_event(RunEvent::Note(format!(
-                            "Builder runner failed on iteration {iteration}: {error}"
-                        )))
-                        .await?;
-                    continue;
-                }
-            };
+                .inspect_err(|_| {
+                    let _ = self
+                        .store
+                        .set_last_run(target, &prompt.name, LastRunStatus::Failed);
+                })?;
 
             if result.exit_code != 0 {
-                if control.is_cancelled() {
-                    return Err(anyhow!("operation canceled"));
-                }
-                let note = format!("builder exited with code {}", result.exit_code);
                 self.store
-                    .append_controller_note(&paths.progress_path, &note)?;
-                delegate.on_event(RunEvent::Note(note)).await?;
-                continue;
+                    .set_last_run(target, &prompt.name, LastRunStatus::Failed)?;
+                let message = format!("runner exited with code {}", result.exit_code);
+                delegate.on_event(RunEvent::Note(message.clone())).await?;
+                return Err(anyhow!(message));
             }
 
-            let marker = match parse_builder_marker_from_output(&result.output) {
-                Ok(marker) => marker,
-                Err(error) => {
-                    let progress_after = self.store.read_progress(&paths.progress_path)?;
-                    let unchanged_progress =
-                        strip_persisted_promise_markers(&progress_after) == stripped;
-                    let note = if unchanged_progress {
-                        format!(
-                            "builder marker validation failed: {error}; builder exited without updating progress"
-                        )
-                    } else {
-                        format!("builder marker validation failed: {error}")
-                    };
-                    self.store
-                        .append_controller_note(&paths.progress_path, &note)?;
-                    delegate.on_event(RunEvent::Note(note)).await?;
-                    continue;
-                }
-            };
-
-            let progress_after = self.store.read_progress(&paths.progress_path)?;
-            if progress_after.trim().is_empty() {
-                let note = "builder did not leave a progress file".to_owned();
+            if target_summary.scaffold == Some(ScaffoldId::Playbook)
+                && implementation_plan_before == self.read_implementation_plan_snapshot()?
+            {
                 self.store
-                    .append_controller_note(&paths.progress_path, &note)?;
-                delegate.on_event(RunEvent::Note(note)).await?;
-                continue;
-            }
-
-            if marker == BuilderMarker::Done {
-                self.store.persist_done_marker(&paths.progress_path)?;
-                let summary = self.summary_for_paths(&paths)?;
+                    .set_last_run(target, &prompt.name, LastRunStatus::Completed)?;
+                let summary = self.store.load_target(target)?;
                 delegate
                     .on_event(RunEvent::Finished {
-                        mode: RunnerMode::Build,
-                        completed: true,
-                        summary: format!("Build complete for {}", summary.spec_path),
+                        status: LastRunStatus::Completed,
+                        summary: format!("Run complete for {}", summary.id),
                     })
                     .await?;
                 return Ok(summary);
             }
         }
 
+        self.store
+            .set_last_run(target, &prompt.name, LastRunStatus::MaxIterations)?;
+        let summary = self.store.load_target(target)?;
+        delegate
+            .on_event(RunEvent::Finished {
+                status: LastRunStatus::MaxIterations,
+                summary: format!("Reached max iterations for {}", summary.id),
+            })
+            .await?;
+        Ok(summary)
+    }
+
+    fn read_implementation_plan_snapshot(&self) -> Result<Option<String>> {
+        let path = self.project_dir.join("IMPLEMENTATION_PLAN.md");
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("failed to read implementation plan {}", path))
+            }
+        }
+    }
+
+    pub fn resolve_prompt(
+        &self,
+        target: &str,
+        prompt_name: Option<&str>,
+    ) -> Result<ralph_core::PromptFile> {
+        let target_summary = self.store.load_target(target)?;
+        self.select_prompt(&target_summary, prompt_name)
+    }
+
+    fn select_prompt(
+        &self,
+        target_summary: &TargetSummary,
+        prompt_name: Option<&str>,
+    ) -> Result<ralph_core::PromptFile> {
+        if target_summary.prompt_files.is_empty() {
+            return Err(anyhow!(
+                "target '{}' has no runnable prompt files",
+                target_summary.id
+            ));
+        }
+
+        if let Some(prompt_name) = prompt_name {
+            return target_summary
+                .prompt_files
+                .iter()
+                .find(|prompt| prompt.name == prompt_name)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "prompt '{prompt_name}' does not exist for '{}'",
+                        target_summary.id
+                    )
+                });
+        }
+
+        if let Some(last_prompt) = &target_summary.last_prompt
+            && let Some(prompt) = target_summary
+                .prompt_files
+                .iter()
+                .find(|prompt| &prompt.name == last_prompt)
+        {
+            return Ok(prompt.clone());
+        }
+
+        if let Some(prompt) = target_summary
+            .prompt_files
+            .iter()
+            .find(|prompt| prompt.name == "prompt_main.md")
+        {
+            return Ok(prompt.clone());
+        }
+
+        if target_summary.prompt_files.len() == 1 {
+            return Ok(target_summary.prompt_files[0].clone());
+        }
+
+        let available = target_summary
+            .prompt_files
+            .iter()
+            .map(|prompt| prompt.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         Err(anyhow!(
-            "builder exceeded {} iterations",
-            self.config.builder_max_iterations
+            "target '{}' has multiple prompt files; choose one with --prompt ({available})",
+            target_summary.id
         ))
     }
 
-    fn summary_for_paths(&self, paths: &SpecPaths) -> Result<SpecSummary> {
-        let review = self.store.review(paths)?;
-        let state = self.store.state_for_paths(paths)?;
-        debug!(spec = %paths.spec_path, ?state, "built spec summary");
-        Ok(SpecSummary {
-            spec_path: review.spec_path,
-            progress_path: review.progress_path,
-            feedback_path: review.feedback_path,
-            state,
-            spec_preview: preview(&review.spec_contents),
-            progress_preview: preview(&review.progress_contents),
-            feedback_preview: preview(&review.feedback_contents),
-        })
-    }
-
-    fn runner_config_for(&self, mode: RunnerMode, control: &RunControl) -> RunnerConfig {
+    fn runner_config_for(&self, control: &RunControl) -> RunnerConfig {
         if let Some(agent) = control.coding_agent() {
             RunnerConfig::for_agent(agent)
         } else {
-            match mode {
-                RunnerMode::Plan => self.config.planner.clone(),
-                RunnerMode::Build => self.config.builder.clone(),
-            }
+            self.config.runner.clone()
         }
     }
 
     async fn execute_runner<D>(
         &self,
-        config: &ralph_core::RunnerConfig,
+        config: &RunnerConfig,
         invocation: RunnerInvocation,
         control: &RunControl,
         delegate: &mut D,
@@ -916,6 +361,25 @@ where
             }
         }
     }
+
+    fn open_in_editor(&self, path: &Utf8Path) -> Result<()> {
+        let editor = self
+            .config
+            .editor_override
+            .clone()
+            .or_else(|| env::var("VISUAL").ok())
+            .or_else(|| env::var("EDITOR").ok())
+            .unwrap_or_else(|| "vi".to_owned());
+
+        let status = Command::new(&editor)
+            .arg(path.as_std_path())
+            .status()
+            .with_context(|| format!("failed to open editor {editor}"))?;
+        if !status.success() {
+            return Err(anyhow!("editor exited with status {}", status));
+        }
+        Ok(())
+    }
 }
 
 async fn forward_stream_event<D>(delegate: &mut D, event: RunnerStreamEvent) -> Result<()>
@@ -927,33 +391,6 @@ where
     }
 }
 
-fn preview(contents: &str) -> String {
-    let compact = contents
-        .lines()
-        .skip_while(|line| line.trim().is_empty())
-        .map(str::trim_end)
-        .take(12)
-        .collect::<Vec<_>>();
-    if compact.is_empty() {
-        "<empty>".to_owned()
-    } else {
-        compact.join("\n")
-    }
-}
-
-fn render_spec_diff(
-    previous_spec_path: &Utf8Path,
-    current_spec_path: &Utf8Path,
-    previous_spec: &str,
-    current_spec: &str,
-) -> String {
-    TextDiff::from_lines(previous_spec, current_spec)
-        .unified_diff()
-        .context_radius(3)
-        .header(previous_spec_path.as_str(), current_spec_path.as_str())
-        .to_string()
-}
-
 #[derive(Default)]
 pub struct ConsoleDelegate;
 
@@ -961,99 +398,45 @@ pub struct ConsoleDelegate;
 impl RunDelegate for ConsoleDelegate {
     async fn on_event(&mut self, event: RunEvent) -> Result<()> {
         match event {
-            RunEvent::ArtifactsCreated {
-                spec_path,
-                progress_path,
-                feedback_path,
-            } => {
-                println!(
-                    "artifacts created:\n- spec: {spec_path}\n- progress: {progress_path}\n- feedback: {feedback_path}"
-                );
-            }
             RunEvent::IterationStarted {
-                mode,
+                prompt_name,
                 iteration,
                 max_iterations,
             } => {
                 println!(
                     "{}",
-                    format_iteration_banner(mode, iteration, max_iterations)
+                    format_iteration_banner(&prompt_name, iteration, max_iterations)
                 );
             }
-            RunEvent::Output(chunk) => print!("{chunk}"),
-            RunEvent::Note(note) => eprintln!("note: {note}"),
-            RunEvent::Finished { summary, .. } => println!("{summary}"),
+            RunEvent::Output(chunk) => {
+                print!("{chunk}");
+            }
+            RunEvent::Note(note) => {
+                eprintln!("{note}");
+            }
+            RunEvent::Finished { status, summary } => {
+                println!("\n{} ({})", summary, status.label());
+            }
         }
         Ok(())
-    }
-
-    async fn ask_clarification(
-        &mut self,
-        request: ClarificationRequest,
-    ) -> Result<Option<ClarificationAnswer>> {
-        println!("\nClarification required:\n{}\n", request.question);
-        for (index, option) in request.options.iter().enumerate() {
-            println!("{}. {} - {}", index + 1, option.label, option.description);
-        }
-        loop {
-            println!("Enter a number, free-form answer, or /quit to abort:");
-
-            let mut input = String::new();
-            std::io::stdin()
-                .read_line(&mut input)
-                .context("failed to read clarification answer")?;
-            let input = input.trim();
-            if input.eq_ignore_ascii_case("/quit") {
-                return Ok(None);
-            }
-            if input.is_empty() {
-                println!("Answer required. Type a choice, free-form answer, or /quit.");
-                continue;
-            }
-            if let Ok(index) = input.parse::<usize>()
-                && let Some(option) = request.options.get(index.saturating_sub(1))
-            {
-                return Ok(Some(ClarificationAnswer {
-                    text: option.label.clone(),
-                    used_option_selection: true,
-                    selected_option: Some(option.clone()),
-                }));
-            }
-            return Ok(Some(ClarificationAnswer {
-                text: input.to_owned(),
-                used_option_selection: false,
-                selected_option: None,
-            }));
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use camino::Utf8PathBuf;
+    use ralph_core::{AppConfig, RunControl, RunnerInvocation, RunnerResult, ScaffoldId};
+    use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
+    use tokio::sync::mpsc::UnboundedSender;
 
-    use super::*;
-    use anyhow::anyhow;
-    use ralph_core::{RunnerResult, WorkflowState};
-
-    type ScriptedStep = Box<dyn Fn(&RunnerInvocation) -> RunnerResult + Send + Sync>;
-    type SharedScriptedSteps = Arc<Mutex<Vec<ScriptedStep>>>;
+    use crate::{RalphApp, RunDelegate, RunEvent};
 
     #[derive(Clone)]
     struct ScriptedRunner {
-        steps: SharedScriptedSteps,
-    }
-
-    impl ScriptedRunner {
-        fn new(steps: Vec<ScriptedStep>) -> Self {
-            Self {
-                steps: Arc::new(Mutex::new(steps)),
-            }
-        }
+        output: String,
+        exit_code: i32,
     }
 
     #[async_trait]
@@ -1061,549 +444,80 @@ mod tests {
         async fn run(
             &self,
             _config: &ralph_core::RunnerConfig,
-            invocation: RunnerInvocation,
+            _invocation: RunnerInvocation,
             _control: &RunControl,
-            stream: Option<tokio::sync::mpsc::UnboundedSender<RunnerStreamEvent>>,
+            stream: Option<UnboundedSender<RunnerStreamEvent>>,
         ) -> Result<RunnerResult> {
-            let next = self.steps.lock().unwrap().remove(0);
-            let result = next(&invocation);
-            if let Some(stream) = stream
-                && !result.output.is_empty()
-            {
-                let _ = stream.send(RunnerStreamEvent::Output(result.output.clone()));
+            if let Some(stream) = stream {
+                let _ = stream.send(RunnerStreamEvent::Output(self.output.clone()));
             }
-            Ok(result)
+            Ok(RunnerResult {
+                output: self.output.clone(),
+                exit_code: self.exit_code,
+            })
         }
     }
 
-    struct TestDelegate {
-        answers: Vec<Option<String>>,
-        created: Vec<(String, String, String)>,
-        notes: Vec<String>,
-        output: Vec<String>,
-    }
+    #[derive(Default)]
+    struct TestDelegate;
 
     #[async_trait]
     impl RunDelegate for TestDelegate {
-        async fn on_event(&mut self, event: RunEvent) -> Result<()> {
-            match event {
-                RunEvent::ArtifactsCreated {
-                    spec_path,
-                    progress_path,
-                    feedback_path,
-                } => self.created.push((spec_path, progress_path, feedback_path)),
-                RunEvent::Note(note) => self.notes.push(note),
-                RunEvent::Output(chunk) => self.output.push(chunk),
-                _ => {}
-            }
+        async fn on_event(&mut self, _event: RunEvent) -> Result<()> {
             Ok(())
         }
-
-        async fn ask_clarification(
-            &mut self,
-            _request: ClarificationRequest,
-        ) -> Result<Option<ClarificationAnswer>> {
-            Ok(self.answers.remove(0).map(|text| ClarificationAnswer {
-                text,
-                used_option_selection: false,
-                selected_option: None,
-            }))
-        }
     }
 
-    fn app(runner: ScriptedRunner) -> (tempfile::TempDir, RalphApp<ScriptedRunner>) {
-        let temp = tempfile::TempDir::new().unwrap();
+    #[tokio::test]
+    async fn playbook_targets_complete_when_implementation_plan_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let config = AppConfig {
-            planning_max_iterations: 3,
-            builder_max_iterations: 3,
-            ..AppConfig::default()
-        };
-        (temp, RalphApp::new(project_dir, config, runner))
-    }
-
-    #[tokio::test]
-    async fn planning_retries_on_invalid_marker() {
-        let runner = ScriptedRunner::new(vec![
-            Box::new(|invocation| {
-                let spec = fs::read_to_string(&invocation.spec_path).unwrap();
-                assert!(spec.contains("# Goal"));
-                assert!(spec.contains("Initial planning request: Implement feature"));
-                assert!(
-                    fs::read_to_string(&invocation.progress_path)
-                        .unwrap()
-                        .is_empty()
-                );
-                assert!(
-                    fs::read_to_string(&invocation.feedback_path)
-                        .unwrap()
-                        .contains("<RECENT-USER-FEEDBACK>")
-                );
-                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("A")).unwrap();
-                fs::write(&invocation.progress_path, "Task 1\n").unwrap();
-                RunnerResult {
-                    output: "not a marker\n".to_owned(),
-                    exit_code: 0,
-                }
-            }),
-            Box::new(|invocation| {
-                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("D")).unwrap();
-                fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
-                RunnerResult {
-                    output: "<plan-promise>DONE</plan-promise>\n".to_owned(),
-                    exit_code: 0,
-                }
-            }),
-        ]);
-
-        let (_temp, app) = app(runner);
-        let mut delegate = TestDelegate {
-            answers: vec![],
-            created: vec![],
-            notes: vec![],
-            output: vec![],
-        };
-        let summary = app
-            .create_new("Implement feature", &mut delegate)
-            .await
-            .unwrap();
-        assert_eq!(summary.state, WorkflowState::Planned);
-        assert_eq!(delegate.created.len(), 1);
-        assert!(delegate.created[0].0.ends_with(".md"));
-        assert!(delegate.created[0].2.ends_with(".txt"));
-        assert!(
-            delegate
-                .notes
-                .iter()
-                .any(|note| note.contains("planner marker validation failed"))
-        );
-    }
-
-    #[tokio::test]
-    async fn builder_persists_done_marker() {
-        let runner = ScriptedRunner::new(vec![Box::new(|invocation| {
-            assert!(invocation.prompt_text.contains("- feedback:"));
-            fs::write(&invocation.progress_path, "Task done\n").unwrap();
-            RunnerResult {
-                output: "<promise>DONE</promise>\n".to_owned(),
+        std::fs::write(project_dir.join("IMPLEMENTATION_PLAN.md"), "- item\n").unwrap();
+        let app = RalphApp::new(
+            project_dir.clone(),
+            AppConfig::default(),
+            ScriptedRunner {
+                output: "no plan changes".to_owned(),
                 exit_code: 0,
-            }
-        })]);
-
-        let (_temp, app) = app(runner);
-        let paths = app.resolve_target("alpha").unwrap();
-        fs::create_dir_all(paths.spec_path.parent().unwrap()).unwrap();
-        fs::write(&paths.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
-        fs::write(
-            &paths.progress_path,
-            "Task 1\n<promise>CONTINUE</promise>\n",
-        )
-        .unwrap();
-
-        let mut delegate = TestDelegate {
-            answers: vec![],
-            created: vec![],
-            notes: vec![],
-            output: vec![],
-        };
-        let summary = app.run_target("alpha", &mut delegate).await.unwrap();
-        assert_eq!(summary.state, WorkflowState::Completed);
-        let progress = fs::read_to_string(&paths.progress_path).unwrap();
-        assert_eq!(progress, "Task done\n<promise>DONE</promise>\n");
-    }
-
-    #[test]
-    fn prepare_target_for_tui_stubs_missing_support_files() {
-        let runner = ScriptedRunner::new(vec![]);
-        let (_temp, app) = app(runner);
-        let target = "custom/feature.md";
-
-        let summary = app.prepare_target_for_tui(target).unwrap();
-        assert!(summary.spec_path.as_str().ends_with("custom/feature.md"));
-        assert!(
-            summary
-                .progress_path
-                .as_str()
-                .ends_with("custom/feature.progress.txt")
+            },
         );
-        assert!(
-            summary
-                .feedback_path
-                .as_str()
-                .ends_with("custom/feature.feedback.txt")
-        );
-        assert!(summary.spec_preview.contains("<empty>"));
-        assert_eq!(summary.progress_preview, "<empty>");
-        assert!(summary.feedback_preview.contains("RECENT-USER-FEEDBACK"));
-    }
+        app.create_target("demo", Some(ScaffoldId::Playbook))
+            .unwrap();
 
-    #[tokio::test]
-    async fn planning_preserves_partial_artifacts_on_cancel() {
-        let runner = ScriptedRunner::new(vec![Box::new(|invocation| {
-            fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
-            fs::write(&invocation.progress_path, "Task 1\n").unwrap();
-            RunnerResult {
-                output: "<ralph-question>{\"question\":\"Which?\",\"options\":[]}</ralph-question>"
-                    .to_owned(),
-                exit_code: 0,
-            }
-        })]);
-
-        let (_temp, app) = app(runner);
-        let mut delegate = TestDelegate {
-            answers: vec![None],
-            created: vec![],
-            notes: vec![],
-            output: vec![],
-        };
-
-        assert!(
-            app.create_new("Implement feature", &mut delegate)
-                .await
-                .is_err()
-        );
-        let specs = app.list_specs().unwrap();
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].state, WorkflowState::Planned);
-    }
-
-    #[tokio::test]
-    async fn planning_keeps_stubbed_new_spec_visible_during_clarification() {
-        let runner = ScriptedRunner::new(vec![Box::new(|invocation| {
-            let spec = fs::read_to_string(&invocation.spec_path).unwrap();
-            assert!(spec.contains("# Goal"));
-            assert!(spec.contains("Initial planning request: Implement feature"));
-            assert!(
-                fs::read_to_string(&invocation.progress_path)
-                    .unwrap()
-                    .is_empty()
-            );
-            RunnerResult {
-                output: "<ralph-question>{\"question\":\"Which?\",\"options\":[]}</ralph-question>"
-                    .to_owned(),
-                exit_code: 0,
-            }
-        })]);
-
-        let (_temp, app) = app(runner);
-        let mut delegate = TestDelegate {
-            answers: vec![None],
-            created: vec![],
-            notes: vec![],
-            output: vec![],
-        };
-
-        assert!(
-            app.create_new("Implement feature", &mut delegate)
-                .await
-                .is_err()
-        );
-
-        let specs = app.list_specs().unwrap();
-        assert_eq!(specs.len(), 1);
-        assert_eq!(specs[0].state, WorkflowState::Planned);
-        assert!(specs[0].spec_preview.contains("Initial planning request"));
-        assert_eq!(specs[0].progress_preview, "<empty>");
-        assert_eq!(delegate.created.len(), 1);
-        assert!(
-            fs::read_to_string(&delegate.created[0].2)
-                .unwrap()
-                .contains("None.")
-        );
-    }
-
-    #[tokio::test]
-    async fn interrupted_planning_leaves_a_non_empty_runnable_stub_spec() {
-        let runner = ScriptedRunner::new(vec![
-            Box::new(|invocation| {
-                let spec = fs::read_to_string(&invocation.spec_path).unwrap();
-                assert!(spec.contains("Initial planning request: Implement feature"));
-                RunnerResult {
-                    output:
-                        "<ralph-question>{\"question\":\"Which?\",\"options\":[]}</ralph-question>"
-                            .to_owned(),
-                    exit_code: 0,
-                }
-            }),
-            Box::new(|invocation| {
-                let spec = fs::read_to_string(&invocation.spec_path).unwrap();
-                assert!(spec.contains("Initial planning request: Implement feature"));
-                fs::write(&invocation.progress_path, "Task 1\n").unwrap();
-                RunnerResult {
-                    output: "<promise>DONE</promise>\n".to_owned(),
-                    exit_code: 0,
-                }
-            }),
-        ]);
-
-        let (_temp, app) = app(runner);
-        let mut planning_delegate = TestDelegate {
-            answers: vec![None],
-            created: vec![],
-            notes: vec![],
-            output: vec![],
-        };
-
-        assert!(
-            app.create_new("Implement feature", &mut planning_delegate)
-                .await
-                .is_err()
-        );
-
-        let target = planning_delegate.created[0].0.clone();
-        let mut builder_delegate = TestDelegate {
-            answers: vec![],
-            created: vec![],
-            notes: vec![],
-            output: vec![],
-        };
-
+        let mut delegate = TestDelegate;
         let summary = app
-            .run_target(&target, &mut builder_delegate)
+            .run_target("demo", Some("playbook_plan.md"), &mut delegate)
             .await
             .unwrap();
-        assert_eq!(summary.state, WorkflowState::Completed);
-    }
 
-    #[tokio::test]
-    async fn planning_notes_malformed_clarification_blocks() {
-        let runner = ScriptedRunner::new(vec![Box::new(|invocation| {
-            fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
-            fs::write(&invocation.progress_path, "Task 1\n").unwrap();
-            RunnerResult {
-                output:
-                    "<ralph-question>{oops}</ralph-question>\n<plan-promise>DONE</plan-promise>\n"
-                        .to_owned(),
-                exit_code: 0,
-            }
-        })]);
-
-        let (_temp, app) = app(runner);
-        let mut delegate = TestDelegate {
-            answers: vec![],
-            created: vec![],
-            notes: vec![],
-            output: vec![],
-        };
-
-        let summary = app
-            .create_new("Implement feature", &mut delegate)
-            .await
-            .unwrap();
-        assert_eq!(summary.state, WorkflowState::Planned);
-        assert!(
-            delegate
-                .notes
-                .iter()
-                .any(|note| { note.contains("no valid clarification block could be parsed") })
+        assert_eq!(
+            summary.last_run_status,
+            ralph_core::LastRunStatus::Completed
         );
     }
 
     #[tokio::test]
-    async fn planning_persists_clarification_history_in_feedback_file() {
-        let runner = ScriptedRunner::new(vec![
-            Box::new(|invocation| {
-                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
-                fs::write(&invocation.progress_path, "Task 1\n").unwrap();
-                RunnerResult {
-                    output: "<ralph-question>{\"question\":\"Which database should the plan assume?\",\"options\":[{\"label\":\"Postgres\",\"description\":\"Use PostgreSQL\"}]}</ralph-question>".to_owned(),
-                    exit_code: 0,
-                }
-            }),
-            Box::new(|invocation| {
-                assert!(invocation.prompt_text.contains("- feedback:"));
-                assert!(
-                    !invocation
-                        .prompt_text
-                        .contains("Q: Which database should the plan assume?")
-                );
-                let feedback = fs::read_to_string(&invocation.feedback_path).unwrap();
-                assert!(feedback.contains("<RECENT-USER-FEEDBACK>"));
-                assert!(feedback.contains("Q: Which database should the plan assume?"));
-                assert!(feedback.contains("A: Postgres"));
-                assert!(feedback.contains("<OLDER-USER-FEEDBACK>\nNone."));
-                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("D")).unwrap();
-                fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
-                RunnerResult {
-                    output: "<plan-promise>DONE</plan-promise>\n".to_owned(),
-                    exit_code: 0,
-                }
-            }),
-        ]);
-
-        let (_temp, app) = app(runner);
-        let mut delegate = TestDelegate {
-            answers: vec![Some("Postgres".to_owned())],
-            created: vec![],
-            notes: vec![],
-            output: vec![],
-        };
-
-        let summary = app
-            .create_new("Implement feature", &mut delegate)
-            .await
-            .unwrap();
-        assert_eq!(summary.state, WorkflowState::Planned);
-    }
-
-    #[tokio::test]
-    async fn planning_done_succeeds_even_without_artifact_changes_in_final_pass() {
-        let runner = ScriptedRunner::new(vec![
-            Box::new(|invocation| {
-                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
-                fs::write(&invocation.progress_path, "Task 1\n").unwrap();
-                RunnerResult {
-                    output: "<plan-promise>CONTINUE</plan-promise>\n".to_owned(),
-                    exit_code: 0,
-                }
-            }),
-            Box::new(|_invocation| RunnerResult {
-                output: "<plan-promise>DONE</plan-promise>\n".to_owned(),
-                exit_code: 0,
-            }),
-        ]);
-
-        let (_temp, app) = app(runner);
-        let mut delegate = TestDelegate {
-            answers: vec![],
-            created: vec![],
-            notes: vec![],
-            output: vec![],
-        };
-
-        let summary = app
-            .create_new("Implement feature", &mut delegate)
-            .await
-            .unwrap();
-        assert_eq!(summary.state, WorkflowState::Planned);
-        assert!(
-            !delegate
-                .notes
-                .iter()
-                .any(|note| note.contains("planner did not change spec or progress"))
-        );
-    }
-
-    #[tokio::test]
-    async fn planning_warns_after_continue_without_changes_or_questions() {
-        let runner = ScriptedRunner::new(vec![
-            Box::new(|invocation| {
-                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
-                fs::write(&invocation.progress_path, "Task 1\n").unwrap();
-                RunnerResult {
-                    output: "<plan-promise>CONTINUE</plan-promise>\n".to_owned(),
-                    exit_code: 0,
-                }
-            }),
-            Box::new(|invocation| {
-                assert!(invocation.prompt_text.contains(
-                    "System warning: in the previous planning iteration you emitted CONTINUE without changing spec/progress and without asking clarification."
-                ));
-                fs::write(&invocation.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
-                fs::write(&invocation.progress_path, "Task 1\nTask 2\n").unwrap();
-                RunnerResult {
-                    output: "<plan-promise>DONE</plan-promise>\n".to_owned(),
-                    exit_code: 0,
-                }
-            }),
-        ]);
-
-        let (_temp, app) = app(runner);
-        let paths = app.resolve_target("alpha").unwrap();
-        fs::create_dir_all(paths.spec_path.parent().unwrap()).unwrap();
-        fs::write(&paths.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
-        fs::write(&paths.progress_path, "Task 1\n").unwrap();
-
-        let mut delegate = TestDelegate {
-            answers: vec![],
-            created: vec![],
-            notes: vec![],
-            output: vec![],
-        };
-
-        let summary = app
-            .revise_target("alpha", "Implement feature", &mut delegate)
-            .await
-            .unwrap();
-        assert_eq!(summary.state, WorkflowState::Planned);
-        assert!(
-            delegate
-                .notes
-                .iter()
-                .any(|note| note.contains("planner did not change spec or progress"))
-        );
-    }
-
-    struct BlockingRunner;
-
-    #[async_trait]
-    impl RunnerAdapter for BlockingRunner {
-        async fn run(
-            &self,
-            _config: &ralph_core::RunnerConfig,
-            _invocation: RunnerInvocation,
-            control: &RunControl,
-            stream: Option<tokio::sync::mpsc::UnboundedSender<RunnerStreamEvent>>,
-        ) -> Result<RunnerResult> {
-            if let Some(stream) = stream {
-                let _ = stream.send(RunnerStreamEvent::Output("started\n".to_owned()));
-            }
-            loop {
-                if control.is_cancelled() {
-                    return Err(anyhow!("runner canceled"));
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn builder_cancellation_stops_runner() {
-        let temp = tempfile::TempDir::new().unwrap();
+    async fn blank_targets_still_run_to_max_iterations_without_plan_change_stop() {
+        let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let config = AppConfig {
-            builder_max_iterations: 2,
-            ..AppConfig::default()
-        };
-        let app = RalphApp::new(project_dir, config, BlockingRunner);
-
-        let paths = app.resolve_target("alpha").unwrap();
-        fs::create_dir_all(paths.spec_path.parent().unwrap()).unwrap();
-        fs::write(&paths.spec_path, ralph_core::sample_spec_contents("C")).unwrap();
-        fs::write(&paths.progress_path, "Task 1\n").unwrap();
-
-        let control = RunControl::new();
-        let cancel = control.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            cancel.cancel();
-        });
-
-        let mut delegate = TestDelegate {
-            answers: vec![],
-            created: vec![],
-            notes: vec![],
-            output: vec![],
-        };
-
-        let error = app
-            .run_target_with_control("alpha", control, &mut delegate)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("operation canceled"));
-        assert!(
-            delegate
-                .output
-                .iter()
-                .any(|chunk| chunk.contains("started"))
+        let mut config = AppConfig::default();
+        config.max_iterations = 1;
+        let app = RalphApp::new(
+            project_dir.clone(),
+            config,
+            ScriptedRunner {
+                output: "no stop protocol".to_owned(),
+                exit_code: 0,
+            },
         );
-    }
+        app.create_target("demo", Some(ScaffoldId::Blank)).unwrap();
 
-    #[test]
-    fn iteration_banner_is_visually_distinct() {
-        let banner = format_iteration_banner(RunnerMode::Plan, 2, 8);
-        assert!(banner.starts_with('\n'));
-        assert!(banner.contains("PLAN ITERATION 2/8"));
-        assert_eq!(banner.lines().count(), 4);
+        let mut delegate = TestDelegate;
+        let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
+
+        assert_eq!(
+            summary.last_run_status,
+            ralph_core::LastRunStatus::MaxIterations
+        );
     }
 }

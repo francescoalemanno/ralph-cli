@@ -8,87 +8,110 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::CodingAgent;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkflowState {
-    Empty,
-    Planned,
+pub enum LastRunStatus {
+    #[default]
+    NeverRun,
     Completed,
+    MaxIterations,
+    Failed,
+    Canceled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+impl LastRunStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NeverRun => "never_run",
+            Self::Completed => "completed",
+            Self::MaxIterations => "max_iterations",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum RunnerMode {
-    Plan,
-    Build,
+pub enum ScaffoldId {
+    #[default]
+    Blank,
+    Playbook,
 }
 
-impl RunnerMode {
+impl ScaffoldId {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Plan => "plan",
-            Self::Build => "build",
+            Self::Blank => "blank",
+            Self::Playbook => "playbook",
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpecPaths {
-    pub spec_path: Utf8PathBuf,
-    pub progress_path: Utf8PathBuf,
-    pub feedback_path: Utf8PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpecSummary {
-    pub spec_path: Utf8PathBuf,
-    pub progress_path: Utf8PathBuf,
-    pub feedback_path: Utf8PathBuf,
-    pub state: WorkflowState,
-    pub spec_preview: String,
-    pub progress_preview: String,
-    pub feedback_preview: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReviewData {
-    pub spec_path: Utf8PathBuf,
-    pub progress_path: Utf8PathBuf,
-    pub feedback_path: Utf8PathBuf,
-    pub spec_contents: String,
-    pub progress_contents: String,
-    pub feedback_contents: String,
-    pub state: WorkflowState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClarificationOption {
-    pub label: String,
-    pub description: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClarificationRequest {
-    pub question: String,
+pub struct TargetConfig {
+    pub id: String,
     #[serde(default)]
-    pub options: Vec<ClarificationOption>,
+    pub scaffold: Option<ScaffoldId>,
+    #[serde(default)]
+    pub max_iterations: Option<usize>,
+    #[serde(default)]
+    pub last_prompt: Option<String>,
+    #[serde(default)]
+    pub last_run_status: LastRunStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetPaths {
+    pub dir: Utf8PathBuf,
+    pub config_path: Utf8PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClarificationAnswer {
-    pub text: String,
-    pub used_option_selection: bool,
-    pub selected_option: Option<ClarificationOption>,
+pub struct PromptFile {
+    pub name: String,
+    pub path: Utf8PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetFile {
+    pub name: String,
+    pub path: Utf8PathBuf,
+    pub is_prompt: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetSummary {
+    pub id: String,
+    pub dir: Utf8PathBuf,
+    pub prompt_files: Vec<PromptFile>,
+    pub files: Vec<TargetFile>,
+    pub scaffold: Option<ScaffoldId>,
+    pub last_prompt: Option<String>,
+    pub last_run_status: LastRunStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetReview {
+    pub summary: TargetSummary,
+    pub files: Vec<TargetFileContents>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetFileContents {
+    pub name: String,
+    pub path: Utf8PathBuf,
+    pub contents: String,
+    pub is_prompt: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerInvocation {
     pub prompt_text: String,
     pub project_dir: Utf8PathBuf,
-    pub mode: RunnerMode,
-    pub spec_path: Utf8PathBuf,
-    pub progress_path: Utf8PathBuf,
-    pub feedback_path: Utf8PathBuf,
+    pub target_dir: Utf8PathBuf,
+    pub prompt_path: Utf8PathBuf,
+    pub prompt_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,7 +185,7 @@ impl RunControl {
 
 #[cfg(test)]
 mod tests {
-    use super::RunControl;
+    use super::{LastRunStatus, RunControl, ScaffoldId};
     use crate::CodingAgent;
 
     #[test]
@@ -186,5 +209,11 @@ mod tests {
         assert_eq!(control.coding_agent(), None);
         control.set_coding_agent(CodingAgent::Codex);
         assert_eq!(control.coding_agent(), Some(CodingAgent::Codex));
+    }
+
+    #[test]
+    fn status_and_scaffold_have_stable_labels() {
+        assert_eq!(LastRunStatus::Completed.label(), "completed");
+        assert_eq!(ScaffoldId::Playbook.as_str(), "playbook");
     }
 }
