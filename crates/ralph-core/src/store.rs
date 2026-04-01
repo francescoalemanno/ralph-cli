@@ -126,11 +126,7 @@ impl TargetStore {
                 self.write_target_file(target_id, "1_build.md", &default_build_prompt())?;
             }
             ScaffoldId::Blank => {
-                self.write_target_file(
-                    target_id,
-                    "prompt_main.md",
-                    &blank_prompt(target_id),
-                )?;
+                self.write_target_file(target_id, "prompt_main.md", &blank_prompt())?;
             }
         }
 
@@ -325,6 +321,13 @@ pub fn is_prompt_file_name(name: &str) -> bool {
     name.ends_with(".md")
 }
 
+pub fn bare_prompt_template(scaffold: ScaffoldId) -> String {
+    match scaffold {
+        ScaffoldId::Default => default_plan_prompt(),
+        ScaffoldId::Blank => blank_prompt(),
+    }
+}
+
 fn current_unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -371,8 +374,7 @@ fn default_build_prompt() -> String {
     .to_owned()
 }
 
-fn blank_prompt(target_id: &str) -> String {
-    let _ = target_id;
+fn blank_prompt() -> String {
     "# Requests (not sorted by priority)\n- A\n- B\n- C\n\n# Execution policy\n1. Read {ralph-env:TARGET_DIR}/progress.txt.\n2. Execute the single most high leverage item in \"Requests\".\n3. Update your progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item\n4. Stop\n\n<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>\n"
         .to_owned()
 }
