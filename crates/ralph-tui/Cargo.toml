@@ -16,3 +16,4 @@ tokio.workspace = true
 tui-textarea.workspace = true
 unicode-width.workspace = true
 textwrap.workspace = true
+vt100.workspace = true

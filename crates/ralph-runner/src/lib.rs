@@ -83,19 +83,23 @@ impl RunnerAdapter for CommandRunner {
             })
             .collect::<Vec<_>>();
 
-        envs.push(("RALPH_MODE".to_owned(), invocation.mode.as_str().to_owned()));
         envs.push((
             "RALPH_PROJECT_DIR".to_owned(),
             invocation.project_dir.to_string(),
         ));
         envs.push((
-            "RALPH_SPEC_PATH".to_owned(),
-            invocation.spec_path.to_string(),
+            "RALPH_TARGET_DIR".to_owned(),
+            invocation.target_dir.to_string(),
         ));
         envs.push((
-            "RALPH_PROGRESS_PATH".to_owned(),
-            invocation.progress_path.to_string(),
+            "RALPH_PROMPT_PATH".to_owned(),
+            invocation.prompt_path.to_string(),
         ));
+        envs.push((
+            "RALPH_PROMPT_NAME".to_owned(),
+            invocation.prompt_name.clone(),
+        ));
+        envs.push(("RALPH_MODE".to_owned(), invocation.prompt_name.clone()));
         if matches!(config.prompt_transport, PromptTransport::EnvVar) {
             envs.push((
                 config.prompt_env_var.clone(),
@@ -119,7 +123,7 @@ impl RunnerAdapter for CommandRunner {
 
         debug!(
             program = config.program,
-            mode = invocation.mode.as_str(),
+            prompt = invocation.prompt_name,
             "starting runner process"
         );
 
@@ -336,9 +340,10 @@ fn render_template(
     let mut rendered = template.to_owned();
     let replacements = [
         ("{project_dir}", invocation.project_dir.as_str()),
-        ("{mode}", invocation.mode.as_str()),
-        ("{spec_path}", invocation.spec_path.as_str()),
-        ("{progress_path}", invocation.progress_path.as_str()),
+        ("{target_dir}", invocation.target_dir.as_str()),
+        ("{prompt_name}", invocation.prompt_name.as_str()),
+        ("{mode}", invocation.prompt_name.as_str()),
+        ("{prompt_path}", invocation.prompt_path.as_str()),
         ("{prompt}", invocation.prompt_text.as_str()),
         ("{prompt_file}", prompt_file.unwrap_or("")),
     ];
