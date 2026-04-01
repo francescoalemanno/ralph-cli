@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use ralph_app::{ConsoleDelegate, RalphApp};
 use ralph_core::{
     AppConfig, CodingAgent, ConfigFileScope, ScaffoldId, TargetReview, TargetSummary,
+    bare_prompt_template,
 };
 use ralph_tui::{run_tui, run_tui_scoped};
 use serde::Serialize;
@@ -133,7 +134,7 @@ enum Commands {
 #[derive(Debug, Clone, Args)]
 struct NewArgs {
     #[arg(value_name = "TARGET")]
-    target: String,
+    target: Option<String>,
     #[arg(long, value_enum, default_value_t = ScaffoldArg::Default)]
     scaffold: ScaffoldArg,
     #[arg(long, action = clap::ArgAction::SetTrue)]
@@ -145,7 +146,7 @@ struct NewArgs {
 #[derive(Debug, Clone, Args)]
 struct RunArgs {
     #[arg(value_name = "TARGET")]
-    target: String,
+    target: Option<String>,
     #[arg(long, value_name = "FILE")]
     prompt: Option<String>,
     #[command(flatten)]
@@ -155,7 +156,9 @@ struct RunArgs {
 #[derive(Debug, Clone, Args)]
 struct ShowArgs {
     #[arg(value_name = "TARGET")]
-    target: String,
+    target: Option<String>,
+    #[arg(long, value_name = "FILE")]
+    prompt: Option<Utf8PathBuf>,
     #[arg(long, value_name = "FILE")]
     file: Option<String>,
 }
@@ -163,7 +166,7 @@ struct ShowArgs {
 #[derive(Debug, Clone, Args)]
 struct EditArgs {
     #[arg(value_name = "TARGET")]
-    target: String,
+    target: Option<String>,
     #[arg(long, value_name = "FILE")]
     prompt: Option<String>,
 }
@@ -241,6 +244,13 @@ struct TargetListRow {
     scaffold: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct PromptFileRow {
+    prompt: String,
+    scaffold: Option<String>,
+    status: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     if let Err(error) = try_main().await {
@@ -266,25 +276,55 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
     match command {
         Commands::New(args) => {
             let app = RalphApp::load(project_dir)?;
-            let summary = app.create_target(&args.target, Some(args.scaffold.into()))?;
-            if args.edit {
-                let prompt = match args.prompt.as_deref() {
-                    Some(name) => Some(name),
-                    None if args.scaffold == ScaffoldArg::Default => Some("0_plan.md"),
-                    None => None,
-                };
-                app.edit_prompt(&args.target, prompt)?;
+            if let Some(target) = args.target.as_deref() {
+                let summary = app.create_target(target, Some(args.scaffold.into()))?;
+                if args.edit {
+                    let prompt = match args.prompt.as_deref() {
+                        Some(name) => Some(name),
+                        None if args.scaffold == ScaffoldArg::Default => Some("0_plan.md"),
+                        None => None,
+                    };
+                    app.edit_prompt(target, prompt)?;
+                }
+                print_summary(output, &summary)
+            } else {
+                let prompt_path = resolve_bare_prompt_path(args.prompt.as_deref())?;
+                let scaffold: ScaffoldId = args.scaffold.into();
+                create_bare_prompt_file(&prompt_path, scaffold)?;
+                if args.edit {
+                    app.edit_prompt_file(&prompt_path)?;
+                }
+                print_prompt_file_row(
+                    output,
+                    &PromptFileRow {
+                        prompt: prompt_path.to_string(),
+                        scaffold: Some(scaffold.as_str().to_owned()),
+                        status: None,
+                    },
+                )
             }
-            print_summary(output, &summary)
         }
         Commands::Run(args) => {
             let mut app = RalphApp::load(project_dir)?;
             args.runtime.apply_to(&mut app);
             let mut delegate = ConsoleDelegate;
-            let summary = app
-                .run_target(&args.target, args.prompt.as_deref(), &mut delegate)
-                .await?;
-            print_summary(output, &summary)
+            if let Some(target) = args.target.as_deref() {
+                let summary = app
+                    .run_target(target, args.prompt.as_deref(), &mut delegate)
+                    .await?;
+                print_summary(output, &summary)
+            } else {
+                let prompt_path = resolve_bare_prompt_path(args.prompt.as_deref())?;
+                let status = app.run_prompt_file(&prompt_path, &mut delegate).await?;
+                print_prompt_file_row(
+                    output,
+                    &PromptFileRow {
+                        prompt: prompt_path.to_string(),
+                        scaffold: None,
+                        status: Some(status.label().to_owned()),
+                    },
+                )
+            }
         }
         Commands::Ls => {
             let app = RalphApp::load(project_dir)?;
@@ -296,13 +336,26 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
             print_json_or_text(output, &rows, render_targets_text(&rows))
         }
         Commands::Show(args) => {
-            let app = RalphApp::load(project_dir)?;
-            let review = app.review_target(&args.target)?;
-            print_show(output, &review, args.file.as_deref())
+            if let Some(target) = args.target.as_deref() {
+                let app = RalphApp::load(project_dir)?;
+                let review = app.review_target(target)?;
+                print_show(output, &review, args.file.as_deref())
+            } else {
+                let prompt_path = args
+                    .prompt
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("show requires either TARGET or --prompt <file>"))?;
+                print_bare_file(output, prompt_path)
+            }
         }
         Commands::Edit(args) => {
             let app = RalphApp::load(project_dir)?;
-            app.edit_prompt(&args.target, args.prompt.as_deref())
+            if let Some(target) = args.target.as_deref() {
+                app.edit_prompt(target, args.prompt.as_deref())
+            } else {
+                let prompt_path = resolve_bare_prompt_path(args.prompt.as_deref())?;
+                app.edit_prompt_file(&prompt_path)
+            }
         }
         Commands::Agent(command) => run_agent_command(project_dir, output, command),
         Commands::Config(command) => run_config_command(project_dir, output, command),
@@ -507,6 +560,24 @@ fn print_show(output: OutputArg, review: &TargetReview, selected_file: Option<&s
     Ok(())
 }
 
+fn print_bare_file(output: OutputArg, path: &camino::Utf8Path) -> Result<()> {
+    let contents = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let row = serde_json::json!({
+        "path": path,
+        "contents": contents,
+    });
+    match output {
+        OutputArg::Text => {
+            println!("{contents}");
+            Ok(())
+        }
+        OutputArg::Json => {
+            println!("{}", serde_json::to_string_pretty(&row)?);
+            Ok(())
+        }
+    }
+}
+
 fn print_json_or_text<T>(output: OutputArg, value: &T, text: String) -> Result<()>
 where
     T: Serialize,
@@ -558,6 +629,36 @@ fn render_targets_text(rows: &[TargetListRow]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn print_prompt_file_row(output: OutputArg, row: &PromptFileRow) -> Result<()> {
+    let text = match row.status.as_deref() {
+        Some(status) => format!("{} [{}]", row.prompt, status),
+        None => row.prompt.clone(),
+    };
+    print_json_or_text(output, row, text)
+}
+
+fn resolve_bare_prompt_path(prompt: Option<&str>) -> Result<Utf8PathBuf> {
+    let prompt = prompt.ok_or_else(|| anyhow!("requires --prompt <file> when TARGET is omitted"))?;
+    let path = Utf8PathBuf::from(prompt);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let cwd = Utf8PathBuf::from_path_buf(env::current_dir().context("failed to read cwd")?)
+        .map_err(|_| anyhow!("current directory is not valid UTF-8"))?;
+    Ok(cwd.join(path))
+}
+
+fn create_bare_prompt_file(path: &camino::Utf8Path, scaffold: ScaffoldId) -> Result<()> {
+    if path.exists() {
+        return Err(anyhow!("prompt file already exists at {}", path));
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent))?;
+    }
+    fs::write(path, bare_prompt_template(scaffold))
+        .with_context(|| format!("failed to write prompt file {}", path))
 }
 
 fn resolve_project_dir(project_dir: Option<Utf8PathBuf>) -> Result<Utf8PathBuf> {
