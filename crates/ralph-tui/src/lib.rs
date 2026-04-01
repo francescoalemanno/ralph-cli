@@ -135,7 +135,7 @@ impl TuiApp {
             selected_prompt: 0,
             screen: Screen::Dashboard,
             new_target_name: String::new(),
-            new_scaffold: ScaffoldId::Playbook,
+            new_scaffold: ScaffoldId::Default,
             message: String::new(),
             running: None,
             tick_count: 0,
@@ -243,7 +243,7 @@ impl TuiApp {
             KeyCode::Char('n') => {
                 self.screen = Screen::NewTarget;
                 self.new_target_name.clear();
-                self.new_scaffold = ScaffoldId::Playbook;
+                self.new_scaffold = ScaffoldId::Default;
             }
             KeyCode::Char('r') => self.start_run()?,
             KeyCode::Char('e') => {
@@ -267,19 +267,7 @@ impl TuiApp {
                 self.message = format!("deleted {target_id}");
             }
             KeyCode::Char('a') => {
-                let detected = ralph_core::CodingAgent::detected();
-                if detected.is_empty() {
-                    self.message = "no supported agents detected on PATH".to_owned();
-                } else {
-                    let current = self.app.coding_agent();
-                    let index = detected
-                        .iter()
-                        .position(|agent| *agent == current)
-                        .unwrap_or(0);
-                    let next = detected[(index + 1) % detected.len()];
-                    self.app.set_coding_agent(next);
-                    self.message = format!("agent={}", next.label());
-                }
+                self.cycle_agent(None)?;
             }
             _ => {}
         }
@@ -293,8 +281,8 @@ impl TuiApp {
             }
             KeyCode::Tab => {
                 self.new_scaffold = match self.new_scaffold {
-                    ScaffoldId::Blank => ScaffoldId::Playbook,
-                    ScaffoldId::Playbook => ScaffoldId::Blank,
+                    ScaffoldId::Blank => ScaffoldId::Default,
+                    ScaffoldId::Default => ScaffoldId::Blank,
                 };
             }
             KeyCode::Backspace => {
@@ -340,6 +328,19 @@ impl TuiApp {
                 if let Some(running) = &self.running {
                     running.control.cancel();
                 }
+            }
+            KeyCode::Char('r') => {
+                if let Some(running) = &self.running
+                    && running.finished
+                {
+                    let target_id = running.target_id.clone();
+                    let prompt_name = running.prompt_name.clone();
+                    self.start_run_for(&target_id, &prompt_name)?;
+                }
+            }
+            KeyCode::Char('a') => {
+                let running_control = self.running.as_ref().map(|running| running.control.clone());
+                self.cycle_agent(running_control)?;
             }
             KeyCode::Up => self.scroll_running(1),
             KeyCode::Down => self.scroll_running(-1),
@@ -846,7 +847,7 @@ impl TuiApp {
         let widget = Paragraph::new(text)
             .block(
                 Block::default()
-                    .title(self.title_line("New Target", "Playbook or blank scaffold"))
+                    .title(self.title_line("New Target", "Default or blank scaffold"))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded),
             )
@@ -910,7 +911,7 @@ impl TuiApp {
                     Span::styled("  ◆  ", Style::default().fg(self.subtle_color())),
                     Span::styled(
                         if running.finished {
-                            "Esc returns to dashboard"
+                            "R reruns  ◆  Esc returns to dashboard"
                         } else {
                             "Q sends cancel"
                         },
@@ -995,13 +996,19 @@ impl TuiApp {
             return Ok(());
         };
 
+        self.start_run_for(&target_id, &prompt_name)
+    }
+
+    fn start_run_for(&mut self, target_id: &str, prompt_name: &str) -> Result<()> {
         let tx = self.tx.clone();
         let app = self.app.clone();
         let control = RunControl::new();
         let run_control = control.clone();
+        let target_id = target_id.to_owned();
+        let prompt_name = prompt_name.to_owned();
         self.running = Some(RunningState {
-            target_id: target_id.clone(),
-            prompt_name: prompt_name.clone(),
+            target_id: target_id.to_owned(),
+            prompt_name: prompt_name.to_owned(),
             iteration: 0,
             max_iterations: 0,
             control,
@@ -1021,6 +1028,27 @@ impl TuiApp {
             let _ = tx.send(UiEvent::RunDone(result));
         });
 
+        Ok(())
+    }
+
+    fn cycle_agent(&mut self, run_control: Option<RunControl>) -> Result<()> {
+        let detected = ralph_core::CodingAgent::detected();
+        if detected.is_empty() {
+            self.message = "no supported agents detected on PATH".to_owned();
+            return Ok(());
+        }
+
+        let current = self.app.coding_agent();
+        let index = detected
+            .iter()
+            .position(|agent| *agent == current)
+            .unwrap_or(0);
+        let next = detected[(index + 1) % detected.len()];
+        self.app.persist_coding_agent(next)?;
+        if let Some(control) = run_control {
+            control.set_coding_agent(next);
+        }
+        self.message = format!("agent={}", next.label());
         Ok(())
     }
 
