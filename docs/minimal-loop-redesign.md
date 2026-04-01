@@ -58,18 +58,25 @@ A target has:
 - a human-readable id
 - one or more prompt files
 - optional per-target settings such as `max_iterations`
+- a directory at `./.ralph/targets/<target-id>/`
 
-Prompt files are discovered by filename convention:
+Target discovery is directory-based:
 
-- `SLUG_*.md`
+- every folder directly under `./.ralph/targets/` is a target
+- the target id is the folder name
+- `target.toml` is optional metadata, not the source of truth
+
+Prompt files are discovered by location and extension:
+
+- any file in the target folder that ends in `.md`
 
 Examples:
 
-- `playbook_plan.md`
-- `playbook_build.md`
+- `0_plan.md`
+- `1_build.md`
 - `prompt_main.md`
 
-Files that do not match this convention are normal target files and are never considered runnable prompts by the core.
+Files in the target folder that do not end in `.md` are normal target files and are never considered runnable prompts by the core.
 
 ### Scaffold
 
@@ -77,7 +84,7 @@ A scaffold is an initialization helper.
 
 A scaffold may create:
 
-- one or more prompt files matching `SLUG_*.md`
+- one or more prompt files ending in `.md`
 - companion files such as `IMPLEMENTATION_PLAN.md`
 - initial target metadata
 
@@ -90,10 +97,14 @@ A run is one invocation of the looping harness against a target and one selected
 The runner:
 
 1. reads the selected prompt file
-2. sends that prompt to the configured coding agent without modification
-3. streams the agent output
-4. stops if the output contains `<iteration-promise:done>`
-5. otherwise starts the next iteration
+2. parses any `<<ralph-watch:filename>>` tags from the prompt
+3. removes those watch tags before sending the prompt to the coding agent
+4. snapshots watched files relative to the repository root before and after each iteration
+5. sends the trimmed prompt to the configured coding agent
+6. streams the agent output
+7. if watched files are declared and unchanged after an iteration, marks the run complete
+8. stops if the output contains `<iteration-promise:done>`
+9. otherwise starts the next iteration
 
 ## Runner Semantics
 
@@ -101,6 +112,7 @@ The core runner knows only:
 
 - `max_iterations`
 - cancellation
+- watched-file directives declared as `<<ralph-watch:filename>>`
 - the done token `<iteration-promise:done>`
 
 It does not know:
@@ -111,11 +123,10 @@ It does not know:
 - what "progress" means
 - whether the agent changed files
 
-Suggested matching rule:
+Recognized prompt-side protocol:
 
 - exact literal substring match for `<iteration-promise:done>`
-
-No other protocol is recognized.
+- zero or more `<<ralph-watch:filename>>` tags inside prompt files
 
 ## Proposed Target Layout
 
@@ -135,7 +146,7 @@ Minimum files:
 
 Additional files may exist, but the core does not assign them any meaning.
 
-Prompt files are the only runnable units. Companion files may exist in the same target directory, but they are never executed unless they match `SLUG_*.md`.
+Prompt files are the only runnable units. Companion files may exist in the same target directory, but they are never executed unless they end in `.md`.
 
 Example minimal target:
 
@@ -145,13 +156,13 @@ Example minimal target:
   prompt_main.md
 ```
 
-Example playbook-style target:
+Example default-style target:
 
 ```text
 .ralph/targets/<target-id>/
   target.toml
-  playbook_plan.md
-  playbook_build.md
+  0_plan.md
+  1_build.md
 ```
 
 Repository-root operational guidance remains outside the target:
@@ -173,16 +184,16 @@ Reason:
 
 The first milestone should support:
 
-- a target with one or more `SLUG_*.md` prompt files
+- a target with one or more `.md` prompt files
 - a loop runner
 - a done marker
 
-The first scaffold set already identified is a playbook scaffold inspired by Clayton Farr's Ralph playbook, but cleaned of Claude-, Sonnet-, Opus-, and subagent-specific instructions.
+The first scaffold set already identified is a default scaffold inspired by Clayton Farr's Ralph workflow, but cleaned of Claude-, Sonnet-, Opus-, and subagent-specific instructions.
 
 That scaffold should generate both prompt files together:
 
-- `playbook_plan.md`
-- `playbook_build.md`
+- `0_plan.md`
+- `1_build.md`
 
 Those two prompts belong to one scaffold and should never be initialized separately.
 
@@ -210,9 +221,9 @@ Behavior:
 Recommended flags:
 
 - `ralph new <target>`
-- `ralph new <target> --scaffold playbook`
-- `ralph run <target> --prompt playbook_plan.md`
-- `ralph run <target> --prompt playbook_build.md`
+- `ralph new <target> --scaffold default`
+- `ralph run <target> --prompt 0_plan.md`
+- `ralph run <target> --prompt 1_build.md`
 
 If a target has multiple prompt files and no prompt is specified, the CLI should ask the user to choose one.
 
@@ -237,7 +248,7 @@ Each target view should show:
 - last run status
 - list of target files
 
-The TUI should not assume anything beyond the existence of at least one `SLUG_*.md` prompt file.
+The TUI should not assume anything beyond the existence of at least one `.md` prompt file.
 
 New target flow:
 
@@ -248,10 +259,12 @@ New target flow:
 
 The TUI must support scaffold initialization too.
 
-For the `playbook` scaffold, initialization creates both:
+For the `default` scaffold, initialization creates both:
 
-- `playbook_plan.md`
-- `playbook_build.md`
+- `0_plan.md`
+- `1_build.md`
+
+Those prompt files should include `<<ralph-watch:IMPLEMENTATION_PLAN.md>>` so completion is driven by watched-file state rather than scaffold identity.
 
 When running a target with multiple prompt files, the TUI should let the user select which prompt to execute.
 
@@ -321,13 +334,13 @@ Suggested removals:
 
 - add `LoopRunner`
 - add `TargetConfig`
-- add prompt discovery by `SLUG_*.md`
+- add prompt discovery for any target-local `.md` file
 - keep old commands temporarily as wrappers if needed
 
 ### Phase 2: Simplify the Product Surface
 
 - remove planner/builder logic from the controller
-- make `SLUG_*.md` prompt files the only universal runnable concept
+- make target-local `.md` prompt files the only universal runnable concept
 
 ### Phase 3: Simplify the UI
 
@@ -337,8 +350,8 @@ Suggested removals:
 ### Phase 4: Add Scaffolds
 
 - add scaffold generation to CLI and TUI
-- add the first playbook scaffold
-- generate `playbook_plan.md` and `playbook_build.md` together
+- add the first default scaffold
+- generate `0_plan.md` and `1_build.md` together
 - keep scaffolds as initialization only, never as controller semantics
 
 ### Phase 5: Remove Legacy Concepts
@@ -371,11 +384,11 @@ Adopt a minimal harness with one recognized token:
 
 `<iteration-promise:done>`
 
-Use `SLUG_*.md` as the prompt discovery convention.
+Use target-local `.md` files as the prompt discovery convention.
 
 Do not introduce runtime templates. Add setup-time scaffolds only.
 
 The first structured scaffold should generate these two prompts together:
 
-- `playbook_plan.md`
-- `playbook_build.md`
+- `0_plan.md`
+- `1_build.md`
