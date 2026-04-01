@@ -21,6 +21,14 @@ struct ParsedPrompt {
     watched_files: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedPromptRun {
+    prompt_path: Utf8PathBuf,
+    prompt_name: String,
+    target_dir: Utf8PathBuf,
+    parsed_prompt: ParsedPrompt,
+}
+
 #[derive(Debug, Clone)]
 pub enum RunEvent {
     IterationStarted {
@@ -140,6 +148,10 @@ where
         self.open_in_editor(&prompt.path)
     }
 
+    pub fn edit_prompt_file(&self, prompt_path: &Utf8Path) -> Result<()> {
+        self.open_in_editor(prompt_path)
+    }
+
     pub async fn run_target<D>(
         &self,
         target: &str,
@@ -150,6 +162,18 @@ where
         D: RunDelegate,
     {
         self.run_target_with_control(target, prompt_name, RunControl::new(), delegate)
+            .await
+    }
+
+    pub async fn run_prompt_file<D>(
+        &self,
+        prompt_path: &Utf8Path,
+        delegate: &mut D,
+    ) -> Result<LastRunStatus>
+    where
+        D: RunDelegate,
+    {
+        self.run_prompt_file_with_control(prompt_path, RunControl::new(), delegate)
             .await
     }
 
@@ -165,96 +189,163 @@ where
     {
         let target_summary = self.store.load_target(target)?;
         let prompt = self.select_prompt(&target_summary, prompt_name)?;
-        let raw_prompt = self.store.read_file(&prompt.path)?;
-        let interpolated_prompt = interpolate_prompt_env(
-            &raw_prompt,
-            &self.project_dir,
-            &target_summary.dir,
-            &prompt.path,
-            &prompt.name,
-        )?;
-        let parsed_prompt = parse_prompt_directives(&interpolated_prompt);
+        let prepared = self.prepare_prompt_run(&prompt.path, &target_summary.dir)?;
         let max_iterations = self
             .store
             .read_target_config(target)?
             .max_iterations
             .unwrap_or(self.config.max_iterations);
+        let status = self
+            .run_prepared_prompt(
+                &prepared,
+                max_iterations,
+                &control,
+                delegate,
+                &format!("Run complete for {}", target_summary.id),
+                &format!("Reached max iterations for {}", target_summary.id),
+            )
+            .await
+            .inspect_err(|_| {
+                let status = if control.is_cancelled() {
+                    LastRunStatus::Canceled
+                } else {
+                    LastRunStatus::Failed
+                };
+                let _ = self
+                    .store
+                    .set_last_run(target, &prepared.prompt_name, status);
+            })?;
+
+        self.store
+            .set_last_run(target, &prepared.prompt_name, status)?;
+        self.store.load_target(target)
+    }
+
+    pub async fn run_prompt_file_with_control<D>(
+        &self,
+        prompt_path: &Utf8Path,
+        control: RunControl,
+        delegate: &mut D,
+    ) -> Result<LastRunStatus>
+    where
+        D: RunDelegate,
+    {
+        let target_dir = prompt_path.parent().ok_or_else(|| {
+            anyhow!("prompt path '{prompt_path}' must have a parent directory for TARGET_DIR")
+        })?;
+        let prepared = self.prepare_prompt_run(prompt_path, target_dir)?;
+        self.run_prepared_prompt(
+            &prepared,
+            self.config.max_iterations,
+            &control,
+            delegate,
+            &format!("Run complete for {}", prompt_path),
+            &format!("Reached max iterations for {}", prompt_path),
+        )
+        .await
+    }
+
+    fn prepare_prompt_run(
+        &self,
+        prompt_path: &Utf8Path,
+        target_dir: &Utf8Path,
+    ) -> Result<PreparedPromptRun> {
+        let prompt_name = prompt_path
+            .file_name()
+            .ok_or_else(|| anyhow!("prompt path '{prompt_path}' has no file name"))?
+            .to_owned();
+        let raw_prompt = self
+            .store
+            .read_file(prompt_path)
+            .with_context(|| format!("failed to read prompt file {prompt_path}"))?;
+        let interpolated_prompt = interpolate_prompt_env(
+            &raw_prompt,
+            &self.project_dir,
+            target_dir,
+            prompt_path,
+            &prompt_name,
+        )?;
+        Ok(PreparedPromptRun {
+            prompt_path: prompt_path.to_path_buf(),
+            prompt_name,
+            target_dir: target_dir.to_path_buf(),
+            parsed_prompt: parse_prompt_directives(&interpolated_prompt),
+        })
+    }
+
+    async fn run_prepared_prompt<D>(
+        &self,
+        prepared: &PreparedPromptRun,
+        max_iterations: usize,
+        control: &RunControl,
+        delegate: &mut D,
+        completed_summary: &str,
+        max_iterations_summary: &str,
+    ) -> Result<LastRunStatus>
+    where
+        D: RunDelegate,
+    {
         if max_iterations == 0 {
             return Err(anyhow!("max_iterations must be greater than zero"));
         }
 
         for iteration in 1..=max_iterations {
-            let watched_before = self.read_watched_files(&parsed_prompt.watched_files)?;
+            let watched_before = self.read_watched_files(&prepared.parsed_prompt.watched_files)?;
 
             if control.is_cancelled() {
-                self.store
-                    .set_last_run(target, &prompt.name, LastRunStatus::Canceled)?;
                 return Err(anyhow!("operation canceled"));
             }
 
             delegate
                 .on_event(RunEvent::IterationStarted {
-                    prompt_name: prompt.name.clone(),
+                    prompt_name: prepared.prompt_name.clone(),
                     iteration,
                     max_iterations,
                 })
                 .await?;
 
-            let config = self.runner_config_for(&control);
+            let config = self.runner_config_for(control);
             let result = self
                 .execute_runner(
                     &config,
                     RunnerInvocation {
-                        prompt_text: parsed_prompt.prompt_text.clone(),
+                        prompt_text: prepared.parsed_prompt.prompt_text.clone(),
                         project_dir: self.project_dir.clone(),
-                        target_dir: target_summary.dir.clone(),
-                        prompt_path: prompt.path.clone(),
-                        prompt_name: prompt.name.clone(),
+                        target_dir: prepared.target_dir.clone(),
+                        prompt_path: prepared.prompt_path.clone(),
+                        prompt_name: prepared.prompt_name.clone(),
                     },
-                    &control,
+                    control,
                     delegate,
                 )
-                .await
-                .inspect_err(|_| {
-                    let _ = self
-                        .store
-                        .set_last_run(target, &prompt.name, LastRunStatus::Failed);
-                })?;
+                .await?;
 
             if result.exit_code != 0 {
-                self.store
-                    .set_last_run(target, &prompt.name, LastRunStatus::Failed)?;
                 let message = format!("runner exited with code {}", result.exit_code);
                 delegate.on_event(RunEvent::Note(message.clone())).await?;
                 return Err(anyhow!(message));
             }
 
-            if !parsed_prompt.watched_files.is_empty()
-                && watched_before == self.read_watched_files(&parsed_prompt.watched_files)?
+            if !prepared.parsed_prompt.watched_files.is_empty()
+                && watched_before == self.read_watched_files(&prepared.parsed_prompt.watched_files)?
             {
-                self.store
-                    .set_last_run(target, &prompt.name, LastRunStatus::Completed)?;
-                let summary = self.store.load_target(target)?;
                 delegate
                     .on_event(RunEvent::Finished {
                         status: LastRunStatus::Completed,
-                        summary: format!("Run complete for {}", summary.id),
+                        summary: completed_summary.to_owned(),
                     })
                     .await?;
-                return Ok(summary);
+                return Ok(LastRunStatus::Completed);
             }
         }
 
-        self.store
-            .set_last_run(target, &prompt.name, LastRunStatus::MaxIterations)?;
-        let summary = self.store.load_target(target)?;
         delegate
             .on_event(RunEvent::Finished {
                 status: LastRunStatus::MaxIterations,
-                summary: format!("Reached max iterations for {}", summary.id),
+                summary: max_iterations_summary.to_owned(),
             })
             .await?;
-        Ok(summary)
+        Ok(LastRunStatus::MaxIterations)
     }
 
     fn read_watched_files(&self, watched_files: &[String]) -> Result<Vec<Option<String>>> {
