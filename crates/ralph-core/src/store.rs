@@ -1,4 +1,7 @@
-use std::fs;
+use std::{
+    fs,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -17,6 +20,28 @@ pub struct TargetStore {
 }
 
 impl TargetStore {
+    fn fallback_target_config(&self, target_id: &str) -> TargetConfig {
+        TargetConfig {
+            id: target_id.to_owned(),
+            scaffold: None,
+            created_at: None,
+            max_iterations: None,
+            last_prompt: None,
+            last_run_status: LastRunStatus::NeverRun,
+        }
+    }
+
+    fn new_target_config(&self, target_id: &str, scaffold: Option<ScaffoldId>) -> TargetConfig {
+        TargetConfig {
+            id: target_id.to_owned(),
+            scaffold,
+            created_at: Some(current_unix_timestamp()),
+            max_iterations: None,
+            last_prompt: None,
+            last_run_status: LastRunStatus::NeverRun,
+        }
+    }
+
     pub fn new(project_dir: impl Into<Utf8PathBuf>) -> Self {
         Self {
             project_dir: project_dir.into(),
@@ -92,26 +117,20 @@ impl TargetStore {
         fs::create_dir_all(&paths.dir)
             .with_context(|| format!("failed to create target directory {}", paths.dir))?;
 
-        let config = TargetConfig {
-            id: target_id.to_owned(),
-            scaffold,
-            max_iterations: None,
-            last_prompt: None,
-            last_run_status: LastRunStatus::NeverRun,
-        };
+        let config = self.new_target_config(target_id, scaffold);
         self.write_target_config(&config)?;
 
-        match scaffold.unwrap_or(ScaffoldId::Playbook) {
+        match scaffold.unwrap_or(ScaffoldId::Default) {
+            ScaffoldId::Default => {
+                self.write_target_file(target_id, "0_plan.md", &default_plan_prompt())?;
+                self.write_target_file(target_id, "1_build.md", &default_build_prompt())?;
+            }
             ScaffoldId::Blank => {
                 self.write_target_file(
                     target_id,
                     "prompt_main.md",
-                    "# Prompt\n\nDescribe the work for this target.\n",
+                    &blank_prompt(target_id),
                 )?;
-            }
-            ScaffoldId::Playbook => {
-                self.write_target_file(target_id, "playbook_plan.md", &playbook_plan_prompt())?;
-                self.write_target_file(target_id, "playbook_build.md", &playbook_build_prompt())?;
             }
         }
 
@@ -149,6 +168,7 @@ impl TargetStore {
             prompt_files,
             files,
             scaffold: config.scaffold,
+            created_at: config.created_at,
             last_prompt: config.last_prompt,
             last_run_status: config.last_run_status,
         })
@@ -187,16 +207,32 @@ impl TargetStore {
                 summaries.push(self.load_target(target_id)?);
             }
         }
-        summaries.sort_by(|left, right| left.id.cmp(&right.id));
+        summaries.sort_by(|left, right| {
+            right
+                .created_at
+                .unwrap_or(0)
+                .cmp(&left.created_at.unwrap_or(0))
+                .then_with(|| left.id.cmp(&right.id))
+        });
         Ok(summaries)
     }
 
     pub fn read_target_config(&self, target_id: &str) -> Result<TargetConfig> {
         let paths = self.target_paths(target_id)?;
-        let raw = fs::read_to_string(&paths.config_path)
-            .with_context(|| format!("failed to read target config {}", paths.config_path))?;
-        toml::from_str(&raw)
-            .with_context(|| format!("failed to parse target config {}", paths.config_path))
+        let raw = match fs::read_to_string(&paths.config_path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(self.fallback_target_config(target_id));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read target config {}", paths.config_path));
+            }
+        };
+        let mut config: TargetConfig =
+            toml::from_str(&raw).unwrap_or_else(|_| self.fallback_target_config(target_id));
+        config.id = target_id.to_owned();
+        Ok(config)
     }
 
     pub fn write_target_config(&self, config: &TargetConfig) -> Result<()> {
@@ -286,24 +322,20 @@ impl TargetStore {
 }
 
 pub fn is_prompt_file_name(name: &str) -> bool {
-    if !name.ends_with(".md") || name.starts_with('.') {
-        return false;
-    }
-    let Some(stem) = name.strip_suffix(".md") else {
-        return false;
-    };
-    let Some((slug, rest)) = stem.split_once('_') else {
-        return false;
-    };
-    !slug.is_empty()
-        && !rest.is_empty()
-        && stem
-            .chars()
-            .all(|ch| matches!(ch, 'a'..='z' | '0'..='9' | '_' | '-'))
+    name.ends_with(".md")
 }
 
-fn playbook_plan_prompt() -> String {
-    r#"0a. Study `specs/*`.
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn default_plan_prompt() -> String {
+    r#"<<ralph-watch:IMPLEMENTATION_PLAN.md>>
+
+0a. Study `specs/*`.
 0b. Study `IMPLEMENTATION_PLAN.md` if present in the repository root.
 0c. Study `src/lib/*` if present to learn shared utilities and components.
 0d. Study the existing source code before deciding something is missing.
@@ -323,8 +355,10 @@ Consider missing elements and plan accordingly. If an element is missing, search
     .to_owned()
 }
 
-fn playbook_build_prompt() -> String {
-    r#"0a. Study `specs/*`.
+fn default_build_prompt() -> String {
+    r#"<<ralph-watch:IMPLEMENTATION_PLAN.md>>
+
+0a. Study `specs/*`.
 0b. Study `IMPLEMENTATION_PLAN.md` if present in the repository root.
 0c. Study the existing source code before deciding something is missing.
 1. Choose the highest-priority open item from `IMPLEMENTATION_PLAN.md`.
@@ -337,28 +371,36 @@ fn playbook_build_prompt() -> String {
     .to_owned()
 }
 
+fn blank_prompt(target_id: &str) -> String {
+    let _ = target_id;
+    "# Requests (not sorted by priority)\n- A\n- B\n- C\n\n# Execution policy\n1. Read {ralph-env:TARGET_DIR}/progress.txt.\n2. Execute the single most high leverage item in \"Requests\".\n3. Update your progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item\n4. Stop\n\n<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>\n"
+        .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{TargetStore, is_prompt_file_name};
     use crate::{LastRunStatus, ScaffoldId};
 
     #[test]
-    fn prompt_file_discovery_ignores_uppercase_docs() {
-        assert!(is_prompt_file_name("playbook_plan.md"));
-        assert!(is_prompt_file_name("prompt_main.md"));
-        assert!(!is_prompt_file_name("IMPLEMENTATION_PLAN.md"));
-        assert!(!is_prompt_file_name("AGENTS.md"));
+    fn prompt_file_discovery_accepts_any_target_local_md_file() {
+        assert!(is_prompt_file_name("0_plan.md"));
+        assert!(is_prompt_file_name("notes.md"));
+        assert!(is_prompt_file_name("review.md"));
+        assert!(is_prompt_file_name(".notes.md"));
+        assert!(!is_prompt_file_name("README.MD"));
+        assert!(!is_prompt_file_name("target.toml"));
     }
 
     #[test]
-    fn playbook_scaffold_creates_both_prompts() {
+    fn default_scaffold_creates_both_prompts() {
         let temp = tempfile::tempdir().unwrap();
         let store = TargetStore::new(
             camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
         );
 
         let summary = store
-            .create_target("demo", Some(ScaffoldId::Playbook))
+            .create_target("demo", Some(ScaffoldId::Default))
             .unwrap();
         let prompt_names = summary
             .prompt_files
@@ -366,7 +408,7 @@ mod tests {
             .map(|prompt| prompt.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(prompt_names, vec!["playbook_build.md", "playbook_plan.md"]);
+        assert_eq!(prompt_names, vec!["0_plan.md", "1_build.md"]);
         assert!(
             !summary
                 .files
@@ -376,10 +418,10 @@ mod tests {
         assert_eq!(summary.last_run_status, LastRunStatus::NeverRun);
 
         let plan_prompt = store
-            .read_named_target_file("demo", "playbook_plan.md")
+            .read_named_target_file("demo", "0_plan.md")
             .unwrap();
         let build_prompt = store
-            .read_named_target_file("demo", "playbook_build.md")
+            .read_named_target_file("demo", "1_build.md")
             .unwrap();
         assert!(
             plan_prompt.contains("ULTIMATE GOAL - We want to achieve:\n[project-specific goal].")
@@ -389,7 +431,7 @@ mod tests {
     }
 
     #[test]
-    fn create_target_defaults_to_playbook_scaffold() {
+    fn create_target_defaults_to_default_scaffold() {
         let temp = tempfile::tempdir().unwrap();
         let store = TargetStore::new(
             camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
@@ -402,6 +444,87 @@ mod tests {
             .map(|prompt| prompt.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(prompt_names, vec!["playbook_build.md", "playbook_plan.md"]);
+        assert_eq!(prompt_names, vec!["0_plan.md", "1_build.md"]);
+        assert!(summary.created_at.is_some());
+    }
+
+    #[test]
+    fn target_directories_are_discovered_even_without_valid_target_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let store = TargetStore::new(project_dir.clone());
+        let target_dir = project_dir.join(".ralph/targets/awesome-feat-X");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("notes.md"), "# Notes\n").unwrap();
+        std::fs::write(target_dir.join("target.toml"), "scaffold = \"playbook\"\n").unwrap();
+
+        let targets = store.list_targets().unwrap();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, "awesome-feat-X");
+        assert_eq!(targets[0].created_at, None);
+        assert_eq!(
+            targets[0]
+                .prompt_files
+                .iter()
+                .map(|prompt| prompt.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes.md"]
+        );
+    }
+
+    #[test]
+    fn newer_targets_sort_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let store = TargetStore::new(project_dir.clone());
+        let old_dir = project_dir.join(".ralph/targets/older");
+        let new_dir = project_dir.join(".ralph/targets/newer");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        std::fs::write(old_dir.join("prompt.md"), "# Old\n").unwrap();
+        std::fs::write(new_dir.join("prompt.md"), "# New\n").unwrap();
+        std::fs::write(
+            old_dir.join("target.toml"),
+            "id = \"older\"\ncreated_at = 10\nlast_run_status = \"never_run\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            new_dir.join("target.toml"),
+            "id = \"newer\"\ncreated_at = 20\nlast_run_status = \"never_run\"\n",
+        )
+        .unwrap();
+
+        let targets = store.list_targets().unwrap();
+
+        assert_eq!(
+            targets.iter().map(|target| target.id.as_str()).collect::<Vec<_>>(),
+            vec!["newer", "older"]
+        );
+    }
+
+    #[test]
+    fn blank_scaffold_uses_target_specific_progress_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TargetStore::new(
+            camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
+        );
+
+        store.create_target("demo", Some(ScaffoldId::Blank)).unwrap();
+        let prompt = store
+            .read_named_target_file("demo", "prompt_main.md")
+            .unwrap();
+
+        assert!(prompt.contains("<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>"));
+        assert!(prompt.contains("# Requests (not sorted by priority)"));
+        assert!(
+            prompt.contains("1. Read {ralph-env:TARGET_DIR}/progress.txt.")
+        );
+        assert!(
+            prompt.contains(
+                "3. Update your progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item"
+            )
+        );
+        assert!(prompt.contains("4. Stop"));
     }
 }
