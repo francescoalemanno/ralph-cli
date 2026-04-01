@@ -26,7 +26,6 @@ struct PreparedPromptRun {
     prompt_path: Utf8PathBuf,
     prompt_name: String,
     target_dir: Utf8PathBuf,
-    parsed_prompt: ParsedPrompt,
 }
 
 #[derive(Debug, Clone)]
@@ -254,23 +253,28 @@ where
             .file_name()
             .ok_or_else(|| anyhow!("prompt path '{prompt_path}' has no file name"))?
             .to_owned();
-        let raw_prompt = self
-            .store
-            .read_file(prompt_path)
-            .with_context(|| format!("failed to read prompt file {prompt_path}"))?;
-        let interpolated_prompt = interpolate_prompt_env(
-            &raw_prompt,
-            &self.project_dir,
-            target_dir,
-            prompt_path,
-            &prompt_name,
-        )?;
-        Ok(PreparedPromptRun {
+        let prepared = PreparedPromptRun {
             prompt_path: prompt_path.to_path_buf(),
             prompt_name,
             target_dir: target_dir.to_path_buf(),
-            parsed_prompt: parse_prompt_directives(&interpolated_prompt),
-        })
+        };
+        self.parse_prompt_run(&prepared)?;
+        Ok(prepared)
+    }
+
+    fn parse_prompt_run(&self, prepared: &PreparedPromptRun) -> Result<ParsedPrompt> {
+        let raw_prompt = self
+            .store
+            .read_file(&prepared.prompt_path)
+            .with_context(|| format!("failed to read prompt file {}", prepared.prompt_path))?;
+        let interpolated_prompt = interpolate_prompt_env(
+            &raw_prompt,
+            &self.project_dir,
+            &prepared.target_dir,
+            &prepared.prompt_path,
+            &prepared.prompt_name,
+        )?;
+        Ok(parse_prompt_directives(&interpolated_prompt))
     }
 
     async fn run_prepared_prompt<D>(
@@ -290,7 +294,8 @@ where
         }
 
         for iteration in 1..=max_iterations {
-            let watched_before = self.read_watched_files(&prepared.parsed_prompt.watched_files)?;
+            let parsed_prompt = self.parse_prompt_run(prepared)?;
+            let watched_before = self.read_watched_files(&parsed_prompt.watched_files)?;
 
             if control.is_cancelled() {
                 return Err(anyhow!("operation canceled"));
@@ -309,7 +314,7 @@ where
                 .execute_runner(
                     &config,
                     RunnerInvocation {
-                        prompt_text: prepared.parsed_prompt.prompt_text.clone(),
+                        prompt_text: parsed_prompt.prompt_text.clone(),
                         project_dir: self.project_dir.clone(),
                         target_dir: prepared.target_dir.clone(),
                         prompt_path: prepared.prompt_path.clone(),
@@ -326,8 +331,8 @@ where
                 return Err(anyhow!(message));
             }
 
-            if !prepared.parsed_prompt.watched_files.is_empty()
-                && watched_before == self.read_watched_files(&prepared.parsed_prompt.watched_files)?
+            if !parsed_prompt.watched_files.is_empty()
+                && watched_before == self.read_watched_files(&parsed_prompt.watched_files)?
             {
                 delegate
                     .on_event(RunEvent::Finished {
@@ -576,8 +581,9 @@ fn absolute_unix_path(path: &Utf8Path) -> Result<String> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        let cwd = Utf8PathBuf::from_path_buf(std::env::current_dir().context("failed to read cwd")?)
-            .map_err(|_| anyhow!("current directory is not valid UTF-8"))?;
+        let cwd =
+            Utf8PathBuf::from_path_buf(std::env::current_dir().context("failed to read cwd")?)
+                .map_err(|_| anyhow!("current directory is not valid UTF-8"))?;
         cwd.join(path)
     };
     Ok(absolute.as_str().replace('\\', "/"))
@@ -624,10 +630,14 @@ impl RunDelegate for ConsoleDelegate {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use anyhow::Result;
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
-    use ralph_core::{AppConfig, CodingAgent, RunControl, RunnerInvocation, RunnerResult, ScaffoldId};
+    use ralph_core::{
+        AppConfig, CodingAgent, RunControl, RunnerInvocation, RunnerResult, ScaffoldId,
+    };
     use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
     use tokio::sync::mpsc::UnboundedSender;
 
@@ -640,6 +650,11 @@ mod tests {
     struct ScriptedRunner {
         output: String,
         exit_code: i32,
+    }
+
+    #[derive(Clone)]
+    struct SteeringRunner {
+        seen_prompts: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -657,6 +672,32 @@ mod tests {
             Ok(RunnerResult {
                 output: self.output.clone(),
                 exit_code: self.exit_code,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RunnerAdapter for SteeringRunner {
+        async fn run(
+            &self,
+            _config: &ralph_core::RunnerConfig,
+            invocation: RunnerInvocation,
+            _control: &RunControl,
+            _stream: Option<UnboundedSender<RunnerStreamEvent>>,
+        ) -> Result<RunnerResult> {
+            let iteration = {
+                let mut seen = self.seen_prompts.lock().unwrap();
+                seen.push(invocation.prompt_text.clone());
+                seen.len()
+            };
+
+            if iteration == 1 {
+                std::fs::write(&invocation.prompt_path, "# Prompt\n\nSecond version\n").unwrap();
+            }
+
+            Ok(RunnerResult {
+                output: String::new(),
+                exit_code: 0,
             })
         }
     }
@@ -730,6 +771,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn prompt_edits_are_reloaded_between_iterations() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let seen_prompts = Arc::new(Mutex::new(Vec::new()));
+        let mut config = AppConfig::default();
+        config.max_iterations = 2;
+        let app = RalphApp::new(
+            project_dir.clone(),
+            config,
+            SteeringRunner {
+                seen_prompts: seen_prompts.clone(),
+            },
+        );
+        app.create_target("demo", Some(ScaffoldId::Blank)).unwrap();
+        std::fs::write(
+            project_dir.join(".ralph/targets/demo/prompt_main.md"),
+            "# Prompt\n\nFirst version\n",
+        )
+        .unwrap();
+
+        let mut delegate = TestDelegate;
+        let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
+
+        assert_eq!(
+            summary.last_run_status,
+            ralph_core::LastRunStatus::MaxIterations
+        );
+        assert_eq!(
+            *seen_prompts.lock().unwrap(),
+            vec![
+                "# Prompt\nFirst version".to_owned(),
+                "# Prompt\nSecond version".to_owned()
+            ]
+        );
+    }
+
     #[test]
     fn prompt_directives_are_trimmed_before_runner_input() {
         let parsed = parse_prompt_directives(
@@ -766,11 +844,17 @@ mod tests {
     #[test]
     fn agent_resolution_falls_back_to_first_detected_agent() {
         assert_eq!(
-            resolve_available_agent(CodingAgent::Codex, &[CodingAgent::Opencode, CodingAgent::Raijin]),
+            resolve_available_agent(
+                CodingAgent::Codex,
+                &[CodingAgent::Opencode, CodingAgent::Raijin]
+            ),
             CodingAgent::Opencode
         );
         assert_eq!(
-            resolve_available_agent(CodingAgent::Codex, &[CodingAgent::Codex, CodingAgent::Opencode]),
+            resolve_available_agent(
+                CodingAgent::Codex,
+                &[CodingAgent::Codex, CodingAgent::Opencode]
+            ),
             CodingAgent::Codex
         );
         assert_eq!(
