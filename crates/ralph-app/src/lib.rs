@@ -1,5 +1,3 @@
-use std::{env, process::Command};
-
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -140,15 +138,6 @@ where
 
     pub fn delete_target(&self, target: &str) -> Result<()> {
         self.store.delete_target(target)
-    }
-
-    pub fn edit_prompt(&self, target: &str, prompt_name: Option<&str>) -> Result<()> {
-        let prompt = self.resolve_prompt(target, prompt_name)?;
-        self.open_in_editor(&prompt.path)
-    }
-
-    pub fn edit_prompt_file(&self, prompt_path: &Utf8Path) -> Result<()> {
-        self.open_in_editor(prompt_path)
     }
 
     pub async fn run_target<D>(
@@ -490,25 +479,6 @@ where
             }
         }
     }
-
-    fn open_in_editor(&self, path: &Utf8Path) -> Result<()> {
-        let editor = self
-            .config
-            .editor_override
-            .clone()
-            .or_else(|| env::var("VISUAL").ok())
-            .or_else(|| env::var("EDITOR").ok())
-            .unwrap_or_else(|| "vi".to_owned());
-
-        let status = Command::new(&editor)
-            .arg(path.as_std_path())
-            .status()
-            .with_context(|| format!("failed to open editor {editor}"))?;
-        if !status.success() {
-            return Err(anyhow!("editor exited with status {}", status));
-        }
-        Ok(())
-    }
 }
 
 async fn forward_stream_event<D>(delegate: &mut D, event: RunnerStreamEvent) -> Result<()>
@@ -725,7 +695,8 @@ mod tests {
                 exit_code: 0,
             },
         );
-        app.create_target("demo", Some(ScaffoldId::Blank)).unwrap();
+        app.create_target("demo", Some(ScaffoldId::SinglePrompt))
+            .unwrap();
         std::fs::write(
             project_dir.join(".ralph/targets/demo/prompt_main.md"),
             "<<ralph-watch:IMPLEMENTATION_PLAN.md>>\n\n# Prompt\n",
@@ -742,7 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blank_targets_still_run_to_max_iterations_without_plan_change_stop() {
+    async fn single_prompt_targets_still_run_to_max_iterations_without_plan_change_stop() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let mut config = AppConfig::default();
@@ -755,7 +726,8 @@ mod tests {
                 exit_code: 0,
             },
         );
-        app.create_target("demo", Some(ScaffoldId::Blank)).unwrap();
+        app.create_target("demo", Some(ScaffoldId::SinglePrompt))
+            .unwrap();
         std::fs::write(
             project_dir.join(".ralph/targets/demo/prompt_main.md"),
             "# Prompt\n\nNo watch directives here.\n",
@@ -785,7 +757,8 @@ mod tests {
                 seen_prompts: seen_prompts.clone(),
             },
         );
-        app.create_target("demo", Some(ScaffoldId::Blank)).unwrap();
+        app.create_target("demo", Some(ScaffoldId::SinglePrompt))
+            .unwrap();
         std::fs::write(
             project_dir.join(".ralph/targets/demo/prompt_main.md"),
             "# Prompt\n\nFirst version\n",

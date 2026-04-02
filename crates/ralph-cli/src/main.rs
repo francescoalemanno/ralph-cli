@@ -1,4 +1,4 @@
-use std::{env, fs, path::Path, process::ExitCode};
+use std::{env, fs, process::ExitCode};
 
 use anyhow::{Context, Result, anyhow};
 use camino::Utf8PathBuf;
@@ -8,7 +8,7 @@ use ralph_core::{
     AppConfig, CodingAgent, ConfigFileScope, ScaffoldId, TargetReview, TargetSummary,
     bare_prompt_template,
 };
-use ralph_tui::{run_tui, run_tui_scoped};
+use ralph_tui::{edit_file, run_tui, run_tui_scoped};
 use serde::Serialize;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -49,15 +49,15 @@ enum OutputArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ScaffoldArg {
-    Default,
-    Blank,
+    SinglePrompt,
+    PlanBuild,
 }
 
 impl From<ScaffoldArg> for ScaffoldId {
     fn from(value: ScaffoldArg) -> Self {
         match value {
-            ScaffoldArg::Default => ScaffoldId::Default,
-            ScaffoldArg::Blank => ScaffoldId::Blank,
+            ScaffoldArg::SinglePrompt => ScaffoldId::SinglePrompt,
+            ScaffoldArg::PlanBuild => ScaffoldId::PlanBuild,
         }
     }
 }
@@ -135,7 +135,7 @@ enum Commands {
 struct NewArgs {
     #[arg(value_name = "TARGET")]
     target: Option<String>,
-    #[arg(long, value_enum, default_value_t = ScaffoldArg::Default)]
+    #[arg(long, value_enum, default_value_t = ScaffoldArg::SinglePrompt)]
     scaffold: ScaffoldArg,
     #[arg(long, action = clap::ArgAction::SetTrue)]
     edit: bool,
@@ -288,10 +288,11 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
                     if args.edit {
                         let prompt = match args.prompt.as_deref() {
                             Some(name) => Some(name),
-                            None if args.scaffold == ScaffoldArg::Default => Some("0_plan.md"),
+                            None if args.scaffold == ScaffoldArg::PlanBuild => Some("0_plan.md"),
                             None => None,
                         };
-                        app.edit_prompt(target, prompt)?;
+                        let prompt_path = app.resolve_prompt(target, prompt)?.path;
+                        edit_file(&prompt_path)?;
                     }
                     print_summary(output, &summary)
                 }
@@ -299,7 +300,7 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
                     let scaffold: ScaffoldId = args.scaffold.into();
                     create_bare_prompt_file(&prompt_path, scaffold)?;
                     if args.edit {
-                        app.edit_prompt_file(&prompt_path)?;
+                        edit_file(&prompt_path)?;
                     }
                     print_prompt_file_row(
                         output,
@@ -358,8 +359,11 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
         Commands::Edit(args) => {
             let app = RalphApp::load(project_dir)?;
             match resolve_target_mode(args.target.as_deref(), args.prompt.as_deref())? {
-                TargetMode::Target(target) => app.edit_prompt(target, args.prompt.as_deref()),
-                TargetMode::BarePrompt(prompt_path) => app.edit_prompt_file(&prompt_path),
+                TargetMode::Target(target) => {
+                    let prompt_path = app.resolve_prompt(target, args.prompt.as_deref())?.path;
+                    edit_file(&prompt_path)
+                }
+                TargetMode::BarePrompt(prompt_path) => edit_file(&prompt_path),
             }
         }
         Commands::Agent(command) => run_agent_command(project_dir, output, command),
@@ -493,19 +497,8 @@ fn run_init(project_dir: Utf8PathBuf, args: InitArgs) -> Result<()> {
 fn run_doctor(project_dir: Utf8PathBuf) -> Result<()> {
     AppConfig::validate_scoped_config(&project_dir, ConfigFileScope::User)?;
     AppConfig::validate_scoped_config(&project_dir, ConfigFileScope::Project)?;
-    let app = RalphApp::load(project_dir.clone())?;
     fs::create_dir_all(project_dir.join(".ralph"))
         .with_context(|| format!("failed to write under {}", project_dir))?;
-
-    let editor = app
-        .config()
-        .editor_override
-        .clone()
-        .or_else(|| env::var("VISUAL").ok())
-        .or_else(|| env::var("EDITOR").ok())
-        .unwrap_or_else(|| "vi".to_owned());
-
-    resolve_command(&editor).with_context(|| format!("editor command '{editor}' was not found"))?;
 
     let detected = CodingAgent::detected();
     if detected.is_empty() {
@@ -683,31 +676,6 @@ fn resolve_project_dir(project_dir: Option<Utf8PathBuf>) -> Result<Utf8PathBuf> 
         None => Utf8PathBuf::from_path_buf(env::current_dir().context("failed to read cwd")?)
             .map_err(|_| anyhow!("current directory is not valid UTF-8")),
     }
-}
-
-fn resolve_command(command: &str) -> Result<()> {
-    if command.contains(std::path::MAIN_SEPARATOR) || command.contains('/') {
-        let path = Path::new(command);
-        if path.is_file() {
-            return Ok(());
-        }
-        return Err(anyhow!("command path does not exist"));
-    }
-
-    let path = env::var_os("PATH").ok_or_else(|| anyhow!("PATH is not set"))?;
-    for directory in env::split_paths(&path) {
-        if directory.join(command).is_file() {
-            return Ok(());
-        }
-        if cfg!(windows) {
-            for ext in [".exe", ".cmd", ".bat"] {
-                if directory.join(format!("{command}{ext}")).is_file() {
-                    return Ok(());
-                }
-            }
-        }
-    }
-    Err(anyhow!("command not found on PATH"))
 }
 
 fn init_tracing() {
