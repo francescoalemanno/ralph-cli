@@ -120,13 +120,13 @@ impl TargetStore {
         let config = self.new_target_config(target_id, scaffold);
         self.write_target_config(&config)?;
 
-        match scaffold.unwrap_or(ScaffoldId::Default) {
-            ScaffoldId::Default => {
-                self.write_target_file(target_id, "0_plan.md", &default_plan_prompt())?;
-                self.write_target_file(target_id, "1_build.md", &default_build_prompt())?;
+        match scaffold.unwrap_or(ScaffoldId::SinglePrompt) {
+            ScaffoldId::PlanBuild => {
+                self.write_target_file(target_id, "0_plan.md", &plan_build_plan_prompt())?;
+                self.write_target_file(target_id, "1_build.md", &plan_build_build_prompt())?;
             }
-            ScaffoldId::Blank => {
-                self.write_target_file(target_id, "prompt_main.md", &blank_prompt())?;
+            ScaffoldId::SinglePrompt => {
+                self.write_target_file(target_id, "prompt_main.md", &single_prompt_template())?;
             }
         }
 
@@ -324,8 +324,8 @@ pub fn is_prompt_file_name(name: &str) -> bool {
 
 pub fn bare_prompt_template(scaffold: ScaffoldId) -> String {
     match scaffold {
-        ScaffoldId::Default => default_plan_prompt(),
-        ScaffoldId::Blank => blank_prompt(),
+        ScaffoldId::PlanBuild => plan_build_plan_prompt(),
+        ScaffoldId::SinglePrompt => single_prompt_template(),
     }
 }
 
@@ -336,7 +336,7 @@ fn current_unix_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
-fn default_plan_prompt() -> String {
+fn plan_build_plan_prompt() -> String {
     r#"0a. Study `specs/*`.
 0b. Study `IMPLEMENTATION_PLAN.md` if present in the repository root.
 0c. Study the codebase areas that appear to hold shared utilities, core modules, or reusable components.
@@ -359,7 +359,7 @@ Consider missing elements and plan accordingly. If an element is missing, search
     .to_owned()
 }
 
-fn default_build_prompt() -> String {
+fn plan_build_build_prompt() -> String {
     r#"0a. Study `specs/*`.
 0b. Study `IMPLEMENTATION_PLAN.md` if present in the repository root.
 0c. Study the existing source code before deciding something is missing.
@@ -375,7 +375,7 @@ fn default_build_prompt() -> String {
     .to_owned()
 }
 
-fn blank_prompt() -> String {
+fn single_prompt_template() -> String {
     "# Requests (not sorted by priority)\n- A\n- B\n- C\n\n# Execution policy\n1. Read {ralph-env:TARGET_DIR}/progress.txt.\n2. Execute the single most high leverage item in \"Requests\".\n3. If an item was executed, update progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item; else if no item was left to execute, do not change progress.\n4. Stop\n\n<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>\n"
         .to_owned()
 }
@@ -396,14 +396,14 @@ mod tests {
     }
 
     #[test]
-    fn default_scaffold_creates_both_prompts() {
+    fn plan_build_scaffold_creates_both_prompts() {
         let temp = tempfile::tempdir().unwrap();
         let store = TargetStore::new(
             camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
         );
 
         let summary = store
-            .create_target("demo", Some(ScaffoldId::Default))
+            .create_target("demo", Some(ScaffoldId::PlanBuild))
             .unwrap();
         let prompt_names = summary
             .prompt_files
@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn create_target_defaults_to_default_scaffold() {
+    fn create_target_defaults_to_single_prompt_scaffold() {
         let temp = tempfile::tempdir().unwrap();
         let store = TargetStore::new(
             camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
@@ -443,7 +443,7 @@ mod tests {
             .map(|prompt| prompt.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(prompt_names, vec!["0_plan.md", "1_build.md"]);
+        assert_eq!(prompt_names, vec!["prompt_main.md"]);
         assert!(summary.created_at.is_some());
     }
 
@@ -506,14 +506,14 @@ mod tests {
     }
 
     #[test]
-    fn blank_scaffold_uses_target_specific_progress_path() {
+    fn single_prompt_scaffold_uses_target_specific_progress_path() {
         let temp = tempfile::tempdir().unwrap();
         let store = TargetStore::new(
             camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
         );
 
         store
-            .create_target("demo", Some(ScaffoldId::Blank))
+            .create_target("demo", Some(ScaffoldId::SinglePrompt))
             .unwrap();
         let prompt = store
             .read_named_target_file("demo", "prompt_main.md")

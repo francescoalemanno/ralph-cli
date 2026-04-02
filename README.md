@@ -116,7 +116,7 @@ Typical flow:
 
 1. Open the TUI.
 2. Press `N` to create a new target.
-3. Pick the default or blank scaffold.
+3. Pick the `single-prompt` or `plan-build` scaffold.
 4. Press `R` to run the selected prompt.
 5. Press `E` to edit a prompt.
 6. Press `A` to cycle and persist the coding agent.
@@ -135,7 +135,7 @@ The current CLI model is:
 ralph
 ralph <target>
 
-ralph new <target> [--scaffold default|blank] [--edit] [--prompt <file>]
+ralph new <target> [--scaffold single-prompt|plan-build] [--edit] [--prompt <file>]
 ralph run <target> [--prompt <file>]
 ralph ls
 ralph show <target> [--file <name>]
@@ -187,18 +187,18 @@ Targets are sorted newest-first using `created_at` when available.
 
 Ralph currently ships two initialization scaffolds.
 
-Default scaffold:
+Plan-build scaffold:
 
 - `0_plan.md`
 - `1_build.md`
 
 These prompts watch `IMPLEMENTATION_PLAN.md` through prompt-local watch directives.
 
-Blank scaffold:
+Single-prompt scaffold:
 
 - `prompt_main.md`
 
-The blank prompt template uses runtime interpolation:
+The single-prompt template uses runtime interpolation:
 
 ```md
 # Requests (not sorted by priority)

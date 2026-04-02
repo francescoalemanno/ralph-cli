@@ -35,15 +35,15 @@ impl LastRunStatus {
 #[serde(rename_all = "snake_case")]
 pub enum ScaffoldId {
     #[default]
-    Default,
-    Blank,
+    SinglePrompt,
+    PlanBuild,
 }
 
 impl ScaffoldId {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Default => "default",
-            Self::Blank => "blank",
+            Self::SinglePrompt => "single_prompt",
+            Self::PlanBuild => "plan_build",
         }
     }
 }
@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn status_and_scaffold_have_stable_labels() {
         assert_eq!(LastRunStatus::Completed.label(), "completed");
-        assert_eq!(ScaffoldId::Default.as_str(), "default");
-        assert_eq!(ScaffoldId::Blank.as_str(), "blank");
+        assert_eq!(ScaffoldId::SinglePrompt.as_str(), "single_prompt");
+        assert_eq!(ScaffoldId::PlanBuild.as_str(), "plan_build");
     }
 }
