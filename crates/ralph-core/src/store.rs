@@ -337,32 +337,30 @@ fn current_unix_timestamp() -> u64 {
 }
 
 fn default_plan_prompt() -> String {
-    r#"<<ralph-watch:IMPLEMENTATION_PLAN.md>>
-
-0a. Study `specs/*`.
+    r#"0a. Study `specs/*`.
 0b. Study `IMPLEMENTATION_PLAN.md` if present in the repository root.
-0c. Study `src/lib/*` if present to learn shared utilities and components.
+0c. Study the codebase areas that appear to hold shared utilities, core modules, or reusable components.
 0d. Study the existing source code before deciding something is missing.
 
 1. Identify missing, incomplete, inconsistent, or unverified work by comparing `specs/*`, `IMPLEMENTATION_PLAN.md`, and the existing source code.
 2. Update `IMPLEMENTATION_PLAN.md` in the repository root as a prioritized bullet list of remaining work.
 3. If specifications are missing or inconsistent, update `specs/*` conservatively and reflect the resulting work in `IMPLEMENTATION_PLAN.md`.
 4. Plan only. Do not implement anything.
-5. Treat `src/lib` as the project's shared library and prefer shared, consolidated solutions over ad hoc duplication.
+5. Prefer shared, consolidated solutions in the codebase over ad hoc duplication.
 6. If `IMPLEMENTATION_PLAN.md` is already up to date and sufficient for the next build loop, leave it unchanged.
 
 ULTIMATE GOAL - We want to achieve:
 [project-specific goal].
 
 Consider missing elements and plan accordingly. If an element is missing, search first to confirm it does not already exist, then, if needed, author the specification at `specs/FILENAME.md`.
+
+<<ralph-watch:IMPLEMENTATION_PLAN.md>>
 "#
     .to_owned()
 }
 
 fn default_build_prompt() -> String {
-    r#"<<ralph-watch:IMPLEMENTATION_PLAN.md>>
-
-0a. Study `specs/*`.
+    r#"0a. Study `specs/*`.
 0b. Study `IMPLEMENTATION_PLAN.md` if present in the repository root.
 0c. Study the existing source code before deciding something is missing.
 1. Choose the highest-priority open item from `IMPLEMENTATION_PLAN.md`.
@@ -371,12 +369,14 @@ fn default_build_prompt() -> String {
 4. Update `IMPLEMENTATION_PLAN.md` in the repository root with completed work and new findings.
 5. Update `AGENTS.md` only when you learn durable operational guidance about running or debugging the project.
 6. If you find no work left to do in `IMPLEMENTATION_PLAN.md` and/or `specs/*`, leave `IMPLEMENTATION_PLAN.md` unchanged.
+
+<<ralph-watch:IMPLEMENTATION_PLAN.md>>
 "#
     .to_owned()
 }
 
 fn blank_prompt() -> String {
-    "# Requests (not sorted by priority)\n- A\n- B\n- C\n\n# Execution policy\n1. Read {ralph-env:TARGET_DIR}/progress.txt.\n2. Execute the single most high leverage item in \"Requests\".\n3. Update your progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item\n4. Stop\n\n<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>\n"
+    "# Requests (not sorted by priority)\n- A\n- B\n- C\n\n# Execution policy\n1. Read {ralph-env:TARGET_DIR}/progress.txt.\n2. Execute the single most high leverage item in \"Requests\".\n3. If an item was executed, update progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item; else if no item was left to execute, do not change progress.\n4. Stop\n\n<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>\n"
         .to_owned()
 }
 
@@ -524,7 +524,7 @@ mod tests {
         assert!(prompt.contains("1. Read {ralph-env:TARGET_DIR}/progress.txt."));
         assert!(
             prompt.contains(
-                "3. Update your progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item"
+                "3. If an item was executed, update progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item; else if no item was left to execute, do not change progress."
             )
         );
         assert!(prompt.contains("4. Stop"));
