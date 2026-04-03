@@ -195,7 +195,7 @@ where
 
         Ok(criteria.iter().zip(before.iter().zip(after.iter())).all(
             |(criterion, (before, after))| match criterion {
-                CompletionCriterion::Watch { .. } => before == after,
+                CompletionCriterion::Watch { .. } => after.is_some() && before == after,
                 CompletionCriterion::NoLineContainsAll { tokens, .. } => {
                     after.as_deref().is_some_and(|contents| {
                         !contents.lines().any(|line| {
@@ -453,6 +453,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_watched_files_do_not_count_as_unchanged_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let config = AppConfig {
+            max_iterations: 1,
+            ..Default::default()
+        };
+        let app = RalphApp::new(
+            project_dir.clone(),
+            config,
+            ScriptedRunner {
+                output: "left progress.txt missing".to_owned(),
+                exit_code: 0,
+            },
+        );
+        app.create_target("demo", Some(ScaffoldId::SinglePrompt))
+            .unwrap();
+
+        let mut delegate = TestDelegate;
+        let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
+
+        assert_eq!(
+            summary.last_run_status,
+            ralph_core::LastRunStatus::MaxIterations
+        );
+        assert!(
+            !project_dir
+                .join(".ralph/targets/demo/progress.txt")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
     async fn prompt_edits_are_reloaded_between_iterations() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
@@ -616,6 +649,11 @@ mod tests {
         );
         app.create_target("demo", Some(ScaffoldId::SinglePrompt))
             .unwrap();
+        std::fs::write(
+            project_dir.join(".ralph/targets/demo/progress.txt"),
+            "steady\n",
+        )
+        .unwrap();
 
         let mut delegate = TestDelegate;
         let control = RunControl::new();
