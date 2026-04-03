@@ -5,7 +5,7 @@ use camino::Utf8PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ralph_app::{ConsoleDelegate, RalphApp};
 use ralph_core::{
-    AppConfig, CodingAgent, ConfigFileScope, ScaffoldId, TargetReview, TargetSummary,
+    AppConfig, CodingAgent, ConfigFileScope, ScaffoldId, TargetReview, TargetSummary, atomic_write,
     bare_prompt_template,
 };
 use ralph_tui::{edit_file, run_tui, run_tui_scoped};
@@ -496,11 +496,7 @@ fn run_init(project_dir: Utf8PathBuf, args: InitArgs) -> Result<()> {
         config.max_iterations = max_iterations;
     }
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config parent for {path}"))?;
-    }
-    fs::write(&path, toml::to_string_pretty(&config)?)
+    atomic_write(&path, toml::to_string_pretty(&config)?)
         .with_context(|| format!("failed to write config at {path}"))?;
     println!("{path}");
     Ok(())
@@ -675,10 +671,7 @@ fn create_bare_prompt_file(path: &camino::Utf8Path, scaffold: ScaffoldId) -> Res
     if path.exists() {
         return Err(anyhow!("prompt file already exists at {}", path));
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent))?;
-    }
-    fs::write(path, bare_prompt_template(scaffold))
+    atomic_write(path, bare_prompt_template(scaffold))
         .with_context(|| format!("failed to write prompt file {}", path))
 }
 

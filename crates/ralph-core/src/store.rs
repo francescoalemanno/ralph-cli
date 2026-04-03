@@ -5,11 +5,11 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
-use tempfile::NamedTempFile;
 
 use crate::{
     GoalDrivenWorkflowState, LastRunStatus, PromptFile, ScaffoldId, TargetConfig, TargetFile,
-    TargetFileContents, TargetPaths, TargetReview, TargetSummary, WorkflowMode, generate_slug,
+    TargetFileContents, TargetPaths, TargetReview, TargetSummary, WorkflowMode, atomic_write,
+    generate_slug,
 };
 
 pub const ARTIFACT_DIR_NAME: &str = ".ralph";
@@ -260,21 +260,8 @@ impl TargetStore {
 
     pub fn write_target_config(&self, config: &TargetConfig) -> Result<()> {
         let paths = self.target_paths(&config.id)?;
-        if let Some(parent) = paths.config_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create target parent {}", parent))?;
-        }
         let raw = toml::to_string_pretty(config).context("failed to serialize target config")?;
-        let parent = paths
-            .config_path
-            .parent()
-            .ok_or_else(|| anyhow!("target config has no parent: {}", paths.config_path))?;
-        let temp = NamedTempFile::new_in(parent)
-            .with_context(|| format!("failed to create temp file for {}", paths.config_path))?;
-        fs::write(temp.path(), raw)
-            .with_context(|| format!("failed to stage target config {}", paths.config_path))?;
-        temp.persist(&paths.config_path)
-            .map_err(|error| anyhow!(error.error))
+        atomic_write(&paths.config_path, raw)
             .with_context(|| format!("failed to write target config {}", paths.config_path))?;
         Ok(())
     }
@@ -347,11 +334,7 @@ impl TargetStore {
     }
 
     fn write_file(&self, path: &Utf8Path, contents: &str) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create parent directory for {path}"))?;
-        }
-        fs::write(path, contents).with_context(|| format!("failed to write {path}"))
+        atomic_write(path, contents).with_context(|| format!("failed to write {path}"))
     }
 }
 

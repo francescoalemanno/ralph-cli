@@ -5,7 +5,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 
-use crate::store::ARTIFACT_DIR_NAME;
+use crate::{atomic_write, store::ARTIFACT_DIR_NAME};
 
 const PROJECT_CONFIG_FILE_NAME: &str = "config.toml";
 
@@ -392,12 +392,8 @@ fn read_partial_config(path: &Utf8Path) -> Result<PartialAppConfig> {
 }
 
 fn write_config(path: &Utf8Path, config: &AppConfig) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config parent for {path}"))?;
-    }
     let raw = toml::to_string_pretty(config).context("failed to serialize config")?;
-    fs::write(path, raw).with_context(|| format!("failed to write config at {path}"))
+    atomic_write(path, raw).with_context(|| format!("failed to write config at {path}"))
 }
 
 fn project_config_path(project_dir: &Utf8Path) -> Utf8PathBuf {

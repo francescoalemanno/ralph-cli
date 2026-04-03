@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     env, io,
-    io::{BufRead, Write},
+    io::BufRead,
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
     time::Duration,
@@ -22,7 +22,7 @@ use crossterm::{
     },
 };
 use ralph_app::{RalphApp, RunDelegate, RunEvent};
-use ralph_core::{LastRunStatus, RunControl, ScaffoldId, TargetSummary};
+use ralph_core::{LastRunStatus, RunControl, ScaffoldId, TargetSummary, atomic_write};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -1510,22 +1510,10 @@ impl<'a> PromptEditor<'a> {
     }
 
     fn save(&mut self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create editor parent {}", parent.display()))?;
-        }
-        let mut file = io::BufWriter::new(
-            std::fs::File::create(&self.path)
-                .with_context(|| format!("failed to create {}", self.path.display()))?,
-        );
-        for line in self.textarea.lines() {
-            file.write_all(line.as_bytes())
-                .with_context(|| format!("failed to write {}", self.path.display()))?;
-            file.write_all(b"\n")
-                .with_context(|| format!("failed to write {}", self.path.display()))?;
-        }
-        file.flush()
-            .with_context(|| format!("failed to flush {}", self.path.display()))?;
+        let mut contents = self.textarea.lines().join("\n");
+        contents.push('\n');
+        atomic_write(&self.path, contents)
+            .with_context(|| format!("failed to save {}", self.path.display()))?;
         self.modified = false;
         Ok(())
     }

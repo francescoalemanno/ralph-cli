@@ -1,8 +1,10 @@
+mod atomic;
 mod config;
 mod slug;
 mod store;
 mod types;
 
+pub use atomic::atomic_write;
 pub use config::{
     AppConfig, CliColorMode, CliConfig, CliOutputMode, CliPagerMode, CliPromptInputMode,
     CodingAgent, ConfigFileScope, PromptTransport, RunnerConfig, ThemeConfig,
