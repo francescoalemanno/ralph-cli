@@ -380,6 +380,14 @@ Package the CLI locally:
 cargo package -p ralph-cli --allow-dirty --no-verify
 ```
 
+Create and push a release cleanly:
+
+```bash
+scripts/release.sh patch
+```
+
+The script requires a clean `main` branch, bumps the workspace version, syncs internal crate dependency versions, refreshes `Cargo.lock`, runs the standard Rust checks, creates the release commit and `vX.Y.Z` tag, and pushes both to `origin`. You can also pass `minor`, `major`, or an explicit version such as `scripts/release.sh 0.2.0`.
+
 ## Current Status
 
 Ralph is a local durable loop tool centered on target folders, markdown prompts, prompt-local NDJSON directives, and pluggable terminal coding agents.
