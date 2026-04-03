@@ -1,11 +1,11 @@
-use std::{collections::BTreeMap, env, ffi::OsStr, fs, path::Path};
+use std::{collections::BTreeMap, fs};
 
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 
-use crate::store::ARTIFACT_DIR_NAME;
+use crate::{CodingAgent, PromptTransport, RunnerConfig, atomic_write, store::ARTIFACT_DIR_NAME};
 
 const PROJECT_CONFIG_FILE_NAME: &str = "config.toml";
 
@@ -49,118 +49,6 @@ pub enum CliPromptInputMode {
 pub enum ConfigFileScope {
     User,
     Project,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PromptTransport {
-    #[default]
-    Stdin,
-    EnvVar,
-    TempFile,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CodingAgent {
-    #[default]
-    Opencode,
-    Codex,
-    Raijin,
-}
-
-impl CodingAgent {
-    pub fn detected() -> Vec<Self> {
-        let path = env::var_os("PATH");
-        let pathext = env::var_os("PATHEXT");
-        detect_agents_in_path(path.as_deref(), pathext.as_deref())
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Opencode => "OpenCode",
-            Self::Codex => "Codex",
-            Self::Raijin => "Raijin",
-        }
-    }
-
-    pub fn default_program(self) -> &'static str {
-        match self {
-            Self::Opencode => "opencode",
-            Self::Codex => "codex",
-            Self::Raijin => "raijin",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunnerConfig {
-    pub program: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: BTreeMap<String, String>,
-    #[serde(default)]
-    pub prompt_transport: PromptTransport,
-    #[serde(default = "default_prompt_env_var")]
-    pub prompt_env_var: String,
-    #[serde(default)]
-    pub shell_template: Option<String>,
-}
-
-impl Default for RunnerConfig {
-    fn default() -> Self {
-        Self::for_agent(CodingAgent::default())
-    }
-}
-
-impl RunnerConfig {
-    pub fn for_agent(agent: CodingAgent) -> Self {
-        match agent {
-            CodingAgent::Opencode => Self {
-                program: "opencode".to_owned(),
-                args: vec![
-                    "run".to_owned(),
-                    "--format".to_owned(),
-                    "default".to_owned(),
-                    "--thinking".to_owned(),
-                ],
-                env: BTreeMap::new(),
-                prompt_transport: PromptTransport::Stdin,
-                prompt_env_var: default_prompt_env_var(),
-                shell_template: None,
-            },
-            CodingAgent::Codex => Self {
-                program: "codex".to_owned(),
-                args: vec![
-                    "exec".to_owned(),
-                    "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-                    "--ephemeral".to_owned(),
-                ],
-                env: BTreeMap::new(),
-                prompt_transport: PromptTransport::Stdin,
-                prompt_env_var: default_prompt_env_var(),
-                shell_template: None,
-            },
-            CodingAgent::Raijin => Self {
-                program: "raijin".to_owned(),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                prompt_transport: PromptTransport::EnvVar,
-                prompt_env_var: default_prompt_env_var(),
-                shell_template: Some(r#"raijin -ephemeral "$PROMPT""#.to_owned()),
-            },
-        }
-    }
-
-    pub fn inferred_agent(&self) -> Option<CodingAgent> {
-        match normalized_program_name(&self.program).as_deref() {
-            Some("opencode") => Some(CodingAgent::Opencode),
-            Some("codex") => Some(CodingAgent::Codex),
-            Some("raijin") => Some(CodingAgent::Raijin),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,11 +144,13 @@ impl AppConfig {
     }
 
     pub fn set_coding_agent(&mut self, agent: CodingAgent) {
-        self.runner = RunnerConfig::for_agent(agent);
+        self.runner = self.runner.with_agent_preserving_env(agent);
     }
 
     pub fn select_detected_coding_agent(&mut self, detected: &[CodingAgent]) -> bool {
-        let current = self.coding_agent();
+        let Some(current) = self.runner.inferred_agent() else {
+            return false;
+        };
         if detected.is_empty() || detected.contains(&current) {
             return false;
         }
@@ -392,12 +282,8 @@ fn read_partial_config(path: &Utf8Path) -> Result<PartialAppConfig> {
 }
 
 fn write_config(path: &Utf8Path, config: &AppConfig) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config parent for {path}"))?;
-    }
     let raw = toml::to_string_pretty(config).context("failed to serialize config")?;
-    fs::write(path, raw).with_context(|| format!("failed to write config at {path}"))
+    atomic_write(path, raw).with_context(|| format!("failed to write config at {path}"))
 }
 
 fn project_config_path(project_dir: &Utf8Path) -> Utf8PathBuf {
@@ -437,7 +323,7 @@ fn merge_config(mut base: AppConfig, partial: PartialAppConfig) -> AppConfig {
         base.max_iterations = max_iterations;
     }
     if let Some(editor_override) = partial.editor_override {
-        base.editor_override = Some(editor_override);
+        base.editor_override = normalize_optional_string(editor_override);
     }
     if let Some(theme) = partial.theme {
         if let Some(value) = theme.accent_color {
@@ -484,65 +370,17 @@ fn merge_runner(mut runner: RunnerConfig, partial: PartialRunnerConfig) -> Runne
         runner.prompt_env_var = prompt_env_var;
     }
     if let Some(shell_template) = partial.shell_template {
-        runner.shell_template = Some(shell_template);
+        runner.shell_template = normalize_optional_string(shell_template);
     }
     runner
 }
 
-fn detect_agents_in_path(path: Option<&OsStr>, pathext: Option<&OsStr>) -> Vec<CodingAgent> {
-    CodingAgent::all()
-        .into_iter()
-        .filter(|agent| program_is_on_path(agent.default_program(), path, pathext))
-        .collect()
-}
-
-impl CodingAgent {
-    fn all() -> [Self; 3] {
-        [Self::Opencode, Self::Codex, Self::Raijin]
-    }
-}
-
-fn program_is_on_path(program: &str, path: Option<&OsStr>, pathext: Option<&OsStr>) -> bool {
-    let Some(path) = path else {
-        return false;
-    };
-    let extensions = executable_extensions(pathext);
-    env::split_paths(path).any(|dir| {
-        if extensions.is_empty() {
-            dir.join(program).is_file()
-        } else {
-            extensions
-                .iter()
-                .any(|extension| dir.join(format!("{program}{extension}")).is_file())
-        }
-    })
-}
-
-fn executable_extensions(pathext: Option<&OsStr>) -> Vec<String> {
-    if cfg!(windows) {
-        pathext
-            .and_then(|value| value.to_str())
-            .map(|value| {
-                value
-                    .split(';')
-                    .filter(|part| !part.is_empty())
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| vec![".exe".to_owned(), ".cmd".to_owned(), ".bat".to_owned()])
+fn normalize_optional_string(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
     } else {
-        Vec::new()
+        Some(value)
     }
-}
-
-fn normalized_program_name(program: &str) -> Option<String> {
-    let file_name = Path::new(program).file_name()?.to_string_lossy();
-    Some(file_name.trim_end_matches(".exe").to_ascii_lowercase())
-}
-
-fn default_prompt_env_var() -> String {
-    "PROMPT".to_owned()
 }
 
 fn default_max_iterations() -> usize {
@@ -564,37 +402,15 @@ fn default_warning_color() -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
 
-    use super::{AppConfig, CodingAgent, PromptTransport, RunnerConfig, merge_runner};
+    use camino::Utf8PathBuf;
 
-    #[test]
-    fn agent_presets_preserve_commands() {
-        let opencode = RunnerConfig::for_agent(CodingAgent::Opencode);
-        assert_eq!(opencode.program, "opencode");
-        assert_eq!(
-            opencode.args,
-            vec!["run", "--format", "default", "--thinking"]
-        );
-
-        let codex = RunnerConfig::for_agent(CodingAgent::Codex);
-        assert_eq!(codex.program, "codex");
-        assert_eq!(
-            codex.args,
-            vec![
-                "exec",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--ephemeral"
-            ]
-        );
-
-        let raijin = RunnerConfig::for_agent(CodingAgent::Raijin);
-        assert_eq!(raijin.program, "raijin");
-        assert_eq!(raijin.prompt_transport, PromptTransport::EnvVar);
-        assert_eq!(
-            raijin.shell_template.as_deref(),
-            Some(r#"raijin -ephemeral "$PROMPT""#)
-        );
-    }
+    use super::{
+        AppConfig, ConfigFileScope, PartialAppConfig, PartialRunnerConfig, merge_config,
+        merge_runner,
+    };
+    use crate::{CodingAgent, PromptTransport, RunnerConfig};
 
     #[test]
     fn app_config_switches_runner_agent() {
@@ -604,14 +420,173 @@ mod tests {
     }
 
     #[test]
+    fn switching_agent_preserves_runner_env_overrides() {
+        let mut config = AppConfig {
+            runner: RunnerConfig {
+                env: BTreeMap::from([
+                    ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
+                    ("RUST_LOG".to_owned(), "debug".to_owned()),
+                ]),
+                ..RunnerConfig::for_agent(CodingAgent::Opencode)
+            },
+            ..Default::default()
+        };
+
+        config.set_coding_agent(CodingAgent::Codex);
+
+        assert_eq!(config.runner.program, "codex");
+        assert_eq!(
+            config.runner.args,
+            vec![
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--ephemeral"
+            ]
+        );
+        assert_eq!(
+            config.runner.env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("test-key")
+        );
+        assert_eq!(
+            config.runner.env.get("RUST_LOG").map(String::as_str),
+            Some("debug")
+        );
+    }
+
+    #[test]
+    fn detected_agent_fallback_still_switches_known_built_in_runner() {
+        let mut config = AppConfig::default();
+        assert!(config.select_detected_coding_agent(&[CodingAgent::Codex]));
+        assert_eq!(config.runner.program, "codex");
+    }
+
+    #[test]
+    fn detected_agent_fallback_preserves_unknown_custom_runner() {
+        let mut config = AppConfig {
+            runner: RunnerConfig {
+                program: "custom-runner".to_owned(),
+                args: vec!["--json".to_owned()],
+                env: BTreeMap::from([("CUSTOM_ENV".to_owned(), "1".to_owned())]),
+                prompt_transport: PromptTransport::TempFile,
+                prompt_env_var: "CUSTOM_PROMPT".to_owned(),
+                shell_template: Some("custom-runner {prompt_file}".to_owned()),
+            },
+            ..Default::default()
+        };
+
+        assert!(!config.select_detected_coding_agent(&[CodingAgent::Codex]));
+        assert_eq!(config.runner.program, "custom-runner");
+        assert_eq!(config.runner.args, vec!["--json"]);
+        assert_eq!(
+            config.runner.env.get("CUSTOM_ENV").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(config.runner.prompt_transport, PromptTransport::TempFile);
+        assert_eq!(config.runner.prompt_env_var, "CUSTOM_PROMPT");
+        assert_eq!(
+            config.runner.shell_template.as_deref(),
+            Some("custom-runner {prompt_file}")
+        );
+    }
+
+    #[test]
     fn merge_runner_overrides_selected_fields() {
         let merged = merge_runner(
             RunnerConfig::default(),
-            super::PartialRunnerConfig {
+            PartialRunnerConfig {
                 env: Some(BTreeMap::from([("A".to_owned(), "B".to_owned())])),
                 ..Default::default()
             },
         );
         assert_eq!(merged.env.get("A").map(String::as_str), Some("B"));
+    }
+
+    #[test]
+    fn persisted_agent_switch_keeps_project_runner_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let config_dir = project_dir.join(".ralph");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"[runner]
+program = "opencode"
+args = ["run"]
+
+[runner.env]
+OPENAI_API_KEY = "test-key"
+RUST_LOG = "debug"
+"#,
+        )
+        .unwrap();
+
+        AppConfig::persist_scoped_coding_agent(
+            &project_dir,
+            ConfigFileScope::Project,
+            CodingAgent::Codex,
+        )
+        .unwrap();
+
+        let config = AppConfig::load(&project_dir).unwrap();
+        assert_eq!(config.runner.program, "codex");
+        assert_eq!(
+            config.runner.env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("test-key")
+        );
+        assert_eq!(
+            config.runner.env.get("RUST_LOG").map(String::as_str),
+            Some("debug")
+        );
+    }
+
+    #[test]
+    fn blank_project_editor_override_clears_inherited_user_value() {
+        let merged = merge_config(
+            AppConfig {
+                editor_override: Some("nvim".to_owned()),
+                ..Default::default()
+            },
+            PartialAppConfig {
+                editor_override: Some("   ".to_owned()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(merged.editor_override, None);
+    }
+
+    #[test]
+    fn blank_project_shell_template_clears_inherited_user_value() {
+        let merged = merge_runner(
+            RunnerConfig {
+                program: "custom-runner".to_owned(),
+                args: vec!["--json".to_owned()],
+                env: BTreeMap::new(),
+                prompt_transport: PromptTransport::TempFile,
+                prompt_env_var: "PROMPT".to_owned(),
+                shell_template: Some("custom-runner {prompt_file}".to_owned()),
+            },
+            PartialRunnerConfig {
+                program: Some("codex".to_owned()),
+                args: Some(vec![
+                    "exec".to_owned(),
+                    "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+                    "--ephemeral".to_owned(),
+                ]),
+                shell_template: Some("".to_owned()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(merged.program, "codex");
+        assert_eq!(
+            merged.args,
+            vec![
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--ephemeral"
+            ]
+        );
+        assert_eq!(merged.shell_template, None);
     }
 }

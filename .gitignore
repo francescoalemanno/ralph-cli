@@ -18,3 +18,5 @@ Thumbs.db
 # Debug files
 *.pdb
 /ralph/*
+
+/.ralph/*

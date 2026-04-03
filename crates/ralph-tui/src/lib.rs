@@ -1,73 +1,61 @@
+mod editor;
+mod ui;
+mod view;
+
 use std::{
-    borrow::Cow,
-    env, io,
-    io::{BufRead, Write},
-    path::PathBuf,
+    io,
     sync::mpsc::{self, Receiver, Sender},
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use camino::Utf8Path;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent,
         KeyEventKind, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{
-        Clear as TerminalClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
-        disable_raw_mode, enable_raw_mode,
-    },
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+pub use editor::edit_file;
 use ralph_app::{RalphApp, RunDelegate, RunEvent};
-use ralph_core::{LastRunStatus, RunControl, ScaffoldId, TargetSummary};
-use ratatui::{
-    Frame, Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap,
-    },
-};
+use ralph_core::{RunControl, ScaffoldId, TargetReview, TargetSummary};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::runtime::Handle;
-use tui_textarea::{Input, Key, TextArea};
+use ui::{ColorMode, detect_color_mode, process_terminal_text, resume_terminal, suspend_terminal};
 
 pub fn run_tui(app: RalphApp) -> Result<()> {
-    let handle = Handle::current();
-    enable_raw_mode().context("failed to enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("failed to enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("failed to create terminal backend")?;
-
-    let result = TuiApp::new(app, handle, None).run(&mut terminal);
-
-    disable_raw_mode().ok();
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .ok();
-    terminal.show_cursor().ok();
-    result
+    run_tui_with_target(app, None)
 }
 
 pub fn run_tui_scoped(app: RalphApp, target: &str) -> Result<()> {
-    let handle = Handle::current();
-    enable_raw_mode().context("failed to enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("failed to enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("failed to create terminal backend")?;
+    run_tui_with_target(app, Some(target.to_owned()))
+}
 
-    let result = TuiApp::new(app, handle, Some(target.to_owned())).run(&mut terminal);
+fn run_tui_with_target(app: RalphApp, target: Option<String>) -> Result<()> {
+    let handle = Handle::current();
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::new(backend).context("failed to create terminal backend")?;
+    enable_raw_mode().context("failed to enable raw mode")?;
+    if let Err(error) = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )
+    .context("failed to enter alternate screen")
+    {
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )
+        .ok();
+        disable_raw_mode().ok();
+        return Err(error);
+    }
+
+    let result = TuiApp::new(app, handle, target).run(&mut terminal);
 
     disable_raw_mode().ok();
     execute!(
@@ -78,11 +66,6 @@ pub fn run_tui_scoped(app: RalphApp, target: &str) -> Result<()> {
     .ok();
     terminal.show_cursor().ok();
     result
-}
-
-pub fn edit_file(path: &Utf8Path) -> Result<()> {
-    PromptEditor::new(path.as_std_path().to_path_buf())?.run()?;
-    Ok(())
 }
 
 enum UiEvent {
@@ -95,12 +78,6 @@ enum Screen {
     Dashboard,
     NewTarget,
     Running,
-}
-
-#[derive(Clone, Copy)]
-enum ColorMode {
-    Light,
-    Dark,
 }
 
 struct RunningState {
@@ -116,27 +93,13 @@ struct RunningState {
     follow: bool,
 }
 
-#[derive(Clone, Copy)]
-enum ShortcutTone {
-    Accent,
-    Success,
-    Warning,
-    Neutral,
-}
-
-#[derive(Clone, Copy)]
-struct ShortcutHint {
-    key: &'static str,
-    label: &'static str,
-    tone: ShortcutTone,
-}
-
 struct TuiApp {
     app: RalphApp,
     handle: Handle,
     tx: Sender<UiEvent>,
     rx: Receiver<UiEvent>,
     targets: Vec<TargetSummary>,
+    selected_target_review: Option<TargetReview>,
     selected_target: usize,
     selected_prompt: usize,
     screen: Screen,
@@ -150,12 +113,8 @@ struct TuiApp {
 
 impl TuiApp {
     fn selected_target_uses_hidden_workflow(&self) -> bool {
-        self.selected_target().is_some_and(|target| {
-            matches!(
-                target.scaffold,
-                Some(ScaffoldId::TaskBased | ScaffoldId::GoalDriven)
-            )
-        })
+        self.selected_target()
+            .is_some_and(ralph_core::TargetSummary::uses_hidden_workflow)
     }
 
     fn new(app: RalphApp, handle: Handle, target: Option<String>) -> Self {
@@ -166,6 +125,7 @@ impl TuiApp {
             tx,
             rx,
             targets: Vec::new(),
+            selected_target_review: None,
             selected_target: 0,
             selected_prompt: 0,
             screen: Screen::Dashboard,
@@ -180,6 +140,7 @@ impl TuiApp {
         if let Some(target) = target {
             if let Some(index) = this.targets.iter().position(|summary| summary.id == target) {
                 this.selected_target = index;
+                this.refresh_selected_target_review();
             } else {
                 this.message = format!("target '{target}' was not found");
             }
@@ -258,11 +219,13 @@ impl TuiApp {
             KeyCode::Up => {
                 self.selected_target = self.selected_target.saturating_sub(1);
                 self.selected_prompt = 0;
+                self.refresh_selected_target_review();
             }
             KeyCode::Down => {
                 if self.selected_target + 1 < self.targets.len() {
                     self.selected_target += 1;
                     self.selected_prompt = 0;
+                    self.refresh_selected_target_review();
                 }
             }
             KeyCode::Left => {
@@ -282,16 +245,19 @@ impl TuiApp {
             }
             KeyCode::Char('r') => self.start_run()?,
             KeyCode::Char('e') => {
-                let Some(target) = self.selected_target() else {
-                    self.message = "select a target first".to_owned();
-                    return Ok(());
+                let prompt_path = match self.resolve_selected_edit_path() {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.message = error.to_string();
+                        return Ok(());
+                    }
                 };
-                let target_id = target.id.clone();
-                let prompt_path = self.app.resolve_target_edit_path(&target_id, None)?;
+                let editor = self.app.config().editor_override.clone();
                 suspend_terminal(terminal)?;
-                let result = edit_file(&prompt_path);
+                let result = edit_file(&prompt_path, editor.as_deref());
                 resume_terminal(terminal)?;
                 result?;
+                self.refresh_selected_target_review();
                 self.message = format!("opened {}", prompt_path.file_name().unwrap_or("file"));
             }
             KeyCode::Char('d') => {
@@ -344,6 +310,7 @@ impl TuiApp {
                 if let Some(index) = self.targets.iter().position(|item| item.id == summary.id) {
                     self.selected_target = index;
                     self.selected_prompt = 0;
+                    self.refresh_selected_target_review();
                 }
                 self.screen = Screen::Dashboard;
                 let opened_path =
@@ -356,10 +323,12 @@ impl TuiApp {
                             .map(|prompt| prompt.path.clone())
                     };
                 if let Some(opened_path) = opened_path {
+                    let editor = self.app.config().editor_override.clone();
                     suspend_terminal(terminal)?;
-                    let result = edit_file(&opened_path);
+                    let result = edit_file(&opened_path, editor.as_deref());
                     resume_terminal(terminal)?;
                     result?;
+                    self.refresh_selected_target_review();
                     self.message = format!(
                         "created {} and opened {}",
                         summary.id,
@@ -412,15 +381,13 @@ impl TuiApp {
                 self.cycle_agent(running_control)?;
             }
             KeyCode::Char('e') => {
-                let Some(running) = self.running.as_ref() else {
-                    return Ok(());
-                };
-                let target_id = running.target_id.clone();
-                let prompt_path = self.app.resolve_target_edit_path(&target_id, None)?;
+                let prompt_path = self.resolve_running_edit_path()?;
+                let editor = self.app.config().editor_override.clone();
                 suspend_terminal(terminal)?;
-                let result = edit_file(&prompt_path);
+                let result = edit_file(&prompt_path, editor.as_deref());
                 resume_terminal(terminal)?;
                 result?;
+                self.refresh_selected_target_review();
                 self.message = format!(
                     "opened {} for steering",
                     prompt_path.file_name().unwrap_or("file")
@@ -501,6 +468,7 @@ impl TuiApp {
                     if let Some(index) = self.targets.iter().position(|item| item.id == summary.id)
                     {
                         self.selected_target = index;
+                        self.refresh_selected_target_review();
                     }
                 }
                 Err(error) => {
@@ -514,632 +482,6 @@ impl TuiApp {
                 }
             },
         }
-    }
-
-    fn draw(&mut self, frame: &mut Frame<'_>) {
-        let has_notice = !self.message.trim().is_empty();
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(if has_notice { 3 } else { 0 }),
-                Constraint::Min(1),
-                Constraint::Length(2),
-            ])
-            .split(frame.area());
-
-        self.draw_header(frame, chunks[0]);
-
-        if has_notice {
-            self.draw_notice(frame, chunks[1]);
-        }
-        let content_area = chunks[2];
-        let footer_area = chunks[3];
-
-        match self.screen {
-            Screen::Dashboard => self.draw_dashboard(frame, content_area),
-            Screen::NewTarget => {
-                self.draw_dashboard(frame, content_area);
-                self.draw_new_target_modal(frame);
-            }
-            Screen::Running => self.draw_running(frame, content_area),
-        }
-
-        self.draw_footer(frame, footer_area);
-    }
-
-    fn draw_header(&self, frame: &mut Frame<'_>, area: Rect) {
-        let active_count = self
-            .targets
-            .iter()
-            .filter(|target| target.last_run_status != LastRunStatus::Completed)
-            .count();
-        let completed_count = self
-            .targets
-            .iter()
-            .filter(|target| target.last_run_status == LastRunStatus::Completed)
-            .count();
-
-        let header = Paragraph::new(Line::from(vec![
-            Span::styled(
-                " RALPH ",
-                Style::default()
-                    .fg(self.accent_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "◆",
-                Style::default()
-                    .fg(self.warning_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                " durable prompt loop ",
-                Style::default()
-                    .fg(self.text_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    "active {}  ◆  completed {}  ◆  agent {}  ◆  {}",
-                    active_count,
-                    completed_count,
-                    self.app.coding_agent().label(),
-                    self.app.project_dir()
-                ),
-                Style::default().fg(self.muted_color()),
-            ),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        );
-        frame.render_widget(header, area);
-    }
-
-    fn draw_notice(&self, frame: &mut Frame<'_>, area: Rect) {
-        let (label, fg, bg) = self.notice_palette();
-        let banner = Paragraph::new(Line::from(vec![
-            Span::styled(
-                label,
-                Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                &self.message,
-                Style::default()
-                    .fg(self.text_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        );
-        frame.render_widget(banner, area);
-    }
-
-    fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect) {
-        let footer = Paragraph::new(Line::from(self.footer_spans()))
-            .style(Style::default().fg(self.muted_color()))
-            .wrap(Wrap { trim: true });
-        frame.render_widget(footer, area);
-    }
-
-    fn footer_spans(&self) -> Vec<Span<'static>> {
-        match self.screen {
-            Screen::Dashboard => shortcut_spans(
-                &[
-                    ShortcutHint {
-                        key: "N",
-                        label: "new",
-                        tone: ShortcutTone::Accent,
-                    },
-                    ShortcutHint {
-                        key: "R",
-                        label: "run",
-                        tone: ShortcutTone::Success,
-                    },
-                    ShortcutHint {
-                        key: "E",
-                        label: "edit",
-                        tone: ShortcutTone::Accent,
-                    },
-                    ShortcutHint {
-                        key: "D",
-                        label: "delete",
-                        tone: ShortcutTone::Warning,
-                    },
-                    ShortcutHint {
-                        key: "A",
-                        label: "agent",
-                        tone: ShortcutTone::Accent,
-                    },
-                    ShortcutHint {
-                        key: "Arrows",
-                        label: "navigate",
-                        tone: ShortcutTone::Neutral,
-                    },
-                    ShortcutHint {
-                        key: "Q",
-                        label: "quit/cancel",
-                        tone: ShortcutTone::Warning,
-                    },
-                ],
-                self,
-            ),
-            Screen::NewTarget => shortcut_spans(
-                &[
-                    ShortcutHint {
-                        key: "Tab",
-                        label: "switch scaffold",
-                        tone: ShortcutTone::Accent,
-                    },
-                    ShortcutHint {
-                        key: "Enter",
-                        label: "create",
-                        tone: ShortcutTone::Success,
-                    },
-                    ShortcutHint {
-                        key: "Backspace",
-                        label: "erase",
-                        tone: ShortcutTone::Warning,
-                    },
-                    ShortcutHint {
-                        key: "Esc",
-                        label: "cancel",
-                        tone: ShortcutTone::Warning,
-                    },
-                ],
-                self,
-            ),
-            Screen::Running => shortcut_spans(&self.running_shortcuts(), self),
-        }
-    }
-
-    fn draw_dashboard(&self, frame: &mut Frame<'_>, area: Rect) {
-        let main = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-            .split(area);
-
-        self.draw_target_list(frame, main[0]);
-        self.draw_target_detail(frame, main[1]);
-    }
-
-    fn draw_target_list(&self, frame: &mut Frame<'_>, area: Rect) {
-        let items = if self.targets.is_empty() {
-            vec![ListItem::new(Line::from(vec![Span::styled(
-                "No targets yet. Press N to create one.",
-                Style::default().fg(self.muted_color()),
-            )]))]
-        } else {
-            self.targets
-                .iter()
-                .map(|target| {
-                    let prompt_count = target.prompt_files.len();
-                    let scaffold = target
-                        .scaffold
-                        .map(|value| value.as_str())
-                        .unwrap_or("none");
-                    let status = target.last_run_status;
-                    ListItem::new(Text::from(vec![
-                        Line::from(vec![
-                            Span::styled(
-                                format!(" {} ", status_badge(status)),
-                                status_style(
-                                    status,
-                                    self.accent_color(),
-                                    self.success_color(),
-                                    self.warning_color(),
-                                    self.muted_color(),
-                                )
-                                .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                format!(" {}", target.id),
-                                Style::default()
-                                    .fg(self.text_color())
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ]),
-                        Line::from(vec![
-                            Span::styled(
-                                format!(" status {} ", status_label(status)),
-                                Style::default().fg(self.muted_color()),
-                            ),
-                            Span::styled("◆", Style::default().fg(self.subtle_color())),
-                            Span::styled(
-                                format!(" prompts {} ", prompt_count),
-                                Style::default().fg(self.muted_color()),
-                            ),
-                            Span::styled("◆", Style::default().fg(self.subtle_color())),
-                            Span::styled(
-                                format!(" scaffold {}", scaffold),
-                                Style::default().fg(self.muted_color()),
-                            ),
-                        ]),
-                    ]))
-                })
-                .collect::<Vec<_>>()
-        };
-
-        let mut state = ListState::default();
-        if !self.targets.is_empty() {
-            state.select(Some(self.selected_target.min(self.targets.len() - 1)));
-        }
-
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .title(self.title_line("Targets", "Select a workspace"))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
-            .highlight_style(
-                Style::default()
-                    .bg(self.panel_highlight())
-                    .fg(self.text_color())
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("▌ ");
-        frame.render_stateful_widget(list, area, &mut state);
-    }
-
-    fn draw_target_detail(&self, frame: &mut Frame<'_>, area: Rect) {
-        let block = Block::default()
-            .title(self.title_line("Selected Target", "Prompt selection and durable files"))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded);
-
-        if let Some(target) = self.selected_target() {
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-
-            let sections = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(4),
-                    Constraint::Length(3),
-                    Constraint::Min(8),
-                    Constraint::Length(7),
-                ])
-                .split(inner);
-
-            let header = Paragraph::new(Text::from(vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!(" {} ", status_badge(target.last_run_status)),
-                        status_style(
-                            target.last_run_status,
-                            self.accent_color(),
-                            self.success_color(),
-                            self.warning_color(),
-                            self.muted_color(),
-                        )
-                        .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!(" {}", target.id),
-                        Style::default()
-                            .fg(self.text_color())
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(vec![Span::styled(
-                    format!(
-                        "scaffold {}  ◆  last_prompt {}",
-                        target
-                            .scaffold
-                            .map(|value| value.as_str())
-                            .unwrap_or("none"),
-                        target.last_prompt.as_deref().unwrap_or("<none>")
-                    ),
-                    Style::default().fg(self.muted_color()),
-                )]),
-                Line::from(vec![Span::styled(
-                    format!(
-                        "{} prompt files  ◆  {} total files",
-                        target.prompt_files.len(),
-                        target.files.len()
-                    ),
-                    Style::default().fg(self.muted_color()),
-                )]),
-            ]))
-            .block(
-                Block::default()
-                    .title(self.title_line("Overview", "Current target metadata"))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            );
-            frame.render_widget(header, sections[0]);
-
-            let uses_hidden_workflow = matches!(
-                target.scaffold,
-                Some(ScaffoldId::TaskBased | ScaffoldId::GoalDriven)
-            );
-            let titles = if uses_hidden_workflow {
-                vec![Line::from("workflow input")]
-            } else if target.prompt_files.is_empty() {
-                vec![Line::from("no prompts")]
-            } else {
-                target
-                    .prompt_files
-                    .iter()
-                    .map(|prompt| Line::from(prompt.name.clone()))
-                    .collect::<Vec<_>>()
-            };
-            let tabs = Tabs::new(titles)
-                .select(
-                    self.selected_prompt
-                        .min(target.prompt_files.len().saturating_sub(1)),
-                )
-                .block(
-                    Block::default()
-                        .title(self.title_line(
-                            "Prompts",
-                            if uses_hidden_workflow {
-                                "Workflow targets run internally"
-                            } else {
-                                "Choose which loop prompt to run"
-                            },
-                        ))
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded),
-                )
-                .highlight_style(
-                    Style::default()
-                        .fg(self.accent_color())
-                        .add_modifier(Modifier::BOLD),
-                )
-                .style(Style::default().fg(self.muted_color()))
-                .divider(" ◆ ");
-            frame.render_widget(tabs, sections[1]);
-
-            let prompt_preview = self
-                .app
-                .review_target(&target.id)
-                .ok()
-                .and_then(|review| {
-                    if uses_hidden_workflow {
-                        review
-                            .files
-                            .into_iter()
-                            .find(|file| file.name == "GOAL.md")
-                            .map(|file| file.contents)
-                    } else {
-                        self.selected_prompt().and_then(|prompt| {
-                            review
-                                .files
-                                .into_iter()
-                                .find(|file| file.name == prompt.name)
-                                .map(|file| file.contents)
-                        })
-                    }
-                })
-                .unwrap_or_else(|| {
-                    if uses_hidden_workflow {
-                        "<missing GOAL.md>".to_owned()
-                    } else {
-                        "<missing prompt>".to_owned()
-                    }
-                });
-
-            let preview = Paragraph::new(prompt_preview)
-                .block(
-                    Block::default()
-                        .title(self.title_line(
-                            if uses_hidden_workflow {
-                                "Goal Preview"
-                            } else {
-                                "Prompt Preview"
-                            },
-                            if uses_hidden_workflow {
-                                "User-facing workflow input"
-                            } else {
-                                "Selected runnable prompt"
-                            },
-                        ))
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded),
-                )
-                .style(Style::default().fg(self.text_color()))
-                .wrap(Wrap { trim: false });
-            frame.render_widget(preview, sections[2]);
-
-            let files = Paragraph::new(
-                target
-                    .files
-                    .iter()
-                    .map(|file| {
-                        if file.is_prompt {
-                            format!("* {}", file.name)
-                        } else {
-                            file.name.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )
-            .block(
-                Block::default()
-                    .title(self.title_line(
-                        "Files",
-                        if uses_hidden_workflow {
-                            "Workflow targets expose GOAL.md and state files"
-                        } else {
-                            "Runnable prompts are marked with *"
-                        },
-                    ))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
-            .style(Style::default().fg(self.muted_color()))
-            .wrap(Wrap { trim: false });
-            frame.render_widget(files, sections[3]);
-        } else {
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![Span::styled(
-                    "No target selected",
-                    Style::default().fg(self.muted_color()),
-                )]))
-                .block(block),
-                area,
-            );
-        }
-    }
-
-    fn draw_new_target_modal(&self, frame: &mut Frame<'_>) {
-        let area = centered_rect(60, 34, frame.area());
-        frame.render_widget(Clear, area);
-        let cursor_on = (self.tick_count / 4).is_multiple_of(2);
-        let name_display = if cursor_on {
-            format!("{}█", self.new_target_name)
-        } else {
-            format!("{} ", self.new_target_name)
-        };
-        let text = Text::from(vec![
-            Line::from(vec![Span::styled(
-                "Create a target with an initialization scaffold.",
-                Style::default().fg(self.muted_color()),
-            )]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("name ", key_style(self.accent_color())),
-                Span::styled(name_display, Style::default().fg(self.text_color())),
-            ]),
-            Line::from(vec![
-                Span::styled("scaffold ", key_style(self.success_color())),
-                Span::styled(
-                    self.new_scaffold.as_str(),
-                    Style::default()
-                        .fg(self.text_color())
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Tab", key_style(self.accent_color())),
-                Span::styled(
-                    " switch scaffold  ",
-                    Style::default().fg(self.muted_color()),
-                ),
-                Span::styled("Enter", key_style(self.success_color())),
-                Span::styled(" create  ", Style::default().fg(self.muted_color())),
-                Span::styled("Esc", key_style(self.warning_color())),
-                Span::styled(" cancel", Style::default().fg(self.muted_color())),
-            ]),
-        ]);
-        let widget = Paragraph::new(text)
-            .block(
-                Block::default()
-                    .title(self.title_line(
-                        "New Target",
-                        "Task-based, goal-driven, single-prompt, or plan-build scaffold",
-                    ))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
-            .style(Style::default().fg(self.text_color()))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(widget, area);
-    }
-
-    fn draw_running(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        let sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(5), Constraint::Min(1)])
-            .split(area);
-
-        let telemetry = if let Some(running) = self.running.as_ref() {
-            let pulse = if (self.tick_count / 2).is_multiple_of(2) {
-                "●"
-            } else {
-                "◉"
-            };
-            Paragraph::new(Text::from(vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!(" {} ", if running.finished { "DONE" } else { "LIVE" }),
-                        if running.finished {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(self.success_color())
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(self.warning_color())
-                                .add_modifier(Modifier::BOLD)
-                        },
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!(
-                            "{} / {}  ◆  iter {}/{}",
-                            running.target_id,
-                            running.prompt_name,
-                            running.iteration,
-                            running.max_iterations
-                        ),
-                        Style::default()
-                            .fg(self.text_color())
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::styled(pulse, Style::default().fg(self.success_color())),
-                    Span::styled(
-                        if running.finished {
-                            " run finished"
-                        } else {
-                            " streaming agent output"
-                        },
-                        Style::default().fg(self.muted_color()),
-                    ),
-                    Span::styled("  ◆  ", Style::default().fg(self.subtle_color())),
-                    Span::styled(
-                        if running.finished {
-                            "E edits input  ◆  R reruns  ◆  Esc returns"
-                        } else {
-                            "E edits input  ◆  A switches agent  ◆  Q cancels"
-                        },
-                        Style::default().fg(self.muted_color()),
-                    ),
-                ]),
-            ]))
-        } else {
-            Paragraph::new("No run selected")
-        }
-        .block(
-            Block::default()
-                .title(self.title_line("Live Run", "Telemetry and controls"))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        );
-        frame.render_widget(telemetry, sections[0]);
-
-        let block = Block::default()
-            .title(self.title_line("Agent Stream", "stdout and stderr"))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded);
-        let inner = block.inner(sections[1]);
-        let output = if let Some(running) = &mut self.running {
-            running
-                .terminal
-                .set_size(inner.height.max(1), inner.width.max(1));
-            let scroll = if running.follow { 0 } else { running.scroll };
-            running.terminal.set_scrollback(scroll);
-            running.terminal.screen().contents()
-        } else {
-            String::new()
-        };
-        let paragraph = Paragraph::new(output)
-            .block(block)
-            .style(Style::default().fg(self.text_color()));
-        frame.render_widget(paragraph, sections[1]);
     }
 
     fn reload_targets(&mut self) {
@@ -1158,9 +500,11 @@ impl TuiApp {
                         self.selected_prompt.min(prompt_count - 1)
                     };
                 }
+                self.refresh_selected_target_review();
             }
             Err(error) => {
                 self.targets = Vec::new();
+                self.selected_target_review = None;
                 self.message = error.to_string();
             }
         }
@@ -1168,6 +512,10 @@ impl TuiApp {
 
     fn selected_target(&self) -> Option<&TargetSummary> {
         self.targets.get(self.selected_target)
+    }
+
+    fn selected_target_review(&self) -> Option<&TargetReview> {
+        self.selected_target_review.as_ref()
     }
 
     fn selected_prompt(&self) -> Option<&ralph_core::PromptFile> {
@@ -1179,6 +527,28 @@ impl TuiApp {
         let target = self.selected_target()?;
         let prompt = self.selected_prompt()?;
         Some((target.id.clone(), prompt.name.clone()))
+    }
+
+    fn resolve_selected_edit_path(&self) -> Result<camino::Utf8PathBuf> {
+        let Some(target) = self.selected_target() else {
+            return Err(anyhow!("select a target first"));
+        };
+        let target_id = target.id.clone();
+        let prompt_name = if target.uses_hidden_workflow() {
+            None
+        } else {
+            self.selected_prompt().map(|prompt| prompt.name.clone())
+        };
+        self.app
+            .resolve_target_edit_path(&target_id, prompt_name.as_deref())
+    }
+
+    fn resolve_running_edit_path(&self) -> Result<camino::Utf8PathBuf> {
+        let Some(running) = self.running.as_ref() else {
+            return Err(anyhow!("no run in progress"));
+        };
+        self.app
+            .resolve_target_edit_path(&running.target_id, running.requested_prompt.as_deref())
     }
 
     fn start_run(&mut self) -> Result<()> {
@@ -1261,63 +631,6 @@ impl TuiApp {
         Ok(())
     }
 
-    fn running_shortcuts(&self) -> Vec<ShortcutHint> {
-        let finished = self
-            .running
-            .as_ref()
-            .is_some_and(|running| running.finished);
-        let mut hints = vec![
-            ShortcutHint {
-                key: "E",
-                label: "edit input",
-                tone: ShortcutTone::Accent,
-            },
-            ShortcutHint {
-                key: "A",
-                label: "agent",
-                tone: ShortcutTone::Accent,
-            },
-        ];
-
-        if finished {
-            hints.push(ShortcutHint {
-                key: "R",
-                label: "rerun",
-                tone: ShortcutTone::Success,
-            });
-            hints.push(ShortcutHint {
-                key: "Esc",
-                label: "dashboard",
-                tone: ShortcutTone::Warning,
-            });
-        } else {
-            hints.push(ShortcutHint {
-                key: "Q",
-                label: "cancel",
-                tone: ShortcutTone::Warning,
-            });
-        }
-
-        hints.extend([
-            ShortcutHint {
-                key: "↑↓",
-                label: "scroll",
-                tone: ShortcutTone::Neutral,
-            },
-            ShortcutHint {
-                key: "PgUp/PgDn",
-                label: "page",
-                tone: ShortcutTone::Neutral,
-            },
-            ShortcutHint {
-                key: "Home/End",
-                label: "jump",
-                tone: ShortcutTone::Neutral,
-            },
-        ]);
-        hints
-    }
-
     fn scroll_running(&mut self, delta: i32) {
         let max_scroll = self.max_running_scroll();
         let Some(running) = &mut self.running else {
@@ -1340,207 +653,10 @@ impl TuiApp {
         max
     }
 
-    fn accent_color(&self) -> Color {
-        resolved_accent_color(&self.app.config().theme.accent_color, self.color_mode)
-    }
-
-    fn success_color(&self) -> Color {
-        resolved_success_color(&self.app.config().theme.success_color, self.color_mode)
-    }
-
-    fn warning_color(&self) -> Color {
-        resolved_warning_color(&self.app.config().theme.warning_color, self.color_mode)
-    }
-
-    fn text_color(&self) -> Color {
-        match self.color_mode {
-            ColorMode::Light => Color::Black,
-            ColorMode::Dark => Color::White,
-        }
-    }
-
-    fn muted_color(&self) -> Color {
-        match self.color_mode {
-            ColorMode::Light => Color::Rgb(96, 103, 112),
-            ColorMode::Dark => Color::Gray,
-        }
-    }
-
-    fn subtle_color(&self) -> Color {
-        match self.color_mode {
-            ColorMode::Light => Color::Rgb(150, 157, 166),
-            ColorMode::Dark => Color::DarkGray,
-        }
-    }
-
-    fn panel_highlight(&self) -> Color {
-        match self.color_mode {
-            ColorMode::Light => Color::Rgb(220, 234, 242),
-            ColorMode::Dark => Color::Rgb(24, 47, 56),
-        }
-    }
-
-    fn title_line(&self, title: &str, subtitle: &str) -> Line<'static> {
-        styled_title(
-            title,
-            subtitle,
-            self.text_color(),
-            self.subtle_color(),
-            self.muted_color(),
-        )
-    }
-
-    fn notice_palette(&self) -> (&'static str, Color, Color) {
-        match self.color_mode {
-            ColorMode::Light => (" INFO ", Color::Black, Color::Rgb(191, 219, 254)),
-            ColorMode::Dark => (" INFO ", Color::Black, Color::Rgb(103, 232, 249)),
-        }
-    }
-}
-
-struct PromptEditor<'a> {
-    path: PathBuf,
-    textarea: TextArea<'a>,
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
-    modified: bool,
-    message: Option<Cow<'static, str>>,
-}
-
-impl<'a> PromptEditor<'a> {
-    fn new(path: PathBuf) -> Result<Self> {
-        let mut stdout = io::stdout();
-        enable_raw_mode().context("failed to enable raw mode for internal editor")?;
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-            .context("failed to enter alternate screen for internal editor")?;
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend).context("failed to create editor terminal")?;
-
-        let mut textarea = load_text_area(&path)?;
-        textarea.set_block(
-            Block::default()
-                .title(styled_title(
-                    "Prompt Editor",
-                    "Ctrl-S saves  ◆  Ctrl-Q closes",
-                    Color::White,
-                    Color::DarkGray,
-                    Color::Gray,
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        );
-        textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
-
-        Ok(Self {
-            path,
-            textarea,
-            terminal,
-            modified: false,
-            message: None,
-        })
-    }
-
-    fn run(&mut self) -> Result<()> {
-        loop {
-            let path = self.path.display().to_string();
-            let modified = self.modified;
-            let message = self.message.take();
-            let textarea = &self.textarea;
-            self.terminal.draw(|frame| {
-                let (footer_text, footer_height) = if let Some(message) = message.as_ref() {
-                    (Cow::Borrowed(message.as_ref()), 1)
-                } else {
-                    editor_help_text(frame.area().width)
-                };
-                let layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Min(1),
-                        Constraint::Length(1),
-                        Constraint::Length(footer_height),
-                    ])
-                    .split(frame.area());
-
-                frame.render_widget(textarea, layout[0]);
-
-                let modified_suffix = if modified { " [modified]" } else { "" };
-                let path = format!(" {}{} ", path, modified_suffix);
-                let (row, col) = textarea.cursor();
-                let cursor = format!("({},{})", row + 1, col + 1);
-                let status_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Min(1), Constraint::Length(cursor.len() as u16)])
-                    .split(layout[1]);
-                let status_style = Style::default().add_modifier(Modifier::REVERSED);
-                frame.render_widget(Paragraph::new(path).style(status_style), status_chunks[0]);
-                frame.render_widget(Paragraph::new(cursor).style(status_style), status_chunks[1]);
-                frame.render_widget(
-                    Paragraph::new(footer_text.as_ref()).style(Style::default().fg(Color::Gray)),
-                    layout[2],
-                );
-            })?;
-
-            match event::read().context("failed while reading editor input")? {
-                CEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                    let input: Input = key.into();
-                    match input {
-                        Input {
-                            key: Key::Char('s'),
-                            ctrl: true,
-                            ..
-                        } => {
-                            self.save()?;
-                            self.message = Some("Saved".into());
-                        }
-                        Input {
-                            key: Key::Char('q'),
-                            ctrl: true,
-                            ..
-                        } => break,
-                        input => {
-                            self.modified |= self.textarea.input(input);
-                        }
-                    }
-                }
-                CEvent::Mouse(_) | CEvent::Resize(_, _) => {}
-                _ => {}
-            }
-        }
-
-        Ok(())
-    }
-
-    fn save(&mut self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create editor parent {}", parent.display()))?;
-        }
-        let mut file = io::BufWriter::new(
-            std::fs::File::create(&self.path)
-                .with_context(|| format!("failed to create {}", self.path.display()))?,
-        );
-        for line in self.textarea.lines() {
-            file.write_all(line.as_bytes())
-                .with_context(|| format!("failed to write {}", self.path.display()))?;
-            file.write_all(b"\n")
-                .with_context(|| format!("failed to write {}", self.path.display()))?;
-        }
-        file.flush()
-            .with_context(|| format!("failed to flush {}", self.path.display()))?;
-        self.modified = false;
-        Ok(())
-    }
-}
-
-impl Drop for PromptEditor<'_> {
-    fn drop(&mut self) {
-        self.terminal.show_cursor().ok();
-        disable_raw_mode().ok();
-        execute!(
-            self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )
-        .ok();
+    fn refresh_selected_target_review(&mut self) {
+        self.selected_target_review = self
+            .selected_target()
+            .and_then(|target| self.app.review_target(&target.id).ok());
     }
 }
 
@@ -1557,262 +673,144 @@ impl RunDelegate for ChannelDelegate {
     }
 }
 
-fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .context("failed to leave alternate screen")?;
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use camino::Utf8PathBuf;
+    use ralph_app::RalphApp;
+    use ralph_core::ScaffoldId;
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
 
-fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    execute!(terminal.backend_mut(), EnterAlternateScreen)
-        .context("failed to re-enter alternate screen")?;
-    enable_raw_mode().context("failed to re-enable raw mode")?;
-    execute!(terminal.backend_mut(), TerminalClear(ClearType::All))
-        .context("failed to clear terminal after editor exit")?;
-    terminal
-        .clear()
-        .context("failed to reset terminal buffer after editor exit")?;
-    terminal.hide_cursor().ok();
-    Ok(())
-}
+    use super::TuiApp;
 
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup[1])[1]
-}
-
-fn detect_color_mode() -> ColorMode {
-    if let Ok(value) = env::var("RALPH_COLOR_MODE") {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "light" => return ColorMode::Light,
-            "dark" => return ColorMode::Dark,
-            _ => {}
-        }
+    fn temp_project_dir() -> (TempDir, Utf8PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        (temp, path)
     }
 
-    if let Ok(value) = env::var("COLORFGBG")
-        && let Some(background) = value
-            .split(';')
-            .next_back()
-            .and_then(|token| token.parse::<u8>().ok())
-    {
-        return if background >= 7 {
-            ColorMode::Light
-        } else {
-            ColorMode::Dark
-        };
+    #[test]
+    fn selected_target_review_tracks_selection() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir.clone())?;
+        app.create_target("alpha", Some(ScaffoldId::SinglePrompt))?;
+        app.create_target("beta", Some(ScaffoldId::SinglePrompt))?;
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), None);
+
+        assert_eq!(
+            tui.selected_target_review()
+                .map(|review| review.summary.id.as_str()),
+            tui.selected_target().map(|target| target.id.as_str())
+        );
+
+        tui.selected_target = 1;
+        tui.refresh_selected_target_review();
+
+        assert_eq!(
+            tui.selected_target_review()
+                .map(|review| review.summary.id.as_str()),
+            tui.selected_target().map(|target| target.id.as_str())
+        );
+        Ok(())
     }
 
-    ColorMode::Dark
-}
+    #[test]
+    fn selected_target_review_refreshes_after_file_changes() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir.clone())?;
+        let summary = app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
+        let prompt_path = summary.prompt_files[0].path.clone();
 
-fn styled_title(
-    title: &str,
-    subtitle: &str,
-    text_color: Color,
-    subtle_color: Color,
-    muted_color: Color,
-) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!(" {} ", title),
-            Style::default().fg(text_color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("◆", Style::default().fg(subtle_color)),
-        Span::styled(format!(" {}", subtitle), Style::default().fg(muted_color)),
-    ])
-}
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), None);
+        let original_contents = tui
+            .selected_target_review()
+            .and_then(|review| {
+                review
+                    .files
+                    .iter()
+                    .find(|file| file.name == "prompt_main.md")
+            })
+            .map(|file| file.contents.clone());
 
-fn key_style(color: Color) -> Style {
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
-}
+        std::fs::write(&prompt_path, "# Prompt\n\nUpdated\n")?;
+        tui.refresh_selected_target_review();
 
-fn load_text_area<'a>(path: &PathBuf) -> Result<TextArea<'a>> {
-    if let Ok(metadata) = path.metadata() {
-        if !metadata.is_file() {
-            return Err(anyhow!("{} is not a file", path.display()));
-        }
+        let refreshed_contents = tui
+            .selected_target_review()
+            .and_then(|review| {
+                review
+                    .files
+                    .iter()
+                    .find(|file| file.name == "prompt_main.md")
+            })
+            .map(|file| file.contents.clone());
 
-        let mut textarea: TextArea<'a> = io::BufReader::new(
-            std::fs::File::open(path)
-                .with_context(|| format!("failed to open {}", path.display()))?,
-        )
-        .lines()
-        .collect::<io::Result<_>>()
-        .with_context(|| format!("failed to read {}", path.display()))?;
-        if textarea.lines().iter().any(|line| line.starts_with('\t')) {
-            textarea.set_hard_tab_indent(true);
-        }
-        Ok(textarea)
-    } else {
-        Ok(TextArea::default())
+        assert_ne!(original_contents, refreshed_contents);
+        assert_eq!(refreshed_contents.as_deref(), Some("# Prompt\n\nUpdated\n"));
+        Ok(())
     }
-}
 
-fn editor_help_text(width: u16) -> (Cow<'static, str>, u16) {
-    const SINGLE_LINE: &str = "^A/^E line ends  M-B/M-F word jump  ^W/M-D delete word  ^U/^R undo redo  ^V/M-V page scroll  ^S save  ^Q close";
-    const TWO_LINES: &str = "^A/^E line ends  M-B/M-F word jump  ^W/M-D delete word\n^U/^R undo redo  ^V/M-V page scroll  ^S save  ^Q close";
+    #[test]
+    fn workflow_targets_are_detected_from_mode_even_without_scaffold() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir.clone())?;
+        app.create_target("demo", Some(ScaffoldId::GoalDriven))?;
+        std::fs::write(
+            project_dir.join(".ralph/targets/demo/target.toml"),
+            "id = \"demo\"\nmode = \"goal_driven\"\nlast_run_status = \"never_run\"\n\n[workflow]\nphase = \"plan\"\n",
+        )?;
 
-    if width as usize >= SINGLE_LINE.len() {
-        (Cow::Borrowed(SINGLE_LINE), 1)
-    } else {
-        (Cow::Borrowed(TWO_LINES), 2)
+        let runtime = Runtime::new()?;
+        let tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+
+        assert!(tui.selected_target_uses_hidden_workflow());
+        Ok(())
     }
-}
 
-fn shortcut_spans(hints: &[ShortcutHint], app: &TuiApp) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    for (index, hint) in hints.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled("  ", Style::default().fg(app.muted_color())));
-        }
-        spans.push(Span::styled(
-            hint.key,
-            key_style(match hint.tone {
-                ShortcutTone::Accent => app.accent_color(),
-                ShortcutTone::Success => app.success_color(),
-                ShortcutTone::Warning => app.warning_color(),
-                ShortcutTone::Neutral => app.text_color(),
-            }),
-        ));
-        spans.push(Span::styled(
-            format!(
-                " {}{}",
-                hint.label,
-                if index + 1 == hints.len() { "" } else { "" }
-            ),
-            Style::default().fg(app.muted_color()),
-        ));
+    #[test]
+    fn selected_prompt_edit_path_tracks_selected_tab() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir.clone())?;
+        let summary = app.create_target("demo", Some(ScaffoldId::PlanBuild))?;
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+        tui.selected_prompt = 1;
+
+        let edit_path = tui.resolve_selected_edit_path()?;
+
+        assert_eq!(edit_path, summary.prompt_files[1].path);
+        Ok(())
     }
-    spans
-}
 
-fn process_terminal_text(terminal: &mut vt100::Parser, text: &str) {
-    let mut normalized = Vec::with_capacity(text.len() + 16);
-    let mut previous = None;
-    for byte in text.bytes() {
-        if byte == b'\n' && previous != Some(b'\r') {
-            normalized.push(b'\r');
-        }
-        normalized.push(byte);
-        previous = Some(byte);
+    #[test]
+    fn running_prompt_edit_path_tracks_requested_prompt() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir)?;
+        let summary = app.create_target("demo", Some(ScaffoldId::PlanBuild))?;
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+        tui.running = Some(super::RunningState {
+            target_id: "demo".to_owned(),
+            prompt_name: "1_build.md".to_owned(),
+            requested_prompt: Some("1_build.md".to_owned()),
+            iteration: 0,
+            max_iterations: 0,
+            control: ralph_core::RunControl::new(),
+            terminal: vt100::Parser::new(24, 80, 100_000),
+            finished: false,
+            scroll: 0,
+            follow: true,
+        });
+
+        let edit_path = tui.resolve_running_edit_path()?;
+
+        assert_eq!(edit_path, summary.prompt_files[1].path);
+        Ok(())
     }
-    terminal.process(&normalized);
-}
-
-fn status_badge(status: LastRunStatus) -> &'static str {
-    match status {
-        LastRunStatus::NeverRun => "○",
-        LastRunStatus::Completed => "✓",
-        LastRunStatus::MaxIterations => "◉",
-        LastRunStatus::Failed => "!",
-        LastRunStatus::Canceled => "×",
-    }
-}
-
-fn status_label(status: LastRunStatus) -> &'static str {
-    match status {
-        LastRunStatus::NeverRun => "never run",
-        LastRunStatus::Completed => "completed",
-        LastRunStatus::MaxIterations => "max iterations",
-        LastRunStatus::Failed => "failed",
-        LastRunStatus::Canceled => "canceled",
-    }
-}
-
-fn status_style(
-    status: LastRunStatus,
-    accent: Color,
-    success: Color,
-    warning: Color,
-    muted: Color,
-) -> Style {
-    match status {
-        LastRunStatus::NeverRun => Style::default().fg(muted),
-        LastRunStatus::Completed => Style::default().fg(Color::Black).bg(success),
-        LastRunStatus::MaxIterations => Style::default().fg(Color::Black).bg(warning),
-        LastRunStatus::Failed => Style::default().fg(Color::White).bg(Color::Red),
-        LastRunStatus::Canceled => Style::default().fg(accent),
-    }
-}
-
-fn resolved_accent_color(name: &str, color_mode: ColorMode) -> Color {
-    if name.trim().eq_ignore_ascii_case("cyan") {
-        match color_mode {
-            ColorMode::Light => Color::Rgb(0, 102, 204),
-            ColorMode::Dark => Color::Cyan,
-        }
-    } else {
-        color_from_name(name).unwrap_or(match color_mode {
-            ColorMode::Light => Color::Rgb(0, 102, 204),
-            ColorMode::Dark => Color::Cyan,
-        })
-    }
-}
-
-fn resolved_success_color(name: &str, color_mode: ColorMode) -> Color {
-    if name.trim().eq_ignore_ascii_case("green") {
-        match color_mode {
-            ColorMode::Light => Color::Rgb(36, 138, 61),
-            ColorMode::Dark => Color::LightGreen,
-        }
-    } else {
-        color_from_name(name).unwrap_or(match color_mode {
-            ColorMode::Light => Color::Rgb(36, 138, 61),
-            ColorMode::Dark => Color::LightGreen,
-        })
-    }
-}
-
-fn resolved_warning_color(name: &str, color_mode: ColorMode) -> Color {
-    if name.trim().eq_ignore_ascii_case("yellow") {
-        match color_mode {
-            ColorMode::Light => Color::Rgb(160, 100, 0),
-            ColorMode::Dark => Color::LightYellow,
-        }
-    } else {
-        color_from_name(name).unwrap_or(match color_mode {
-            ColorMode::Light => Color::Rgb(160, 100, 0),
-            ColorMode::Dark => Color::LightYellow,
-        })
-    }
-}
-
-fn color_from_name(name: &str) -> Option<Color> {
-    let normalized = name.trim().to_ascii_lowercase();
-    Some(match normalized.as_str() {
-        "black" => Color::Black,
-        "red" => Color::Red,
-        "green" => Color::Green,
-        "yellow" => Color::Yellow,
-        "blue" => Color::Blue,
-        "magenta" => Color::Magenta,
-        "cyan" => Color::Cyan,
-        "gray" | "grey" => Color::Gray,
-        "darkgray" | "dark_gray" | "darkgrey" | "dark_grey" => Color::DarkGray,
-        "lightred" | "light_red" => Color::LightRed,
-        "lightgreen" | "light_green" => Color::LightGreen,
-        "lightyellow" | "light_yellow" => Color::LightYellow,
-        "lightblue" | "light_blue" => Color::LightBlue,
-        "lightmagenta" | "light_magenta" => Color::LightMagenta,
-        "lightcyan" | "light_cyan" => Color::LightCyan,
-        "white" => Color::White,
-        _ => return None,
-    })
 }
