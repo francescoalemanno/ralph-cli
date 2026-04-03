@@ -1,28 +1,25 @@
+mod editor;
+mod ui;
+
 use std::{
-    borrow::Cow,
-    env, io,
-    io::BufRead,
-    path::PathBuf,
+    io,
     sync::mpsc::{self, Receiver, Sender},
     time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use camino::Utf8Path;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent,
         KeyEventKind, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{
-        Clear as TerminalClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
-        disable_raw_mode, enable_raw_mode,
-    },
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+pub use editor::edit_file;
 use ralph_app::{RalphApp, RunDelegate, RunEvent};
-use ralph_core::{LastRunStatus, RunControl, ScaffoldId, TargetSummary, atomic_write};
+use ralph_core::{LastRunStatus, RunControl, ScaffoldId, TargetSummary};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -34,31 +31,21 @@ use ratatui::{
     },
 };
 use tokio::runtime::Handle;
-use tui_textarea::{Input, Key, TextArea};
+use ui::{
+    ColorMode, centered_rect, detect_color_mode, key_style, process_terminal_text,
+    resolved_accent_color, resolved_success_color, resolved_warning_color, resume_terminal,
+    status_badge, status_label, status_style, styled_title, suspend_terminal,
+};
 
 pub fn run_tui(app: RalphApp) -> Result<()> {
-    let handle = Handle::current();
-    enable_raw_mode().context("failed to enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("failed to enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("failed to create terminal backend")?;
-
-    let result = TuiApp::new(app, handle, None).run(&mut terminal);
-
-    disable_raw_mode().ok();
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )
-    .ok();
-    terminal.show_cursor().ok();
-    result
+    run_tui_with_target(app, None)
 }
 
 pub fn run_tui_scoped(app: RalphApp, target: &str) -> Result<()> {
+    run_tui_with_target(app, Some(target.to_owned()))
+}
+
+fn run_tui_with_target(app: RalphApp, target: Option<String>) -> Result<()> {
     let handle = Handle::current();
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -67,7 +54,7 @@ pub fn run_tui_scoped(app: RalphApp, target: &str) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal backend")?;
 
-    let result = TuiApp::new(app, handle, Some(target.to_owned())).run(&mut terminal);
+    let result = TuiApp::new(app, handle, target).run(&mut terminal);
 
     disable_raw_mode().ok();
     execute!(
@@ -78,11 +65,6 @@ pub fn run_tui_scoped(app: RalphApp, target: &str) -> Result<()> {
     .ok();
     terminal.show_cursor().ok();
     result
-}
-
-pub fn edit_file(path: &Utf8Path) -> Result<()> {
-    PromptEditor::new(path.as_std_path().to_path_buf())?.run()?;
-    Ok(())
 }
 
 enum UiEvent {
@@ -95,12 +77,6 @@ enum Screen {
     Dashboard,
     NewTarget,
     Running,
-}
-
-#[derive(Clone, Copy)]
-enum ColorMode {
-    Light,
-    Dark,
 }
 
 struct RunningState {
@@ -1398,140 +1374,6 @@ impl TuiApp {
     }
 }
 
-struct PromptEditor<'a> {
-    path: PathBuf,
-    textarea: TextArea<'a>,
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
-    modified: bool,
-    message: Option<Cow<'static, str>>,
-}
-
-impl<'a> PromptEditor<'a> {
-    fn new(path: PathBuf) -> Result<Self> {
-        let mut stdout = io::stdout();
-        enable_raw_mode().context("failed to enable raw mode for internal editor")?;
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-            .context("failed to enter alternate screen for internal editor")?;
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend).context("failed to create editor terminal")?;
-
-        let mut textarea = load_text_area(&path)?;
-        textarea.set_block(
-            Block::default()
-                .title(styled_title(
-                    "Prompt Editor",
-                    "Ctrl-S saves  ◆  Ctrl-Q closes",
-                    Color::White,
-                    Color::DarkGray,
-                    Color::Gray,
-                ))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        );
-        textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
-
-        Ok(Self {
-            path,
-            textarea,
-            terminal,
-            modified: false,
-            message: None,
-        })
-    }
-
-    fn run(&mut self) -> Result<()> {
-        loop {
-            let path = self.path.display().to_string();
-            let modified = self.modified;
-            let message = self.message.take();
-            let textarea = &self.textarea;
-            self.terminal.draw(|frame| {
-                let (footer_text, footer_height) = if let Some(message) = message.as_ref() {
-                    (Cow::Borrowed(message.as_ref()), 1)
-                } else {
-                    editor_help_text(frame.area().width)
-                };
-                let layout = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Min(1),
-                        Constraint::Length(1),
-                        Constraint::Length(footer_height),
-                    ])
-                    .split(frame.area());
-
-                frame.render_widget(textarea, layout[0]);
-
-                let modified_suffix = if modified { " [modified]" } else { "" };
-                let path = format!(" {}{} ", path, modified_suffix);
-                let (row, col) = textarea.cursor();
-                let cursor = format!("({},{})", row + 1, col + 1);
-                let status_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Min(1), Constraint::Length(cursor.len() as u16)])
-                    .split(layout[1]);
-                let status_style = Style::default().add_modifier(Modifier::REVERSED);
-                frame.render_widget(Paragraph::new(path).style(status_style), status_chunks[0]);
-                frame.render_widget(Paragraph::new(cursor).style(status_style), status_chunks[1]);
-                frame.render_widget(
-                    Paragraph::new(footer_text.as_ref()).style(Style::default().fg(Color::Gray)),
-                    layout[2],
-                );
-            })?;
-
-            match event::read().context("failed while reading editor input")? {
-                CEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                    let input: Input = key.into();
-                    match input {
-                        Input {
-                            key: Key::Char('s'),
-                            ctrl: true,
-                            ..
-                        } => {
-                            self.save()?;
-                            self.message = Some("Saved".into());
-                        }
-                        Input {
-                            key: Key::Char('q'),
-                            ctrl: true,
-                            ..
-                        } => break,
-                        input => {
-                            self.modified |= self.textarea.input(input);
-                        }
-                    }
-                }
-                CEvent::Mouse(_) | CEvent::Resize(_, _) => {}
-                _ => {}
-            }
-        }
-
-        Ok(())
-    }
-
-    fn save(&mut self) -> Result<()> {
-        let mut contents = self.textarea.lines().join("\n");
-        contents.push('\n');
-        atomic_write(&self.path, contents)
-            .with_context(|| format!("failed to save {}", self.path.display()))?;
-        self.modified = false;
-        Ok(())
-    }
-}
-
-impl Drop for PromptEditor<'_> {
-    fn drop(&mut self) {
-        self.terminal.show_cursor().ok();
-        disable_raw_mode().ok();
-        execute!(
-            self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )
-        .ok();
-    }
-}
-
 struct ChannelDelegate {
     tx: Sender<UiEvent>,
 }
@@ -1542,125 +1384,6 @@ impl RunDelegate for ChannelDelegate {
         self.tx
             .send(UiEvent::RunEvent(event))
             .map_err(|_| anyhow!("failed to send run event"))
-    }
-}
-
-fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .context("failed to leave alternate screen")?;
-    Ok(())
-}
-
-fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    execute!(terminal.backend_mut(), EnterAlternateScreen)
-        .context("failed to re-enter alternate screen")?;
-    enable_raw_mode().context("failed to re-enable raw mode")?;
-    execute!(terminal.backend_mut(), TerminalClear(ClearType::All))
-        .context("failed to clear terminal after editor exit")?;
-    terminal
-        .clear()
-        .context("failed to reset terminal buffer after editor exit")?;
-    terminal.hide_cursor().ok();
-    Ok(())
-}
-
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup[1])[1]
-}
-
-fn detect_color_mode() -> ColorMode {
-    if let Ok(value) = env::var("RALPH_COLOR_MODE") {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "light" => return ColorMode::Light,
-            "dark" => return ColorMode::Dark,
-            _ => {}
-        }
-    }
-
-    if let Ok(value) = env::var("COLORFGBG")
-        && let Some(background) = value
-            .split(';')
-            .next_back()
-            .and_then(|token| token.parse::<u8>().ok())
-    {
-        return if background >= 7 {
-            ColorMode::Light
-        } else {
-            ColorMode::Dark
-        };
-    }
-
-    ColorMode::Dark
-}
-
-fn styled_title(
-    title: &str,
-    subtitle: &str,
-    text_color: Color,
-    subtle_color: Color,
-    muted_color: Color,
-) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!(" {} ", title),
-            Style::default().fg(text_color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("◆", Style::default().fg(subtle_color)),
-        Span::styled(format!(" {}", subtitle), Style::default().fg(muted_color)),
-    ])
-}
-
-fn key_style(color: Color) -> Style {
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
-}
-
-fn load_text_area<'a>(path: &PathBuf) -> Result<TextArea<'a>> {
-    if let Ok(metadata) = path.metadata() {
-        if !metadata.is_file() {
-            return Err(anyhow!("{} is not a file", path.display()));
-        }
-
-        let mut textarea: TextArea<'a> = io::BufReader::new(
-            std::fs::File::open(path)
-                .with_context(|| format!("failed to open {}", path.display()))?,
-        )
-        .lines()
-        .collect::<io::Result<_>>()
-        .with_context(|| format!("failed to read {}", path.display()))?;
-        if textarea.lines().iter().any(|line| line.starts_with('\t')) {
-            textarea.set_hard_tab_indent(true);
-        }
-        Ok(textarea)
-    } else {
-        Ok(TextArea::default())
-    }
-}
-
-fn editor_help_text(width: u16) -> (Cow<'static, str>, u16) {
-    const SINGLE_LINE: &str = "^A/^E line ends  M-B/M-F word jump  ^W/M-D delete word  ^U/^R undo redo  ^V/M-V page scroll  ^S save  ^Q close";
-    const TWO_LINES: &str = "^A/^E line ends  M-B/M-F word jump  ^W/M-D delete word\n^U/^R undo redo  ^V/M-V page scroll  ^S save  ^Q close";
-
-    if width as usize >= SINGLE_LINE.len() {
-        (Cow::Borrowed(SINGLE_LINE), 1)
-    } else {
-        (Cow::Borrowed(TWO_LINES), 2)
     }
 }
 
@@ -1685,118 +1408,4 @@ fn shortcut_spans(hints: &[ShortcutHint], app: &TuiApp) -> Vec<Span<'static>> {
         ));
     }
     spans
-}
-
-fn process_terminal_text(terminal: &mut vt100::Parser, text: &str) {
-    let mut normalized = Vec::with_capacity(text.len() + 16);
-    let mut previous = None;
-    for byte in text.bytes() {
-        if byte == b'\n' && previous != Some(b'\r') {
-            normalized.push(b'\r');
-        }
-        normalized.push(byte);
-        previous = Some(byte);
-    }
-    terminal.process(&normalized);
-}
-
-fn status_badge(status: LastRunStatus) -> &'static str {
-    match status {
-        LastRunStatus::NeverRun => "○",
-        LastRunStatus::Completed => "✓",
-        LastRunStatus::MaxIterations => "◉",
-        LastRunStatus::Failed => "!",
-        LastRunStatus::Canceled => "×",
-    }
-}
-
-fn status_label(status: LastRunStatus) -> &'static str {
-    match status {
-        LastRunStatus::NeverRun => "never run",
-        LastRunStatus::Completed => "completed",
-        LastRunStatus::MaxIterations => "max iterations",
-        LastRunStatus::Failed => "failed",
-        LastRunStatus::Canceled => "canceled",
-    }
-}
-
-fn status_style(
-    status: LastRunStatus,
-    accent: Color,
-    success: Color,
-    warning: Color,
-    muted: Color,
-) -> Style {
-    match status {
-        LastRunStatus::NeverRun => Style::default().fg(muted),
-        LastRunStatus::Completed => Style::default().fg(Color::Black).bg(success),
-        LastRunStatus::MaxIterations => Style::default().fg(Color::Black).bg(warning),
-        LastRunStatus::Failed => Style::default().fg(Color::White).bg(Color::Red),
-        LastRunStatus::Canceled => Style::default().fg(accent),
-    }
-}
-
-fn resolved_accent_color(name: &str, color_mode: ColorMode) -> Color {
-    if name.trim().eq_ignore_ascii_case("cyan") {
-        match color_mode {
-            ColorMode::Light => Color::Rgb(0, 102, 204),
-            ColorMode::Dark => Color::Cyan,
-        }
-    } else {
-        color_from_name(name).unwrap_or(match color_mode {
-            ColorMode::Light => Color::Rgb(0, 102, 204),
-            ColorMode::Dark => Color::Cyan,
-        })
-    }
-}
-
-fn resolved_success_color(name: &str, color_mode: ColorMode) -> Color {
-    if name.trim().eq_ignore_ascii_case("green") {
-        match color_mode {
-            ColorMode::Light => Color::Rgb(36, 138, 61),
-            ColorMode::Dark => Color::LightGreen,
-        }
-    } else {
-        color_from_name(name).unwrap_or(match color_mode {
-            ColorMode::Light => Color::Rgb(36, 138, 61),
-            ColorMode::Dark => Color::LightGreen,
-        })
-    }
-}
-
-fn resolved_warning_color(name: &str, color_mode: ColorMode) -> Color {
-    if name.trim().eq_ignore_ascii_case("yellow") {
-        match color_mode {
-            ColorMode::Light => Color::Rgb(160, 100, 0),
-            ColorMode::Dark => Color::LightYellow,
-        }
-    } else {
-        color_from_name(name).unwrap_or(match color_mode {
-            ColorMode::Light => Color::Rgb(160, 100, 0),
-            ColorMode::Dark => Color::LightYellow,
-        })
-    }
-}
-
-fn color_from_name(name: &str) -> Option<Color> {
-    let normalized = name.trim().to_ascii_lowercase();
-    Some(match normalized.as_str() {
-        "black" => Color::Black,
-        "red" => Color::Red,
-        "green" => Color::Green,
-        "yellow" => Color::Yellow,
-        "blue" => Color::Blue,
-        "magenta" => Color::Magenta,
-        "cyan" => Color::Cyan,
-        "gray" | "grey" => Color::Gray,
-        "darkgray" | "dark_gray" | "darkgrey" | "dark_grey" => Color::DarkGray,
-        "lightred" | "light_red" => Color::LightRed,
-        "lightgreen" | "light_green" => Color::LightGreen,
-        "lightyellow" | "light_yellow" => Color::LightYellow,
-        "lightblue" | "light_blue" => Color::LightBlue,
-        "lightmagenta" | "light_magenta" => Color::LightMagenta,
-        "lightcyan" | "light_cyan" => Color::LightCyan,
-        "white" => Color::White,
-        _ => return None,
-    })
 }

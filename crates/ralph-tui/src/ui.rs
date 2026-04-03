@@ -1,0 +1,226 @@
+use std::{env, io};
+
+use anyhow::{Context, Result};
+use crossterm::{
+    execute,
+    terminal::{
+        Clear as TerminalClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
+        disable_raw_mode, enable_raw_mode,
+    },
+};
+use ralph_core::LastRunStatus;
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+};
+
+#[derive(Clone, Copy)]
+pub(crate) enum ColorMode {
+    Light,
+    Dark,
+}
+
+pub(crate) fn suspend_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<()> {
+    disable_raw_mode().ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)
+        .context("failed to leave alternate screen")?;
+    Ok(())
+}
+
+pub(crate) fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    execute!(terminal.backend_mut(), EnterAlternateScreen)
+        .context("failed to re-enter alternate screen")?;
+    enable_raw_mode().context("failed to re-enable raw mode")?;
+    execute!(terminal.backend_mut(), TerminalClear(ClearType::All))
+        .context("failed to clear terminal after editor exit")?;
+    terminal
+        .clear()
+        .context("failed to reset terminal buffer after editor exit")?;
+    terminal.hide_cursor().ok();
+    Ok(())
+}
+
+pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup[1])[1]
+}
+
+pub(crate) fn detect_color_mode() -> ColorMode {
+    if let Ok(value) = env::var("RALPH_COLOR_MODE") {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "light" => return ColorMode::Light,
+            "dark" => return ColorMode::Dark,
+            _ => {}
+        }
+    }
+
+    if let Ok(value) = env::var("COLORFGBG")
+        && let Some(background) = value
+            .split(';')
+            .next_back()
+            .and_then(|token| token.parse::<u8>().ok())
+    {
+        return if background >= 7 {
+            ColorMode::Light
+        } else {
+            ColorMode::Dark
+        };
+    }
+
+    ColorMode::Dark
+}
+
+pub(crate) fn styled_title(
+    title: &str,
+    subtitle: &str,
+    text_color: Color,
+    subtle_color: Color,
+    muted_color: Color,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!(" {} ", title),
+            Style::default().fg(text_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("◆", Style::default().fg(subtle_color)),
+        Span::styled(format!(" {}", subtitle), Style::default().fg(muted_color)),
+    ])
+}
+
+pub(crate) fn key_style(color: Color) -> Style {
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+pub(crate) fn process_terminal_text(terminal: &mut vt100::Parser, text: &str) {
+    let mut normalized = Vec::with_capacity(text.len() + 16);
+    let mut previous = None;
+    for byte in text.bytes() {
+        if byte == b'\n' && previous != Some(b'\r') {
+            normalized.push(b'\r');
+        }
+        normalized.push(byte);
+        previous = Some(byte);
+    }
+    terminal.process(&normalized);
+}
+
+pub(crate) fn status_badge(status: LastRunStatus) -> &'static str {
+    match status {
+        LastRunStatus::NeverRun => "○",
+        LastRunStatus::Completed => "✓",
+        LastRunStatus::MaxIterations => "◉",
+        LastRunStatus::Failed => "!",
+        LastRunStatus::Canceled => "×",
+    }
+}
+
+pub(crate) fn status_label(status: LastRunStatus) -> &'static str {
+    match status {
+        LastRunStatus::NeverRun => "never run",
+        LastRunStatus::Completed => "completed",
+        LastRunStatus::MaxIterations => "max iterations",
+        LastRunStatus::Failed => "failed",
+        LastRunStatus::Canceled => "canceled",
+    }
+}
+
+pub(crate) fn status_style(
+    status: LastRunStatus,
+    accent: Color,
+    success: Color,
+    warning: Color,
+    muted: Color,
+) -> Style {
+    match status {
+        LastRunStatus::NeverRun => Style::default().fg(muted),
+        LastRunStatus::Completed => Style::default().fg(Color::Black).bg(success),
+        LastRunStatus::MaxIterations => Style::default().fg(Color::Black).bg(warning),
+        LastRunStatus::Failed => Style::default().fg(Color::White).bg(Color::Red),
+        LastRunStatus::Canceled => Style::default().fg(accent),
+    }
+}
+
+pub(crate) fn resolved_accent_color(name: &str, color_mode: ColorMode) -> Color {
+    if name.trim().eq_ignore_ascii_case("cyan") {
+        match color_mode {
+            ColorMode::Light => Color::Rgb(0, 102, 204),
+            ColorMode::Dark => Color::Cyan,
+        }
+    } else {
+        color_from_name(name).unwrap_or(match color_mode {
+            ColorMode::Light => Color::Rgb(0, 102, 204),
+            ColorMode::Dark => Color::Cyan,
+        })
+    }
+}
+
+pub(crate) fn resolved_success_color(name: &str, color_mode: ColorMode) -> Color {
+    if name.trim().eq_ignore_ascii_case("green") {
+        match color_mode {
+            ColorMode::Light => Color::Rgb(36, 138, 61),
+            ColorMode::Dark => Color::LightGreen,
+        }
+    } else {
+        color_from_name(name).unwrap_or(match color_mode {
+            ColorMode::Light => Color::Rgb(36, 138, 61),
+            ColorMode::Dark => Color::LightGreen,
+        })
+    }
+}
+
+pub(crate) fn resolved_warning_color(name: &str, color_mode: ColorMode) -> Color {
+    if name.trim().eq_ignore_ascii_case("yellow") {
+        match color_mode {
+            ColorMode::Light => Color::Rgb(160, 100, 0),
+            ColorMode::Dark => Color::LightYellow,
+        }
+    } else {
+        color_from_name(name).unwrap_or(match color_mode {
+            ColorMode::Light => Color::Rgb(160, 100, 0),
+            ColorMode::Dark => Color::LightYellow,
+        })
+    }
+}
+
+fn color_from_name(name: &str) -> Option<Color> {
+    let normalized = name.trim().to_ascii_lowercase();
+    Some(match normalized.as_str() {
+        "black" => Color::Black,
+        "red" => Color::Red,
+        "green" => Color::Green,
+        "yellow" => Color::Yellow,
+        "blue" => Color::Blue,
+        "magenta" => Color::Magenta,
+        "cyan" => Color::Cyan,
+        "gray" | "grey" => Color::Gray,
+        "darkgray" | "dark_gray" | "darkgrey" | "dark_grey" => Color::DarkGray,
+        "lightred" | "light_red" => Color::LightRed,
+        "lightgreen" | "light_green" => Color::LightGreen,
+        "lightyellow" | "light_yellow" => Color::LightYellow,
+        "lightblue" | "light_blue" => Color::LightBlue,
+        "lightmagenta" | "light_magenta" => Color::LightMagenta,
+        "lightcyan" | "light_cyan" => Color::LightCyan,
+        "white" => Color::White,
+        _ => return None,
+    })
+}
