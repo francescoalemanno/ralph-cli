@@ -1,4 +1,4 @@
-use std::{borrow::Cow, io, io::BufRead, path::PathBuf};
+use std::{borrow::Cow, env, io, io::BufRead, path::PathBuf, process::Command};
 
 use anyhow::{Context, Result, anyhow};
 use camino::Utf8Path;
@@ -19,9 +19,58 @@ use tui_textarea::{Input, Key, TextArea};
 
 use crate::ui::styled_title;
 
-pub fn edit_file(path: &Utf8Path) -> Result<()> {
+pub fn edit_file(path: &Utf8Path, editor_override: Option<&str>) -> Result<()> {
+    if let Some(editor) = preferred_external_editor(editor_override) {
+        return edit_file_with_external_editor(path, &editor);
+    }
+
     PromptEditor::new(path.as_std_path().to_path_buf())?.run()?;
     Ok(())
+}
+
+fn preferred_external_editor(editor_override: Option<&str>) -> Option<String> {
+    let visual = env::var("VISUAL").ok();
+    let editor = env::var("EDITOR").ok();
+    resolve_editor_command(editor_override, visual.as_deref(), editor.as_deref())
+}
+
+fn resolve_editor_command(
+    editor_override: Option<&str>,
+    visual: Option<&str>,
+    editor: Option<&str>,
+) -> Option<String> {
+    [editor_override, visual, editor]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn edit_file_with_external_editor(path: &Utf8Path, editor: &str) -> Result<()> {
+    let command = format!("{editor} {}", quote_shell_arg(path.as_str()));
+    let status = if cfg!(windows) {
+        Command::new("cmd").arg("/C").arg(&command).status()
+    } else {
+        Command::new("sh").arg("-lc").arg(&command).status()
+    }
+    .with_context(|| format!("failed to launch editor command '{editor}'"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "editor command '{editor}' exited with status {status}"
+        ))
+    }
+}
+
+fn quote_shell_arg(value: &str) -> String {
+    if cfg!(windows) {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
 }
 
 struct PromptEditor<'a> {
@@ -188,5 +237,31 @@ fn editor_help_text(width: u16) -> (Cow<'static, str>, u16) {
         (Cow::Borrowed(SINGLE_LINE), 1)
     } else {
         (Cow::Borrowed(TWO_LINES), 2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_editor_command;
+
+    #[test]
+    fn editor_override_has_highest_priority() {
+        assert_eq!(
+            resolve_editor_command(Some("nvim"), Some("vim"), Some("nano")),
+            Some("nvim".to_owned())
+        );
+    }
+
+    #[test]
+    fn visual_then_editor_are_used_when_override_is_missing_or_blank() {
+        assert_eq!(
+            resolve_editor_command(Some("   "), Some(" code -w "), Some("nano")),
+            Some("code -w".to_owned())
+        );
+        assert_eq!(
+            resolve_editor_command(None, Some("   "), Some(" nano ")),
+            Some("nano".to_owned())
+        );
+        assert_eq!(resolve_editor_command(None, None, Some("   ")), None);
     }
 }

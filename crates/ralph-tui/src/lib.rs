@@ -238,8 +238,9 @@ impl TuiApp {
                 };
                 let target_id = target.id.clone();
                 let prompt_path = self.app.resolve_target_edit_path(&target_id, None)?;
+                let editor = self.app.config().editor_override.clone();
                 suspend_terminal(terminal)?;
-                let result = edit_file(&prompt_path);
+                let result = edit_file(&prompt_path, editor.as_deref());
                 resume_terminal(terminal)?;
                 result?;
                 self.refresh_selected_target_review();
@@ -308,8 +309,9 @@ impl TuiApp {
                             .map(|prompt| prompt.path.clone())
                     };
                 if let Some(opened_path) = opened_path {
+                    let editor = self.app.config().editor_override.clone();
                     suspend_terminal(terminal)?;
-                    let result = edit_file(&opened_path);
+                    let result = edit_file(&opened_path, editor.as_deref());
                     resume_terminal(terminal)?;
                     result?;
                     self.refresh_selected_target_review();
@@ -370,8 +372,9 @@ impl TuiApp {
                 };
                 let target_id = running.target_id.clone();
                 let prompt_path = self.app.resolve_target_edit_path(&target_id, None)?;
+                let editor = self.app.config().editor_override.clone();
                 suspend_terminal(terminal)?;
-                let result = edit_file(&prompt_path);
+                let result = edit_file(&prompt_path, editor.as_deref());
                 resume_terminal(terminal)?;
                 result?;
                 self.refresh_selected_target_review();

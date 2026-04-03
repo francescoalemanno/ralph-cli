@@ -67,7 +67,7 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
                             None => None,
                         };
                         let prompt_path = app.resolve_target_edit_path(target, prompt)?;
-                        edit_file(&prompt_path)?;
+                        edit_file(&prompt_path, app.config().editor_override.as_deref())?;
                     }
                     print_target_summary(output, &summary)
                 }
@@ -80,7 +80,7 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
                     }
                     create_bare_prompt_file(&prompt_path, scaffold)?;
                     if args.edit {
-                        edit_file(&prompt_path)?;
+                        edit_file(&prompt_path, app.config().editor_override.as_deref())?;
                     }
                     print_prompt_file_row(
                         output,
@@ -133,9 +133,11 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
                 TargetMode::Target(target) => {
                     let prompt_path =
                         app.resolve_target_edit_path(target, args.prompt.as_deref())?;
-                    edit_file(&prompt_path)
+                    edit_file(&prompt_path, app.config().editor_override.as_deref())
                 }
-                TargetMode::BarePrompt(prompt_path) => edit_file(&prompt_path),
+                TargetMode::BarePrompt(prompt_path) => {
+                    edit_file(&prompt_path, app.config().editor_override.as_deref())
+                }
             }
         }
         Commands::Agent(command) => run_agent_command(project_dir, output, command),
