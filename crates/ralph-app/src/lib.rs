@@ -1144,6 +1144,17 @@ fn goal_driven_build_prompt() -> String {
 4. Execute only that item completely against the current target-local specifications and plan. Do not leave placeholders or partial implementations behind.
 5. Run the checks relevant to the code you changed.
 6. Update `{target_dir}/plan.toml` so it accurately records completed work and any remaining follow-up.
+   `plan.toml` must stay valid TOML and follow this exact shape:
+
+```toml
+version = 1
+
+[[items]]
+category = "functional"
+description = "Describe one concrete outcome"
+steps = ["List the ordered implementation and verification steps"]
+completed = false
+```
 7. Create or update `{target_dir}/journal.txt` as a free-form builder journal for future iterations. Record what you changed, what you verified, and any concrete follow-up notes useful to the next build iteration.
 8. Do not edit `{target_dir}/GOAL.md`.
 9. Update `AGENTS.md` only when you learn durable operational guidance about running or debugging the project.
@@ -1166,6 +1177,16 @@ fn task_based_build_prompt() -> String {
 4. Execute only that item completely. Do not leave placeholders or partial implementations behind.
 5. Run the checks relevant to the code you changed.
 6. Update `{target_dir}/progress.toml` so it accurately records completed work and any remaining follow-up.
+   `progress.toml` must stay valid TOML and follow this exact shape:
+
+```toml
+version = 1
+
+[[items]]
+description = "..."
+steps = ["..."]
+completed = false
+```
 7. Create or update `{target_dir}/{journal_file}` as a free-form builder journal for future iterations. Record what you changed, what you verified, and any concrete follow-up notes useful to the next build iteration.
 8. Do not edit `{target_dir}/GOAL.md`.
 9. Update `AGENTS.md` only when you learn durable operational guidance about running or debugging the project.
