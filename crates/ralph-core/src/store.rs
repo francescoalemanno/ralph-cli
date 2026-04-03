@@ -172,8 +172,8 @@ impl TargetStore {
         if !paths.dir.exists() {
             return Err(anyhow!("target '{target_id}' does not exist"));
         }
-        let config = self.read_target_config(target_id)?;
-        let files = self.list_target_files(target_id)?;
+        let config = self.read_target_config_for_discovery(target_id)?;
+        let files = self.list_target_files_with_config(target_id, &config)?;
         let prompt_files = files
             .iter()
             .filter(|file| file.is_prompt)
@@ -240,6 +240,18 @@ impl TargetStore {
     }
 
     pub fn read_target_config(&self, target_id: &str) -> Result<TargetConfig> {
+        self.read_target_config_internal(target_id, true)
+    }
+
+    fn read_target_config_for_discovery(&self, target_id: &str) -> Result<TargetConfig> {
+        self.read_target_config_internal(target_id, false)
+    }
+
+    fn read_target_config_internal(
+        &self,
+        target_id: &str,
+        strict_parse: bool,
+    ) -> Result<TargetConfig> {
         let paths = self.target_paths(target_id)?;
         let raw = match fs::read_to_string(&paths.config_path) {
             Ok(raw) => raw,
@@ -252,8 +264,15 @@ impl TargetStore {
                 });
             }
         };
-        let mut config: TargetConfig =
-            toml::from_str(&raw).unwrap_or_else(|_| self.fallback_target_config(target_id));
+        let mut config = match toml::from_str(&raw) {
+            Ok(config) => config,
+            Err(_) if !strict_parse => self.fallback_target_config(target_id),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to parse target config {}", paths.config_path)
+                });
+            }
+        };
         config.id = target_id.to_owned();
         Ok(config)
     }
@@ -303,8 +322,16 @@ impl TargetStore {
     }
 
     pub fn list_target_files(&self, target_id: &str) -> Result<Vec<TargetFile>> {
-        let paths = self.target_paths(target_id)?;
         let config = self.read_target_config(target_id)?;
+        self.list_target_files_with_config(target_id, &config)
+    }
+
+    fn list_target_files_with_config(
+        &self,
+        target_id: &str,
+        config: &TargetConfig,
+    ) -> Result<Vec<TargetFile>> {
+        let paths = self.target_paths(target_id)?;
         let mut files = Vec::new();
         for entry in fs::read_dir(&paths.dir)
             .with_context(|| format!("failed to read target directory {}", paths.dir))?
@@ -320,7 +347,7 @@ impl TargetStore {
                 .ok_or_else(|| anyhow!("target file missing file name"))?
                 .to_owned();
             files.push(TargetFile {
-                is_prompt: is_target_prompt_file(&config, &name),
+                is_prompt: is_target_prompt_file(config, &name),
                 name,
                 path,
             });
@@ -431,12 +458,13 @@ fn is_target_prompt_file(config: &TargetConfig, name: &str) -> bool {
 }
 
 fn workflow_state_for_mode(mode: WorkflowMode) -> GoalDrivenWorkflowState {
-    let mut workflow = GoalDrivenWorkflowState::default();
-    workflow.phase = match mode {
-        WorkflowMode::TaskBased => crate::GoalDrivenPhase::Build,
-        WorkflowMode::GoalDriven => crate::GoalDrivenPhase::Plan,
-    };
-    workflow
+    GoalDrivenWorkflowState {
+        phase: match mode {
+            WorkflowMode::TaskBased => crate::GoalDrivenPhase::Build,
+            WorkflowMode::GoalDriven => crate::GoalDrivenPhase::Plan,
+        },
+        ..GoalDrivenWorkflowState::default()
+    }
 }
 
 #[cfg(test)]
@@ -588,6 +616,63 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["notes.md"]
         );
+    }
+
+    #[test]
+    fn load_target_tolerates_invalid_target_config_during_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let store = TargetStore::new(project_dir.clone());
+        let target_dir = project_dir.join(".ralph/targets/demo");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("notes.md"), "# Notes\n").unwrap();
+        std::fs::write(target_dir.join("target.toml"), "scaffold = \"playbook\"\n").unwrap();
+
+        let summary = store.load_target("demo").unwrap();
+
+        assert_eq!(summary.id, "demo");
+        assert_eq!(
+            summary
+                .prompt_files
+                .iter()
+                .map(|prompt| prompt.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes.md"]
+        );
+    }
+
+    #[test]
+    fn invalid_target_config_is_rejected_for_operational_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let store = TargetStore::new(project_dir.clone());
+        let target_dir = project_dir.join(".ralph/targets/demo");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("target.toml"), "scaffold = \"playbook\"\n").unwrap();
+
+        let error = store.read_target_config("demo").unwrap_err().to_string();
+
+        assert!(error.contains("failed to parse target config"));
+    }
+
+    #[test]
+    fn invalid_target_config_is_not_silently_overwritten_by_set_last_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let store = TargetStore::new(project_dir.clone());
+        let target_dir = project_dir.join(".ralph/targets/demo");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let config_path = target_dir.join("target.toml");
+        let invalid = "scaffold = \"playbook\"\n";
+        std::fs::write(&config_path, invalid).unwrap();
+
+        let error = store
+            .set_last_run("demo", "prompt_main.md", LastRunStatus::Completed)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("failed to parse target config"));
+        assert_eq!(std::fs::read_to_string(config_path).unwrap(), invalid);
     }
 
     #[test]
