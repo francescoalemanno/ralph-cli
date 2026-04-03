@@ -1106,7 +1106,7 @@ fn goal_driven_plan_prompt() -> String {
    b. Study `{target_dir}/plan.toml` if it exists.
    c. Study all spec files in `{target_dir}/specs/`.
 2. Study the relevant repository documentation and source code (do not assume something is not implemented, look deeply).
-3. Create or revise the spec files in `{target_dir}/specs/` until the intended behavior, constraints, and user-visible outcomes are clear enough to build against without guessing.
+3. Create or revise the spec files in `{target_dir}/specs/` until the functional requirements, non-functional requirements, constraints, and user-visible outcomes are clear enough to build against without guessing.
 4. Only after the specifications are coherent and sufficient, create or revise `{target_dir}/plan.toml` as the current operational plan.
 5. `plan.toml` must stay valid TOML and follow this exact shape:
 
@@ -1114,16 +1114,17 @@ fn goal_driven_plan_prompt() -> String {
 version = 1
 
 [[items]]
-category = "functional"
+category = "functional" # or "non_functional"
 description = "Describe one concrete outcome"
 steps = ["List the ordered implementation and verification steps"]
 completed = false
 ```
 
 6. Keep the items in the exact execution order. Earlier items must prepare later items; do not rely on later items to make earlier items possible.
-7. Keep every incomplete item at `completed = false`.
-8. Plan only. Do not implement product code or tests.
-9. If the specifications and `plan.toml` are already correct and sufficient, leave `{target_dir}/plan.toml` unchanged.
+7. Use `category` to distinguish functional and non-functional work when relevant.
+8. Keep every incomplete item at `completed = false`.
+9. Plan only. Do not implement product code or tests.
+10. If the specifications and `plan.toml` are already correct and sufficient, leave `{target_dir}/plan.toml` unchanged.
 
 {{"ralph":"watch","path":"{target_dir}/plan.toml"}}
 "#,
