@@ -548,22 +548,78 @@ impl TuiApp {
             } else {
                 "◉"
             };
+            let (badge_text, badge_style, indicator, indicator_style, status_text) =
+                match running.status() {
+                    None => (
+                        "LIVE",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(self.warning_color())
+                            .add_modifier(Modifier::BOLD),
+                        pulse,
+                        Style::default().fg(self.success_color()),
+                        " streaming agent output",
+                    ),
+                    Some(LastRunStatus::Completed) => (
+                        "DONE",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(self.success_color())
+                            .add_modifier(Modifier::BOLD),
+                        status_badge(LastRunStatus::Completed),
+                        Style::default()
+                            .fg(self.success_color())
+                            .add_modifier(Modifier::BOLD),
+                        " run completed",
+                    ),
+                    Some(LastRunStatus::MaxIterations) => (
+                        "LIMIT",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(self.warning_color())
+                            .add_modifier(Modifier::BOLD),
+                        status_badge(LastRunStatus::MaxIterations),
+                        Style::default()
+                            .fg(self.warning_color())
+                            .add_modifier(Modifier::BOLD),
+                        " max iterations reached",
+                    ),
+                    Some(LastRunStatus::Failed) => (
+                        "FAIL",
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(Color::Red)
+                            .add_modifier(Modifier::BOLD),
+                        status_badge(LastRunStatus::Failed),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        " run failed",
+                    ),
+                    Some(LastRunStatus::Canceled) => (
+                        "CANCELED",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(self.accent_color())
+                            .add_modifier(Modifier::BOLD),
+                        status_badge(LastRunStatus::Canceled),
+                        Style::default()
+                            .fg(self.accent_color())
+                            .add_modifier(Modifier::BOLD),
+                        " run canceled",
+                    ),
+                    Some(LastRunStatus::NeverRun) => (
+                        "DONE",
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(self.success_color())
+                            .add_modifier(Modifier::BOLD),
+                        status_badge(LastRunStatus::NeverRun),
+                        Style::default().fg(self.muted_color()),
+                        " run finished",
+                    ),
+                };
             Paragraph::new(Text::from(vec![
                 Line::from(vec![
-                    Span::styled(
-                        format!(" {} ", if running.finished { "DONE" } else { "LIVE" }),
-                        if running.finished {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(self.success_color())
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(self.warning_color())
-                                .add_modifier(Modifier::BOLD)
-                        },
-                    ),
+                    Span::styled(format!(" {badge_text} "), badge_style),
                     Span::raw(" "),
                     Span::styled(
                         format!(
@@ -579,18 +635,11 @@ impl TuiApp {
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled(pulse, Style::default().fg(self.success_color())),
-                    Span::styled(
-                        if running.finished {
-                            " run finished"
-                        } else {
-                            " streaming agent output"
-                        },
-                        Style::default().fg(self.muted_color()),
-                    ),
+                    Span::styled(indicator, indicator_style),
+                    Span::styled(status_text, Style::default().fg(self.muted_color())),
                     Span::styled("  ◆  ", Style::default().fg(self.subtle_color())),
                     Span::styled(
-                        if running.finished {
+                        if running.is_finished() {
                             "E edits input  ◆  R reruns  ◆  Esc returns"
                         } else {
                             "E edits input  ◆  A switches agent  ◆  Q cancels"
@@ -632,7 +681,7 @@ impl TuiApp {
         let finished = self
             .running
             .as_ref()
-            .is_some_and(|running| running.finished);
+            .is_some_and(|running| running.is_finished());
         let mut hints = vec![
             ShortcutHint {
                 key: "E",
@@ -767,7 +816,7 @@ mod tests {
     use anyhow::Result;
     use camino::Utf8PathBuf;
     use ralph_app::RalphApp;
-    use ralph_core::ScaffoldId;
+    use ralph_core::{LastRunStatus, ScaffoldId};
     use ratatui::{Terminal, backend::TestBackend};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
@@ -818,6 +867,56 @@ mod tests {
         let rows = buffer_rows(&terminal);
         assert!(rows.iter().any(|row| row.contains("softwrapalpha")));
         assert!(rows.iter().any(|row| row.contains("softwrapepsilon")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn finished_runs_render_final_status_instead_of_live_spinner() -> Result<()> {
+        let statuses = [
+            (LastRunStatus::Completed, "DONE", "run completed"),
+            (
+                LastRunStatus::MaxIterations,
+                "LIMIT",
+                "max iterations reached",
+            ),
+            (LastRunStatus::Failed, "FAIL", "run failed"),
+            (LastRunStatus::Canceled, "CANCELED", "run canceled"),
+        ];
+
+        for (status, badge, text) in statuses {
+            let (_temp, project_dir) = temp_project_dir();
+            let app = RalphApp::load(project_dir)?;
+            app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
+
+            let runtime = Runtime::new()?;
+            let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+            let mut running = RunningState::new(
+                "demo".to_owned(),
+                "prompt_main.md".to_owned(),
+                Some("prompt_main.md".to_owned()),
+                ralph_core::RunControl::new(),
+            );
+            running.finish(status);
+            tui.running = Some(running);
+            tui.screen = Screen::Running;
+
+            let backend = TestBackend::new(80, 18);
+            let mut terminal = Terminal::new(backend)?;
+            terminal.draw(|frame| tui.draw(frame))?;
+
+            let rows = buffer_rows(&terminal).join("\n");
+            assert!(rows.contains(badge), "missing badge {badge} for {status:?}");
+            assert!(rows.contains(text), "missing text {text} for {status:?}");
+            assert!(
+                !rows.contains("LIVE"),
+                "live badge still shown for {status:?}"
+            );
+            assert!(
+                !rows.contains("streaming agent output"),
+                "live spinner text still shown for {status:?}"
+            );
+        }
 
         Ok(())
     }

@@ -20,7 +20,7 @@ use crossterm::{
 };
 pub use editor::edit_file;
 use ralph_app::{RalphApp, RunDelegate, RunEvent};
-use ralph_core::{RunControl, ScaffoldId, TargetReview, TargetSummary};
+use ralph_core::{LastRunStatus, RunControl, ScaffoldId, TargetReview, TargetSummary};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::runtime::Handle;
 use ui::{normalize_terminal_text, resume_terminal, suspend_terminal};
@@ -93,7 +93,7 @@ struct RunningState {
     terminal_bytes: Vec<u8>,
     terminal_rows: u16,
     terminal_cols: u16,
-    finished: bool,
+    status: Option<LastRunStatus>,
     scroll: usize,
     follow: bool,
 }
@@ -118,10 +118,22 @@ impl RunningState {
             terminal_bytes: Vec::new(),
             terminal_rows,
             terminal_cols,
-            finished: false,
+            status: None,
             scroll: 0,
             follow: true,
         }
+    }
+
+    fn finish(&mut self, status: LastRunStatus) {
+        self.status = Some(status);
+    }
+
+    fn is_finished(&self) -> bool {
+        self.status.is_some()
+    }
+
+    fn status(&self) -> Option<LastRunStatus> {
+        self.status
     }
 
     fn push_terminal_text(&mut self, text: &str) {
@@ -402,11 +414,7 @@ impl TuiApp {
     ) -> Result<()> {
         match key.code {
             KeyCode::Esc => {
-                if self
-                    .running
-                    .as_ref()
-                    .is_some_and(|running| running.finished)
-                {
+                if self.running.as_ref().is_some_and(RunningState::is_finished) {
                     self.running = None;
                     self.screen = Screen::Dashboard;
                 }
@@ -418,7 +426,7 @@ impl TuiApp {
             }
             KeyCode::Char('r') => {
                 if let Some(running) = &self.running
-                    && running.finished
+                    && running.is_finished()
                 {
                     let target_id = running.target_id.clone();
                     let requested_prompt = running.requested_prompt.clone();
@@ -496,7 +504,7 @@ impl TuiApp {
                             running.push_terminal_text(&format!("\n{note}\n"));
                         }
                         RunEvent::Finished { status, summary } => {
-                            running.finished = true;
+                            running.finish(status);
                             running.push_terminal_text(&format!(
                                 "\n{summary} ({})\nPress Esc to return.",
                                 status.label()
@@ -510,6 +518,15 @@ impl TuiApp {
             }
             UiEvent::RunDone(result) => match result {
                 Ok(summary) => {
+                    if let Some(running) = &mut self.running
+                        && !running.is_finished()
+                    {
+                        running.finish(summary.last_run_status);
+                        running.push_terminal_text(&format!(
+                            "\nRun ended with status: {}.\nPress Esc to return.",
+                            summary.last_run_status.label()
+                        ));
+                    }
                     self.reload_targets();
                     if let Some(index) = self.targets.iter().position(|item| item.id == summary.id)
                     {
@@ -519,9 +536,16 @@ impl TuiApp {
                 }
                 Err(error) => {
                     if let Some(running) = &mut self.running {
-                        running.finished = true;
-                        running
-                            .push_terminal_text(&format!("\nerror: {error}\nPress Esc to return."));
+                        let status = if running.control.is_cancelled() {
+                            LastRunStatus::Canceled
+                        } else {
+                            LastRunStatus::Failed
+                        };
+                        running.finish(status);
+                        running.push_terminal_text(&format!(
+                            "\nerror: {error} ({})\nPress Esc to return.",
+                            status.label()
+                        ));
                     }
                 }
             },
@@ -716,11 +740,11 @@ mod tests {
     use anyhow::Result;
     use camino::Utf8PathBuf;
     use ralph_app::RalphApp;
-    use ralph_core::ScaffoldId;
+    use ralph_core::{LastRunStatus, ScaffoldId};
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
-    use super::TuiApp;
+    use super::{RunningState, TuiApp, UiEvent};
 
     fn temp_project_dir() -> (TempDir, Utf8PathBuf) {
         let temp = tempfile::tempdir().unwrap();
@@ -862,5 +886,82 @@ mod tests {
 
         let output = running.terminal.screen().contents();
         assert!(output.contains(long_line));
+    }
+
+    #[test]
+    fn run_done_marks_run_finished_even_without_finished_event() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir)?;
+        let mut summary = app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
+        summary.last_run_status = LastRunStatus::Completed;
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+        tui.running = Some(RunningState::new(
+            "demo".to_owned(),
+            "prompt_main.md".to_owned(),
+            Some("prompt_main.md".to_owned()),
+            ralph_core::RunControl::new(),
+        ));
+
+        tui.handle_ui_event(UiEvent::RunDone(Ok(summary)));
+
+        let running = tui.running.as_ref().expect("running state");
+        assert!(running.is_finished());
+        assert_eq!(running.status(), Some(LastRunStatus::Completed));
+        assert!(
+            running
+                .terminal
+                .screen()
+                .contents()
+                .contains("Run ended with status: completed.")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_done_error_marks_failed_or_canceled_runs_finished() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir.clone())?;
+        app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
+        app.create_target("cancelled", Some(ScaffoldId::SinglePrompt))?;
+        let runtime = Runtime::new()?;
+
+        let mut failed_tui = TuiApp::new(
+            app.clone(),
+            runtime.handle().clone(),
+            Some("demo".to_owned()),
+        );
+        failed_tui.running = Some(RunningState::new(
+            "demo".to_owned(),
+            "prompt_main.md".to_owned(),
+            Some("prompt_main.md".to_owned()),
+            ralph_core::RunControl::new(),
+        ));
+        failed_tui.handle_ui_event(UiEvent::RunDone(Err("boom".to_owned())));
+        assert_eq!(
+            failed_tui.running.as_ref().and_then(RunningState::status),
+            Some(LastRunStatus::Failed)
+        );
+
+        let mut cancelled_tui =
+            TuiApp::new(app, runtime.handle().clone(), Some("cancelled".to_owned()));
+        let running = RunningState::new(
+            "cancelled".to_owned(),
+            "prompt_main.md".to_owned(),
+            Some("prompt_main.md".to_owned()),
+            ralph_core::RunControl::new(),
+        );
+        running.control.cancel();
+        cancelled_tui.running = Some(running);
+        cancelled_tui.handle_ui_event(UiEvent::RunDone(Err("operation canceled".to_owned())));
+        assert_eq!(
+            cancelled_tui
+                .running
+                .as_ref()
+                .and_then(RunningState::status),
+            Some(LastRunStatus::Canceled)
+        );
+        Ok(())
     }
 }
