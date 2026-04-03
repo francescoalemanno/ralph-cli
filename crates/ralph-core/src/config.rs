@@ -323,7 +323,7 @@ fn merge_config(mut base: AppConfig, partial: PartialAppConfig) -> AppConfig {
         base.max_iterations = max_iterations;
     }
     if let Some(editor_override) = partial.editor_override {
-        base.editor_override = Some(editor_override);
+        base.editor_override = normalize_optional_string(editor_override);
     }
     if let Some(theme) = partial.theme {
         if let Some(value) = theme.accent_color {
@@ -370,9 +370,17 @@ fn merge_runner(mut runner: RunnerConfig, partial: PartialRunnerConfig) -> Runne
         runner.prompt_env_var = prompt_env_var;
     }
     if let Some(shell_template) = partial.shell_template {
-        runner.shell_template = Some(shell_template);
+        runner.shell_template = normalize_optional_string(shell_template);
     }
     runner
+}
+
+fn normalize_optional_string(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn default_max_iterations() -> usize {
@@ -398,7 +406,10 @@ mod tests {
 
     use camino::Utf8PathBuf;
 
-    use super::{AppConfig, ConfigFileScope, merge_runner};
+    use super::{
+        AppConfig, ConfigFileScope, PartialAppConfig, PartialRunnerConfig, merge_config,
+        merge_runner,
+    };
     use crate::{CodingAgent, PromptTransport, RunnerConfig};
 
     #[test]
@@ -482,7 +493,7 @@ mod tests {
     fn merge_runner_overrides_selected_fields() {
         let merged = merge_runner(
             RunnerConfig::default(),
-            super::PartialRunnerConfig {
+            PartialRunnerConfig {
                 env: Some(BTreeMap::from([("A".to_owned(), "B".to_owned())])),
                 ..Default::default()
             },
@@ -526,5 +537,56 @@ RUST_LOG = "debug"
             config.runner.env.get("RUST_LOG").map(String::as_str),
             Some("debug")
         );
+    }
+
+    #[test]
+    fn blank_project_editor_override_clears_inherited_user_value() {
+        let merged = merge_config(
+            AppConfig {
+                editor_override: Some("nvim".to_owned()),
+                ..Default::default()
+            },
+            PartialAppConfig {
+                editor_override: Some("   ".to_owned()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(merged.editor_override, None);
+    }
+
+    #[test]
+    fn blank_project_shell_template_clears_inherited_user_value() {
+        let merged = merge_runner(
+            RunnerConfig {
+                program: "custom-runner".to_owned(),
+                args: vec!["--json".to_owned()],
+                env: BTreeMap::new(),
+                prompt_transport: PromptTransport::TempFile,
+                prompt_env_var: "PROMPT".to_owned(),
+                shell_template: Some("custom-runner {prompt_file}".to_owned()),
+            },
+            PartialRunnerConfig {
+                program: Some("codex".to_owned()),
+                args: Some(vec![
+                    "exec".to_owned(),
+                    "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+                    "--ephemeral".to_owned(),
+                ]),
+                shell_template: Some("".to_owned()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(merged.program, "codex");
+        assert_eq!(
+            merged.args,
+            vec![
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--ephemeral"
+            ]
+        );
+        assert_eq!(merged.shell_template, None);
     }
 }
