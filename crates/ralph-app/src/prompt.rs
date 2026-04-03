@@ -42,8 +42,21 @@ enum CompletionDirectiveType {
 pub(crate) fn parse_prompt_directives(prompt_text: &str) -> ParsedPrompt {
     let mut completion_criteria = Vec::new();
     let mut cleaned_lines = Vec::new();
+    let mut in_fenced_code_block = false;
 
     for line in prompt_text.lines() {
+        let trimmed_start = line.trim_start();
+        if trimmed_start.starts_with("```") {
+            in_fenced_code_block = !in_fenced_code_block;
+            cleaned_lines.push(line.to_owned());
+            continue;
+        }
+
+        if in_fenced_code_block {
+            cleaned_lines.push(line.to_owned());
+            continue;
+        }
+
         let trimmed = line.trim();
         let directive = serde_json::from_str::<PromptDirective>(trimmed);
         match directive {
@@ -61,9 +74,7 @@ pub(crate) fn parse_prompt_directives(prompt_text: &str) -> ParsedPrompt {
                 }
             }
             _ => {
-                if !line.trim().is_empty() {
-                    cleaned_lines.push(line.to_owned());
-                }
+                cleaned_lines.push(line.to_owned());
             }
         }
     }

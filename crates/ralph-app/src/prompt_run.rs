@@ -459,8 +459,8 @@ mod tests {
         assert_eq!(
             *seen_prompts.lock().unwrap(),
             vec![
-                "# Prompt\nFirst version".to_owned(),
-                "# Prompt\nSecond version".to_owned()
+                "# Prompt\n\nFirst version".to_owned(),
+                "# Prompt\n\nSecond version".to_owned()
             ]
         );
     }
@@ -484,6 +484,34 @@ mod tests {
             ]
         );
         assert_eq!(parsed.prompt_text, "# Prompt\nBody");
+    }
+
+    #[test]
+    fn blank_lines_are_preserved_after_trimming_directives() {
+        let parsed = parse_prompt_directives(
+            "# Prompt\n\n{\"ralph\":\"watch\",\"path\":\"IMPLEMENTATION_PLAN.md\"}\n\nBody\n",
+        );
+
+        assert_eq!(
+            parsed.completion_criteria,
+            vec![CompletionCriterion::Watch {
+                path: "IMPLEMENTATION_PLAN.md".to_owned()
+            }]
+        );
+        assert_eq!(parsed.prompt_text, "# Prompt\n\n\nBody");
+    }
+
+    #[test]
+    fn directive_like_lines_inside_code_fences_are_preserved() {
+        let parsed = parse_prompt_directives(
+            "```json\n{\"ralph\":\"watch\",\"path\":\"IMPLEMENTATION_PLAN.md\"}\n```\n",
+        );
+
+        assert!(parsed.completion_criteria.is_empty());
+        assert_eq!(
+            parsed.prompt_text,
+            "```json\n{\"ralph\":\"watch\",\"path\":\"IMPLEMENTATION_PLAN.md\"}\n```"
+        );
     }
 
     #[test]
