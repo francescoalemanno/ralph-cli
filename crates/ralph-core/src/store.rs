@@ -277,13 +277,13 @@ impl TargetStore {
     }
 
     pub fn write_target_file(&self, target_id: &str, name: &str, contents: &str) -> Result<()> {
-        let paths = self.target_paths(target_id)?;
-        self.write_file(&paths.dir.join(name), contents)
+        let path = self.target_named_file_path(target_id, name)?;
+        self.write_file(&path, contents)
     }
 
     pub fn read_named_target_file(&self, target_id: &str, name: &str) -> Result<String> {
-        let paths = self.target_paths(target_id)?;
-        self.read_file(&paths.dir.join(name))
+        let path = self.target_named_file_path(target_id, name)?;
+        self.read_file(&path)
     }
 
     pub fn list_prompt_files(&self, target_id: &str) -> Result<Vec<PromptFile>> {
@@ -339,6 +339,12 @@ impl TargetStore {
         fs::read_to_string(path).with_context(|| format!("failed to read {path}"))
     }
 
+    fn target_named_file_path(&self, target_id: &str, name: &str) -> Result<Utf8PathBuf> {
+        validate_target_file_name(name)?;
+        let paths = self.target_paths(target_id)?;
+        Ok(paths.dir.join(name))
+    }
+
     fn write_file(&self, path: &Utf8Path, contents: &str) -> Result<()> {
         atomic_write(path, contents).with_context(|| format!("failed to write {path}"))
     }
@@ -346,6 +352,22 @@ impl TargetStore {
 
 pub fn is_prompt_file_name(name: &str) -> bool {
     name.ends_with(".md")
+}
+
+fn validate_target_file_name(name: &str) -> Result<()> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("target file name cannot be empty"));
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err(anyhow!(
+            "target file name must resolve inside the target directory"
+        ));
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(anyhow!("target file name cannot contain path separators"));
+    }
+    Ok(())
 }
 
 fn current_unix_timestamp() -> u64 {
@@ -640,5 +662,42 @@ mod tests {
             )
         );
         assert!(prompt.contains("4. Stop"));
+    }
+
+    #[test]
+    fn read_named_target_file_rejects_path_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = TargetStore::new(
+            camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
+        );
+        store
+            .create_target("demo", Some(ScaffoldId::SinglePrompt))
+            .unwrap();
+
+        let error = store
+            .read_named_target_file("demo", "../outside.md")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("target file name cannot contain path separators"));
+    }
+
+    #[test]
+    fn write_target_file_rejects_path_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let store = TargetStore::new(project_dir.clone());
+        store
+            .create_target("demo", Some(ScaffoldId::SinglePrompt))
+            .unwrap();
+
+        let outside_path = project_dir.join(".ralph/targets/escaped.md");
+        let error = store
+            .write_target_file("demo", "../escaped.md", "bad\n")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("target file name cannot contain path separators"));
+        assert!(!outside_path.exists());
     }
 }
