@@ -1,7 +1,6 @@
-use std::{
-    fs,
-    time::{SystemTime, UNIX_EPOCH},
-};
+mod console;
+mod prompt;
+mod workflow;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -12,54 +11,21 @@ use ralph_core::{
     TargetReview, TargetStore, TargetSummary, WorkflowMode,
 };
 use ralph_runner::{CommandRunner, RunnerAdapter, RunnerStreamEvent};
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
-const RALPH_ENV_PROJECT_DIR: &str = "{ralph-env:PROJECT_DIR}";
-const RALPH_ENV_TARGET_DIR: &str = "{ralph-env:TARGET_DIR}";
-const RALPH_ENV_PROMPT_PATH: &str = "{ralph-env:PROMPT_PATH}";
-const RALPH_ENV_PROMPT_NAME: &str = "{ralph-env:PROMPT_NAME}";
-const GOAL_DRIVEN_GOAL_FILE: &str = "GOAL.md";
-const GOAL_DRIVEN_PLAN_FILE: &str = "plan.toml";
-const GOAL_DRIVEN_SPECS_DIR: &str = "specs";
-const GOAL_DRIVEN_PLAN_PROMPT: &str = "goal_driven_plan";
-const GOAL_DRIVEN_BUILD_PROMPT: &str = "goal_driven_build";
-const GOAL_DRIVEN_PAUSED_PROMPT: &str = "goal_driven_paused";
-const TASK_BASED_PROGRESS_FILE: &str = "progress.toml";
-const TASK_BASED_JOURNAL_FILE: &str = "journal.txt";
-const TASK_BASED_BUILD_PROMPT: &str = "task_based_build";
-const TASK_BASED_PAUSED_PROMPT: &str = "task_based_paused";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedPrompt {
-    prompt_text: String,
-    completion_criteria: Vec<CompletionCriterion>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CompletionCriterion {
-    Watch { path: String },
-    NoLineContainsAll { path: String, tokens: Vec<String> },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "ralph", rename_all = "snake_case")]
-enum PromptDirective {
-    Watch {
-        path: String,
-    },
-    CompleteWhen {
-        #[serde(rename = "type")]
-        kind: CompletionDirectiveType,
-        path: String,
-        tokens: Vec<String>,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum CompletionDirectiveType {
-    NoLineContainsAll,
-}
+pub use console::ConsoleDelegate;
+pub(crate) use prompt::{
+    CompletionCriterion, ParsedPrompt, interpolate_prompt_env, parse_prompt_directives,
+};
+pub(crate) use workflow::{
+    GOAL_DRIVEN_BUILD_PROMPT, GOAL_DRIVEN_GOAL_FILE, GOAL_DRIVEN_PAUSED_PROMPT,
+    GOAL_DRIVEN_PLAN_PROMPT, TASK_BASED_BUILD_PROMPT, TASK_BASED_PAUSED_PROMPT,
+    TASK_BASED_PROGRESS_FILE,
+};
+use workflow::{
+    GoalDrivenAction, current_unix_timestamp, goal_driven_build_prompt, goal_driven_hashes,
+    goal_driven_plan_prompt, select_goal_driven_action, select_task_based_build_needed,
+    task_based_build_prompt, task_based_hashes,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PreparedPromptRun {
@@ -67,25 +33,6 @@ struct PreparedPromptRun {
     prompt_name: String,
     target_dir: Utf8PathBuf,
     raw_prompt: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GoalDrivenAction {
-    Plan,
-    Build,
-    Paused,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GoalDrivenHashes {
-    goal_hash: String,
-    content_hash: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TaskBasedHashes {
-    goal_hash: String,
-    content_hash: String,
 }
 
 #[derive(Debug, Clone)]
@@ -363,8 +310,8 @@ where
         }
 
         let target_dir = self.store.target_paths(target)?.dir;
-        let hashes = self.goal_driven_hashes(&target_dir)?;
-        let action = self.select_goal_driven_action(&target_config, &hashes);
+        let hashes = goal_driven_hashes(&self.store, &target_dir)?;
+        let action = select_goal_driven_action(&target_config, &hashes);
 
         if action == GoalDrivenAction::Paused {
             target_config.last_prompt = Some(GOAL_DRIVEN_PAUSED_PROMPT.to_owned());
@@ -435,7 +382,7 @@ where
             })?;
 
         if status == LastRunStatus::Completed {
-            let after_hashes = self.goal_driven_hashes(&target_dir)?;
+            let after_hashes = goal_driven_hashes(&self.store, &target_dir)?;
             let workflow = target_config
                 .workflow
                 .get_or_insert_with(GoalDrivenWorkflowState::default);
@@ -479,8 +426,8 @@ where
         }
 
         let target_dir = self.store.target_paths(target)?.dir;
-        let hashes = self.task_based_hashes(&target_dir)?;
-        let should_build = self.select_task_based_build_needed(&target_config, &hashes);
+        let hashes = task_based_hashes(&self.store, &target_dir)?;
+        let should_build = select_task_based_build_needed(&target_config, &hashes);
 
         if !should_build {
             target_config.last_prompt = Some(TASK_BASED_PAUSED_PROMPT.to_owned());
@@ -534,7 +481,7 @@ where
             })?;
 
         if status == LastRunStatus::Completed {
-            let after_hashes = self.task_based_hashes(&target_dir)?;
+            let after_hashes = task_based_hashes(&self.store, &target_dir)?;
             let workflow = target_config
                 .workflow
                 .get_or_insert_with(GoalDrivenWorkflowState::default);
@@ -614,141 +561,6 @@ where
         config.last_prompt = Some(prompt_name.to_owned());
         config.last_run_status = status;
         self.store.write_target_config(&config)
-    }
-
-    fn select_goal_driven_action(
-        &self,
-        config: &TargetConfig,
-        hashes: &GoalDrivenHashes,
-    ) -> GoalDrivenAction {
-        if let Some(inflight) = &config.inflight {
-            return match inflight.phase {
-                GoalDrivenPhase::Plan => GoalDrivenAction::Plan,
-                GoalDrivenPhase::Build => {
-                    if inflight.goal_hash == hashes.goal_hash {
-                        GoalDrivenAction::Build
-                    } else {
-                        GoalDrivenAction::Plan
-                    }
-                }
-                GoalDrivenPhase::Paused => GoalDrivenAction::Paused,
-            };
-        }
-
-        let workflow = config.workflow.clone().unwrap_or_default();
-        if workflow
-            .last_goal_hash
-            .as_deref()
-            .is_none_or(|hash| hash != hashes.goal_hash)
-        {
-            return GoalDrivenAction::Plan;
-        }
-
-        match workflow.phase {
-            GoalDrivenPhase::Plan => GoalDrivenAction::Plan,
-            GoalDrivenPhase::Build => GoalDrivenAction::Build,
-            GoalDrivenPhase::Paused => {
-                if workflow.last_content_hash.as_deref() == Some(hashes.content_hash.as_str()) {
-                    GoalDrivenAction::Paused
-                } else {
-                    GoalDrivenAction::Plan
-                }
-            }
-        }
-    }
-
-    fn select_task_based_build_needed(
-        &self,
-        config: &TargetConfig,
-        hashes: &TaskBasedHashes,
-    ) -> bool {
-        if config.inflight.is_some() {
-            return true;
-        }
-
-        let workflow = config.workflow.clone().unwrap_or_default();
-        if workflow
-            .last_goal_hash
-            .as_deref()
-            .is_none_or(|hash| hash != hashes.goal_hash)
-        {
-            return true;
-        }
-
-        match workflow.phase {
-            GoalDrivenPhase::Paused => {
-                workflow.last_content_hash.as_deref() != Some(hashes.content_hash.as_str())
-            }
-            GoalDrivenPhase::Plan | GoalDrivenPhase::Build => true,
-        }
-    }
-
-    fn goal_driven_hashes(&self, target_dir: &Utf8Path) -> Result<GoalDrivenHashes> {
-        let goal_path = target_dir.join(GOAL_DRIVEN_GOAL_FILE);
-        let goal_contents = self
-            .store
-            .read_file(&goal_path)
-            .with_context(|| format!("missing required goal file {}", goal_path))?;
-        let goal_hash = hash_bytes(goal_contents.as_bytes());
-
-        let mut hasher = Sha256::new();
-        hash_named_contents(&mut hasher, GOAL_DRIVEN_GOAL_FILE, goal_contents.as_bytes());
-
-        let plan_path = target_dir.join(GOAL_DRIVEN_PLAN_FILE);
-        if plan_path.exists() {
-            hash_named_contents(
-                &mut hasher,
-                GOAL_DRIVEN_PLAN_FILE,
-                self.store.read_file(&plan_path)?.as_bytes(),
-            );
-        }
-
-        let specs_dir = target_dir.join(GOAL_DRIVEN_SPECS_DIR);
-        if specs_dir.exists() {
-            let mut paths = walk_files(&specs_dir)?;
-            paths.sort();
-            for path in paths {
-                let relative = path
-                    .strip_prefix(target_dir)
-                    .map_err(|_| anyhow!("failed to compute relative path for {}", path))?;
-                hash_named_contents(
-                    &mut hasher,
-                    relative.as_str(),
-                    self.store.read_file(&path)?.as_bytes(),
-                );
-            }
-        }
-
-        Ok(GoalDrivenHashes {
-            goal_hash,
-            content_hash: format!("sha256:{:x}", hasher.finalize()),
-        })
-    }
-
-    fn task_based_hashes(&self, target_dir: &Utf8Path) -> Result<TaskBasedHashes> {
-        let goal_path = target_dir.join(GOAL_DRIVEN_GOAL_FILE);
-        let goal_contents = self
-            .store
-            .read_file(&goal_path)
-            .with_context(|| format!("missing required goal file {}", goal_path))?;
-        let goal_hash = hash_bytes(goal_contents.as_bytes());
-
-        let mut hasher = Sha256::new();
-        hash_named_contents(&mut hasher, GOAL_DRIVEN_GOAL_FILE, goal_contents.as_bytes());
-
-        let progress_path = target_dir.join(TASK_BASED_PROGRESS_FILE);
-        if progress_path.exists() {
-            hash_named_contents(
-                &mut hasher,
-                TASK_BASED_PROGRESS_FILE,
-                self.store.read_file(&progress_path)?.as_bytes(),
-            );
-        }
-
-        Ok(TaskBasedHashes {
-            goal_hash,
-            content_hash: format!("sha256:{:x}", hasher.finalize()),
-        })
     }
 
     async fn run_prepared_prompt<D>(
@@ -1023,245 +835,11 @@ where
     }
 }
 
-fn parse_prompt_directives(prompt_text: &str) -> ParsedPrompt {
-    let mut completion_criteria = Vec::new();
-    let mut cleaned_lines = Vec::new();
-
-    for line in prompt_text.lines() {
-        let trimmed = line.trim();
-        let directive = serde_json::from_str::<PromptDirective>(trimmed);
-        match directive {
-            Ok(PromptDirective::Watch { path }) if !path.trim().is_empty() => {
-                completion_criteria.push(CompletionCriterion::Watch { path });
-            }
-            Ok(PromptDirective::CompleteWhen { kind, path, tokens })
-                if !path.trim().is_empty() && !tokens.is_empty() =>
-            {
-                match kind {
-                    CompletionDirectiveType::NoLineContainsAll => {
-                        completion_criteria
-                            .push(CompletionCriterion::NoLineContainsAll { path, tokens });
-                    }
-                }
-            }
-            _ => {
-                if !line.trim().is_empty() {
-                    cleaned_lines.push(line.to_owned());
-                }
-            }
-        }
-    }
-
-    ParsedPrompt {
-        prompt_text: cleaned_lines.join("\n"),
-        completion_criteria,
-    }
-}
-
-fn interpolate_prompt_env(
-    prompt_text: &str,
-    project_dir: &Utf8Path,
-    target_dir: &Utf8Path,
-    prompt_path: &Utf8Path,
-    prompt_name: &str,
-) -> Result<String> {
-    let replacements = [
-        (RALPH_ENV_PROJECT_DIR, absolute_unix_path(project_dir)?),
-        (RALPH_ENV_TARGET_DIR, absolute_unix_path(target_dir)?),
-        (RALPH_ENV_PROMPT_PATH, absolute_unix_path(prompt_path)?),
-        (RALPH_ENV_PROMPT_NAME, prompt_name.to_owned()),
-    ];
-
-    let mut interpolated = prompt_text.to_owned();
-    for (needle, value) in replacements {
-        interpolated = interpolated.replace(needle, &value);
-    }
-    Ok(interpolated)
-}
-
-fn absolute_unix_path(path: &Utf8Path) -> Result<String> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        let cwd =
-            Utf8PathBuf::from_path_buf(std::env::current_dir().context("failed to read cwd")?)
-                .map_err(|_| anyhow!("current directory is not valid UTF-8"))?;
-        cwd.join(path)
-    };
-    Ok(absolute.as_str().replace('\\', "/"))
-}
-
 fn resolve_available_agent(preferred: CodingAgent, detected: &[CodingAgent]) -> CodingAgent {
     if detected.is_empty() || detected.contains(&preferred) {
         preferred
     } else {
         detected[0]
-    }
-}
-
-fn goal_driven_plan_prompt() -> String {
-    format!(
-        r#"1. Study these inputs before planning:
-   a. Study `{target_dir}/GOAL.md`.
-   b. Study `{target_dir}/plan.toml` if it exists.
-   c. Study all spec files in `{target_dir}/specs/`.
-2. Study the relevant repository documentation and source code (do not assume something is not implemented, look deeply).
-3. Create or revise the spec files in `{target_dir}/specs/` until the functional requirements, non-functional requirements, constraints, and user-visible outcomes are clear enough to build against without guessing.
-4. Only after the specifications are coherent and sufficient, create or revise `{target_dir}/plan.toml` as the current operational plan.
-5. `plan.toml` must stay valid TOML and follow this exact shape:
-
-```toml
-version = 1
-
-[[items]]
-category = "functional" # or "non_functional"
-description = "Describe one concrete outcome"
-steps = ["List the ordered implementation and verification steps"]
-completed = false
-```
-
-6. Keep the items in the exact execution order. Earlier items must prepare later items; do not rely on later items to make earlier items possible.
-7. Use `category` to distinguish functional and non-functional work when relevant.
-8. Keep every incomplete item at `completed = false`.
-9. Plan only. Do not implement product code or tests.
-10. If the specifications and `plan.toml` are already correct and sufficient, leave `{target_dir}/plan.toml` unchanged.
-
-{{"ralph":"watch","path":"{target_dir}/plan.toml"}}
-"#,
-        target_dir = RALPH_ENV_TARGET_DIR
-    )
-}
-
-fn goal_driven_build_prompt() -> String {
-    format!(
-        r#"1. Study these inputs before building:
-   a. Study `{target_dir}/GOAL.md`.
-   b. Study `{target_dir}/plan.toml`.
-   c. Study all spec files in `{target_dir}/specs/`.
-   d. Study `{target_dir}/journal.txt` if it exists.
-   e. Study `AGENTS.md` if it exists.
-2. Study the relevant repository documentation and source code (do not assume something is not implemented, look deeply).
-3. Select the single highest-priority open item with the highest leverage from `{target_dir}/plan.toml`.
-4. Execute only that item completely against the current target-local specifications and plan. Do not leave placeholders or partial implementations behind.
-5. Run the checks relevant to the code you changed.
-6. Update `{target_dir}/plan.toml` so it accurately records completed work and any remaining follow-up.
-   `plan.toml` must stay valid TOML and follow this exact shape:
-
-```toml
-version = 1
-
-[[items]]
-category = "functional"
-description = "Describe one concrete outcome"
-steps = ["List the ordered implementation and verification steps"]
-completed = false
-```
-7. Create or update `{target_dir}/journal.txt` as a free-form builder journal for future iterations. Record what you changed, what you verified, and any concrete follow-up notes useful to the next build iteration.
-8. Do not edit `{target_dir}/GOAL.md`.
-9. Update `AGENTS.md` only when you learn durable operational guidance about running or debugging the project.
-
-{{"ralph":"complete_when","type":"no_line_contains_all","path":"{target_dir}/plan.toml","tokens":["completed","false"]}}
-"#,
-        target_dir = RALPH_ENV_TARGET_DIR
-    )
-}
-
-fn task_based_build_prompt() -> String {
-    format!(
-        r#"1. Study these inputs before building:
-   a. Study `{target_dir}/GOAL.md` as the CEO input.
-   b. Study `{target_dir}/progress.toml`.
-   c. Study `{target_dir}/{journal_file}` if it exists.
-   d. Study `AGENTS.md` if it exists.
-2. Study the relevant repository documentation and source code (do not assume something is not implemented, look deeply).
-3. Select the single highest-priority open item with the highest leverage from `{target_dir}/progress.toml`.
-4. Execute only that item completely. Do not leave placeholders or partial implementations behind.
-5. Run the checks relevant to the code you changed.
-6. Update `{target_dir}/progress.toml` so it accurately records completed work and any remaining follow-up.
-   `progress.toml` must stay valid TOML and follow this exact shape:
-
-```toml
-version = 1
-
-[[items]]
-description = "..."
-steps = ["..."]
-completed = false
-```
-7. Create or update `{target_dir}/{journal_file}` as a free-form builder journal for future iterations. Record what you changed, what you verified, and any concrete follow-up notes useful to the next build iteration.
-8. Do not edit `{target_dir}/GOAL.md`.
-9. Update `AGENTS.md` only when you learn durable operational guidance about running or debugging the project.
-
-{{"ralph":"complete_when","type":"no_line_contains_all","path":"{target_dir}/progress.toml","tokens":["completed","false"]}}
-"#,
-        target_dir = RALPH_ENV_TARGET_DIR,
-        journal_file = TASK_BASED_JOURNAL_FILE
-    )
-}
-
-fn current_unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("sha256:{:x}", hasher.finalize())
-}
-
-fn hash_named_contents(hasher: &mut Sha256, name: &str, contents: &[u8]) {
-    hasher.update(name.as_bytes());
-    hasher.update([0]);
-    hasher.update(contents);
-    hasher.update([0xff]);
-}
-
-fn walk_files(dir: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir))? {
-        let entry = entry?;
-        let path = Utf8PathBuf::from_path_buf(entry.path())
-            .map_err(|_| anyhow!("non-UTF8 path under {}", dir))?;
-        if path.is_dir() {
-            files.extend(walk_files(&path)?);
-        } else if path.is_file() {
-            files.push(path);
-        }
-    }
-    Ok(files)
-}
-
-#[derive(Default)]
-pub struct ConsoleDelegate;
-
-#[async_trait]
-impl RunDelegate for ConsoleDelegate {
-    async fn on_event(&mut self, event: RunEvent) -> Result<()> {
-        match event {
-            RunEvent::IterationStarted {
-                prompt_name,
-                iteration,
-                max_iterations,
-            } => {
-                println!(
-                    "{}",
-                    format_iteration_banner(&prompt_name, iteration, max_iterations)
-                );
-            }
-            RunEvent::Output(chunk) => {
-                print!("{chunk}");
-            }
-            RunEvent::Note(note) => {
-                eprintln!("{note}");
-            }
-            RunEvent::Finished { status, summary } => {
-                println!("\n{} ({})", summary, status.label());
-            }
-        }
-        Ok(())
     }
 }
 
