@@ -23,7 +23,9 @@ use ralph_app::{RalphApp, RunDelegate, RunEvent};
 use ralph_core::{RunControl, ScaffoldId, TargetReview, TargetSummary};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::runtime::Handle;
-use ui::{process_terminal_text, resume_terminal, suspend_terminal};
+use ui::{normalize_terminal_text, resume_terminal, suspend_terminal};
+
+const RUNNING_SCROLLBACK_LIMIT: usize = 100_000;
 
 pub fn run_tui(app: RalphApp) -> Result<()> {
     run_tui_with_target(app, None)
@@ -88,9 +90,58 @@ struct RunningState {
     max_iterations: usize,
     control: RunControl,
     terminal: vt100::Parser,
+    terminal_bytes: Vec<u8>,
+    terminal_rows: u16,
+    terminal_cols: u16,
     finished: bool,
     scroll: usize,
     follow: bool,
+}
+
+impl RunningState {
+    fn new(
+        target_id: String,
+        prompt_name: String,
+        requested_prompt: Option<String>,
+        control: RunControl,
+    ) -> Self {
+        let terminal_rows = 24;
+        let terminal_cols = 80;
+        Self {
+            target_id,
+            prompt_name,
+            requested_prompt,
+            iteration: 0,
+            max_iterations: 0,
+            control,
+            terminal: vt100::Parser::new(terminal_rows, terminal_cols, RUNNING_SCROLLBACK_LIMIT),
+            terminal_bytes: Vec::new(),
+            terminal_rows,
+            terminal_cols,
+            finished: false,
+            scroll: 0,
+            follow: true,
+        }
+    }
+
+    fn push_terminal_text(&mut self, text: &str) {
+        let normalized = normalize_terminal_text(text);
+        self.terminal_bytes.extend_from_slice(&normalized);
+        self.terminal.process(&normalized);
+    }
+
+    fn ensure_terminal_size(&mut self, rows: u16, cols: u16) {
+        if self.terminal_rows == rows && self.terminal_cols == cols {
+            return;
+        }
+
+        self.terminal_rows = rows;
+        self.terminal_cols = cols;
+
+        let mut terminal = vt100::Parser::new(rows, cols, RUNNING_SCROLLBACK_LIMIT);
+        terminal.process(&self.terminal_bytes);
+        self.terminal = terminal;
+    }
 }
 
 struct TuiApp {
@@ -429,30 +480,27 @@ impl TuiApp {
                             running.prompt_name = prompt_name.clone();
                             running.iteration = iteration;
                             running.max_iterations = max_iterations;
-                            process_terminal_text(
-                                &mut running.terminal,
-                                &format!(
-                                    "{}\n",
-                                    ralph_app::format_iteration_banner(
-                                        &prompt_name,
-                                        iteration,
-                                        max_iterations
-                                    )
-                                ),
-                            );
+                            running.push_terminal_text(&format!(
+                                "{}\n",
+                                ralph_app::format_iteration_banner(
+                                    &prompt_name,
+                                    iteration,
+                                    max_iterations
+                                )
+                            ));
                         }
                         RunEvent::Output(chunk) => {
-                            process_terminal_text(&mut running.terminal, &chunk);
+                            running.push_terminal_text(&chunk);
                         }
                         RunEvent::Note(note) => {
-                            process_terminal_text(&mut running.terminal, &format!("\n{note}\n"));
+                            running.push_terminal_text(&format!("\n{note}\n"));
                         }
                         RunEvent::Finished { status, summary } => {
                             running.finished = true;
-                            process_terminal_text(
-                                &mut running.terminal,
-                                &format!("\n{summary} ({})\nPress Esc to return.", status.label()),
-                            );
+                            running.push_terminal_text(&format!(
+                                "\n{summary} ({})\nPress Esc to return.",
+                                status.label()
+                            ));
                         }
                     }
                     if running.follow {
@@ -472,10 +520,8 @@ impl TuiApp {
                 Err(error) => {
                     if let Some(running) = &mut self.running {
                         running.finished = true;
-                        process_terminal_text(
-                            &mut running.terminal,
-                            &format!("\nerror: {error}\nPress Esc to return."),
-                        );
+                        running
+                            .push_terminal_text(&format!("\nerror: {error}\nPress Esc to return."));
                     }
                 }
             },
@@ -577,18 +623,12 @@ impl TuiApp {
         let display_prompt = requested_prompt
             .clone()
             .unwrap_or_else(|| "workflow_auto".to_owned());
-        self.running = Some(RunningState {
-            target_id: target_id.to_owned(),
-            prompt_name: display_prompt,
-            requested_prompt: requested_prompt.clone(),
-            iteration: 0,
-            max_iterations: 0,
+        self.running = Some(RunningState::new(
+            target_id.to_owned(),
+            display_prompt,
+            requested_prompt.clone(),
             control,
-            terminal: vt100::Parser::new(24, 80, 100_000),
-            finished: false,
-            scroll: 0,
-            follow: true,
-        });
+        ));
         self.screen = Screen::Running;
 
         self.handle.spawn(async move {
@@ -793,22 +833,34 @@ mod tests {
 
         let runtime = Runtime::new()?;
         let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
-        tui.running = Some(super::RunningState {
-            target_id: "demo".to_owned(),
-            prompt_name: "1_build.md".to_owned(),
-            requested_prompt: Some("1_build.md".to_owned()),
-            iteration: 0,
-            max_iterations: 0,
-            control: ralph_core::RunControl::new(),
-            terminal: vt100::Parser::new(24, 80, 100_000),
-            finished: false,
-            scroll: 0,
-            follow: true,
-        });
+        tui.running = Some(super::RunningState::new(
+            "demo".to_owned(),
+            "1_build.md".to_owned(),
+            Some("1_build.md".to_owned()),
+            ralph_core::RunControl::new(),
+        ));
 
         let edit_path = tui.resolve_running_edit_path()?;
 
         assert_eq!(edit_path, summary.prompt_files[1].path);
         Ok(())
+    }
+
+    #[test]
+    fn running_terminal_resize_reflows_from_full_transcript() {
+        let mut running = super::RunningState::new(
+            "demo".to_owned(),
+            "prompt_main.md".to_owned(),
+            Some("prompt_main.md".to_owned()),
+            ralph_core::RunControl::new(),
+        );
+        let long_line = "abcdefghijklmnopqrstuvwxyz0123456789";
+
+        running.push_terminal_text(&format!("{long_line}\n"));
+        running.ensure_terminal_size(24, 10);
+        running.ensure_terminal_size(24, 80);
+
+        let output = running.terminal.screen().contents();
+        assert!(output.contains(long_line));
     }
 }

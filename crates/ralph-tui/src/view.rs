@@ -614,9 +614,7 @@ impl TuiApp {
             .style(Style::default().bg(self.background_color()));
         let inner = block.inner(sections[1]);
         let output = if let Some(running) = &mut self.running {
-            running
-                .terminal
-                .set_size(inner.height.max(1), inner.width.max(1));
+            running.ensure_terminal_size(inner.height.max(1), inner.width.max(1));
             let scroll = if running.follow { 0 } else { running.scroll };
             running.terminal.set_scrollback(scroll);
             running.terminal.screen().contents()
@@ -625,7 +623,8 @@ impl TuiApp {
         };
         let paragraph = Paragraph::new(output)
             .block(block)
-            .style(Style::default().fg(self.text_color()));
+            .style(Style::default().fg(self.text_color()))
+            .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, sections[1]);
     }
 
@@ -761,4 +760,65 @@ fn shortcut_spans(hints: &[ShortcutHint], app: &TuiApp) -> Vec<Span<'static>> {
         ));
     }
     spans
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::Result;
+    use camino::Utf8PathBuf;
+    use ralph_app::RalphApp;
+    use ralph_core::ScaffoldId;
+    use ratatui::{Terminal, backend::TestBackend};
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
+
+    use crate::{RunningState, Screen, TuiApp};
+
+    fn temp_project_dir() -> (TempDir, Utf8PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        (temp, path)
+    }
+
+    fn buffer_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buffer = terminal.backend().buffer();
+        let width = buffer.area.width as usize;
+
+        buffer
+            .content
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn live_run_stream_soft_wraps_long_logical_lines() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir)?;
+        app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+        let mut running = RunningState::new(
+            "demo".to_owned(),
+            "prompt_main.md".to_owned(),
+            Some("prompt_main.md".to_owned()),
+            ralph_core::RunControl::new(),
+        );
+        running.push_terminal_text(
+            "softwrapalpha softwrapbeta softwrapgamma softwrapdelta softwrapepsilon",
+        );
+        tui.running = Some(running);
+        tui.screen = Screen::Running;
+
+        let backend = TestBackend::new(48, 18);
+        let mut terminal = Terminal::new(backend)?;
+        terminal.draw(|frame| tui.draw(frame))?;
+
+        let rows = buffer_rows(&terminal);
+        assert!(rows.iter().any(|row| row.contains("softwrapalpha")));
+        assert!(rows.iter().any(|row| row.contains("softwrapepsilon")));
+
+        Ok(())
+    }
 }

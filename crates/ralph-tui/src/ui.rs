@@ -80,7 +80,7 @@ pub(crate) fn key_style(color: Color) -> Style {
     Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
-pub(crate) fn process_terminal_text(terminal: &mut vt100::Parser, text: &str) {
+pub(crate) fn normalize_terminal_text(text: &str) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(text.len() + 16);
     let mut previous = None;
     for byte in text.bytes() {
@@ -90,7 +90,7 @@ pub(crate) fn process_terminal_text(terminal: &mut vt100::Parser, text: &str) {
         normalized.push(byte);
         previous = Some(byte);
     }
-    terminal.process(&normalized);
+    normalized
 }
 
 pub(crate) fn status_badge(status: LastRunStatus) -> &'static str {
