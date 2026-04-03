@@ -6,7 +6,7 @@ use std::sync::{
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 
-use crate::config::CodingAgent;
+use crate::CodingAgent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
