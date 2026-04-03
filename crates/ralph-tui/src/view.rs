@@ -1,4 +1,4 @@
-use ralph_core::{LastRunStatus, ScaffoldId};
+use ralph_core::LastRunStatus;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -373,10 +373,7 @@ impl TuiApp {
             );
             frame.render_widget(header, sections[0]);
 
-            let uses_hidden_workflow = matches!(
-                target.scaffold,
-                Some(ScaffoldId::TaskBased | ScaffoldId::GoalDriven)
-            );
+            let uses_hidden_workflow = target.uses_hidden_workflow();
             let titles = if uses_hidden_workflow {
                 vec![Line::from("workflow input")]
             } else if target.prompt_files.is_empty() {

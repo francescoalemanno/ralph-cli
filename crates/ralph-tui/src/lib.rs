@@ -100,12 +100,8 @@ struct TuiApp {
 
 impl TuiApp {
     fn selected_target_uses_hidden_workflow(&self) -> bool {
-        self.selected_target().is_some_and(|target| {
-            matches!(
-                target.scaffold,
-                Some(ScaffoldId::TaskBased | ScaffoldId::GoalDriven)
-            )
-        })
+        self.selected_target()
+            .is_some_and(ralph_core::TargetSummary::uses_hidden_workflow)
     }
 
     fn new(app: RalphApp, handle: Handle, target: Option<String>) -> Self {
@@ -731,6 +727,23 @@ mod tests {
 
         assert_ne!(original_contents, refreshed_contents);
         assert_eq!(refreshed_contents.as_deref(), Some("# Prompt\n\nUpdated\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_targets_are_detected_from_mode_even_without_scaffold() -> Result<()> {
+        let project_dir = temp_project_dir();
+        let app = RalphApp::load(project_dir.clone())?;
+        app.create_target("demo", Some(ScaffoldId::GoalDriven))?;
+        std::fs::write(
+            project_dir.join(".ralph/targets/demo/target.toml"),
+            "id = \"demo\"\nmode = \"goal_driven\"\nlast_run_status = \"never_run\"\n\n[workflow]\nphase = \"plan\"\n",
+        )?;
+
+        let runtime = Runtime::new()?;
+        let tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+
+        assert!(tui.selected_target_uses_hidden_workflow());
         Ok(())
     }
 }

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
     AppConfig, CodingAgent, LastRunStatus, PromptFile, ScaffoldId, TargetReview, TargetStore,
-    TargetSummary, WorkflowMode,
+    TargetSummary,
 };
 use ralph_runner::CommandRunner;
 use workflow::GOAL_DRIVEN_GOAL_FILE;
@@ -136,10 +136,7 @@ impl<R> RalphApp<R> {
         let config = self.store.read_target_config(target)?;
         let target_dir = self.store.target_paths(target)?.dir;
 
-        if matches!(
-            config.mode,
-            Some(WorkflowMode::GoalDriven | WorkflowMode::TaskBased)
-        ) {
+        if config.uses_hidden_workflow() {
             return match requested_file {
                 None | Some(GOAL_DRIVEN_GOAL_FILE) => Ok(target_dir.join(GOAL_DRIVEN_GOAL_FILE)),
                 Some(name) => Err(anyhow!(
@@ -161,10 +158,7 @@ impl<R> RalphApp<R> {
         target_summary: &TargetSummary,
         prompt_name: Option<&str>,
     ) -> Result<PromptFile> {
-        if matches!(
-            target_summary.mode,
-            Some(WorkflowMode::GoalDriven | WorkflowMode::TaskBased)
-        ) {
+        if target_summary.uses_hidden_workflow() {
             return Err(anyhow!(
                 "target '{}' uses a workflow mode and does not expose runnable prompts",
                 target_summary.id

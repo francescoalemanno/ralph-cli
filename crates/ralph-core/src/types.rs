@@ -111,6 +111,15 @@ pub struct TargetConfig {
     pub last_run_status: LastRunStatus,
 }
 
+impl TargetConfig {
+    pub fn uses_hidden_workflow(&self) -> bool {
+        matches!(
+            self.mode,
+            Some(WorkflowMode::TaskBased | WorkflowMode::GoalDriven)
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetPaths {
     pub dir: Utf8PathBuf,
@@ -141,6 +150,15 @@ pub struct TargetSummary {
     pub created_at: Option<u64>,
     pub last_prompt: Option<String>,
     pub last_run_status: LastRunStatus,
+}
+
+impl TargetSummary {
+    pub fn uses_hidden_workflow(&self) -> bool {
+        matches!(
+            self.mode,
+            Some(WorkflowMode::TaskBased | WorkflowMode::GoalDriven)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,7 +255,7 @@ impl RunControl {
 
 #[cfg(test)]
 mod tests {
-    use super::{LastRunStatus, RunControl, ScaffoldId};
+    use super::{LastRunStatus, RunControl, ScaffoldId, TargetConfig, TargetSummary, WorkflowMode};
     use crate::CodingAgent;
 
     #[test]
@@ -270,5 +288,34 @@ mod tests {
         assert_eq!(ScaffoldId::PlanBuild.as_str(), "plan_build");
         assert_eq!(ScaffoldId::TaskBased.as_str(), "task_based");
         assert_eq!(ScaffoldId::GoalDriven.as_str(), "goal_driven");
+    }
+
+    #[test]
+    fn workflow_visibility_comes_from_mode() {
+        let config = TargetConfig {
+            id: "demo".to_owned(),
+            scaffold: None,
+            mode: Some(WorkflowMode::GoalDriven),
+            workflow: None,
+            inflight: None,
+            created_at: None,
+            max_iterations: None,
+            last_prompt: None,
+            last_run_status: LastRunStatus::NeverRun,
+        };
+        let summary = TargetSummary {
+            id: "demo".to_owned(),
+            dir: camino::Utf8PathBuf::from("/tmp/demo"),
+            prompt_files: Vec::new(),
+            files: Vec::new(),
+            scaffold: None,
+            mode: Some(WorkflowMode::TaskBased),
+            created_at: None,
+            last_prompt: None,
+            last_run_status: LastRunStatus::NeverRun,
+        };
+
+        assert!(config.uses_hidden_workflow());
+        assert!(summary.uses_hidden_workflow());
     }
 }
