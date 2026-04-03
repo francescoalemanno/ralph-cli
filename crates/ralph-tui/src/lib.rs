@@ -232,12 +232,13 @@ impl TuiApp {
             }
             KeyCode::Char('r') => self.start_run()?,
             KeyCode::Char('e') => {
-                let Some(target) = self.selected_target() else {
-                    self.message = "select a target first".to_owned();
-                    return Ok(());
+                let prompt_path = match self.resolve_selected_edit_path() {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.message = error.to_string();
+                        return Ok(());
+                    }
                 };
-                let target_id = target.id.clone();
-                let prompt_path = self.app.resolve_target_edit_path(&target_id, None)?;
                 let editor = self.app.config().editor_override.clone();
                 suspend_terminal(terminal)?;
                 let result = edit_file(&prompt_path, editor.as_deref());
@@ -367,11 +368,7 @@ impl TuiApp {
                 self.cycle_agent(running_control)?;
             }
             KeyCode::Char('e') => {
-                let Some(running) = self.running.as_ref() else {
-                    return Ok(());
-                };
-                let target_id = running.target_id.clone();
-                let prompt_path = self.app.resolve_target_edit_path(&target_id, None)?;
+                let prompt_path = self.resolve_running_edit_path()?;
                 let editor = self.app.config().editor_override.clone();
                 suspend_terminal(terminal)?;
                 let result = edit_file(&prompt_path, editor.as_deref());
@@ -517,6 +514,28 @@ impl TuiApp {
         let target = self.selected_target()?;
         let prompt = self.selected_prompt()?;
         Some((target.id.clone(), prompt.name.clone()))
+    }
+
+    fn resolve_selected_edit_path(&self) -> Result<camino::Utf8PathBuf> {
+        let Some(target) = self.selected_target() else {
+            return Err(anyhow!("select a target first"));
+        };
+        let target_id = target.id.clone();
+        let prompt_name = if target.uses_hidden_workflow() {
+            None
+        } else {
+            self.selected_prompt().map(|prompt| prompt.name.clone())
+        };
+        self.app
+            .resolve_target_edit_path(&target_id, prompt_name.as_deref())
+    }
+
+    fn resolve_running_edit_path(&self) -> Result<camino::Utf8PathBuf> {
+        let Some(running) = self.running.as_ref() else {
+            return Err(anyhow!("no run in progress"));
+        };
+        self.app
+            .resolve_target_edit_path(&running.target_id, running.requested_prompt.as_deref())
     }
 
     fn start_run(&mut self) -> Result<()> {
@@ -736,6 +755,49 @@ mod tests {
         let tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
 
         assert!(tui.selected_target_uses_hidden_workflow());
+        Ok(())
+    }
+
+    #[test]
+    fn selected_prompt_edit_path_tracks_selected_tab() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir.clone())?;
+        let summary = app.create_target("demo", Some(ScaffoldId::PlanBuild))?;
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+        tui.selected_prompt = 1;
+
+        let edit_path = tui.resolve_selected_edit_path()?;
+
+        assert_eq!(edit_path, summary.prompt_files[1].path);
+        Ok(())
+    }
+
+    #[test]
+    fn running_prompt_edit_path_tracks_requested_prompt() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir)?;
+        let summary = app.create_target("demo", Some(ScaffoldId::PlanBuild))?;
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+        tui.running = Some(super::RunningState {
+            target_id: "demo".to_owned(),
+            prompt_name: "1_build.md".to_owned(),
+            requested_prompt: Some("1_build.md".to_owned()),
+            iteration: 0,
+            max_iterations: 0,
+            control: ralph_core::RunControl::new(),
+            terminal: vt100::Parser::new(24, 80, 100_000),
+            finished: false,
+            scroll: 0,
+            follow: true,
+        });
+
+        let edit_path = tui.resolve_running_edit_path()?;
+
+        assert_eq!(edit_path, summary.prompt_files[1].path);
         Ok(())
     }
 }
