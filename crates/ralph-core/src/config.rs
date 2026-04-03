@@ -144,7 +144,7 @@ impl AppConfig {
     }
 
     pub fn set_coding_agent(&mut self, agent: CodingAgent) {
-        self.runner = RunnerConfig::for_agent(agent);
+        self.runner = self.runner.with_agent_preserving_env(agent);
     }
 
     pub fn select_detected_coding_agent(&mut self, detected: &[CodingAgent]) -> bool {
@@ -394,8 +394,11 @@ fn default_warning_color() -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
 
-    use super::{AppConfig, merge_runner};
+    use camino::Utf8PathBuf;
+
+    use super::{AppConfig, ConfigFileScope, merge_runner};
     use crate::{CodingAgent, PromptTransport, RunnerConfig};
 
     #[test]
@@ -403,6 +406,40 @@ mod tests {
         let mut config = AppConfig::default();
         config.set_coding_agent(CodingAgent::Codex);
         assert_eq!(config.runner.program, "codex");
+    }
+
+    #[test]
+    fn switching_agent_preserves_runner_env_overrides() {
+        let mut config = AppConfig {
+            runner: RunnerConfig {
+                env: BTreeMap::from([
+                    ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
+                    ("RUST_LOG".to_owned(), "debug".to_owned()),
+                ]),
+                ..RunnerConfig::for_agent(CodingAgent::Opencode)
+            },
+            ..Default::default()
+        };
+
+        config.set_coding_agent(CodingAgent::Codex);
+
+        assert_eq!(config.runner.program, "codex");
+        assert_eq!(
+            config.runner.args,
+            vec![
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--ephemeral"
+            ]
+        );
+        assert_eq!(
+            config.runner.env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("test-key")
+        );
+        assert_eq!(
+            config.runner.env.get("RUST_LOG").map(String::as_str),
+            Some("debug")
+        );
     }
 
     #[test]
@@ -451,5 +488,43 @@ mod tests {
             },
         );
         assert_eq!(merged.env.get("A").map(String::as_str), Some("B"));
+    }
+
+    #[test]
+    fn persisted_agent_switch_keeps_project_runner_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let config_dir = project_dir.join(".ralph");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"[runner]
+program = "opencode"
+args = ["run"]
+
+[runner.env]
+OPENAI_API_KEY = "test-key"
+RUST_LOG = "debug"
+"#,
+        )
+        .unwrap();
+
+        AppConfig::persist_scoped_coding_agent(
+            &project_dir,
+            ConfigFileScope::Project,
+            CodingAgent::Codex,
+        )
+        .unwrap();
+
+        let config = AppConfig::load(&project_dir).unwrap();
+        assert_eq!(config.runner.program, "codex");
+        assert_eq!(
+            config.runner.env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("test-key")
+        );
+        assert_eq!(
+            config.runner.env.get("RUST_LOG").map(String::as_str),
+            Some("debug")
+        );
     }
 }

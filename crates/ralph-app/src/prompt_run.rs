@@ -212,13 +212,16 @@ where
     fn runner_config_for(&self, control: &RunControl) -> RunnerConfig {
         let detected = CodingAgent::detected();
         if let Some(agent) = control.coding_agent() {
-            return RunnerConfig::for_agent(resolve_available_agent(agent, &detected));
+            return self
+                .config
+                .runner
+                .with_agent_preserving_env(resolve_available_agent(agent, &detected));
         }
 
         if let Some(agent) = self.config.runner.inferred_agent() {
             let resolved = resolve_available_agent(agent, &detected);
             if resolved != agent {
-                return RunnerConfig::for_agent(resolved);
+                return self.config.runner.with_agent_preserving_env(resolved);
             }
         }
 
@@ -278,13 +281,15 @@ fn resolve_available_agent(preferred: CodingAgent, detected: &[CodingAgent]) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
     use anyhow::Result;
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
     use ralph_core::{
-        AppConfig, CodingAgent, RunControl, RunnerInvocation, RunnerResult, ScaffoldId,
+        AppConfig, CodingAgent, RunControl, RunnerConfig, RunnerInvocation, RunnerResult,
+        ScaffoldId,
     };
     use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
     use tokio::sync::mpsc::UnboundedSender;
@@ -305,6 +310,11 @@ mod tests {
     #[derive(Clone)]
     struct SteeringRunner {
         seen_prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct ConfigCapturingRunner {
+        seen_configs: Arc<Mutex<Vec<RunnerConfig>>>,
     }
 
     #[async_trait]
@@ -345,6 +355,23 @@ mod tests {
                 std::fs::write(&invocation.prompt_path, "# Prompt\n\nSecond version\n").unwrap();
             }
 
+            Ok(RunnerResult {
+                output: String::new(),
+                exit_code: 0,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RunnerAdapter for ConfigCapturingRunner {
+        async fn run(
+            &self,
+            config: &ralph_core::RunnerConfig,
+            _invocation: RunnerInvocation,
+            _control: &RunControl,
+            _stream: Option<UnboundedSender<RunnerStreamEvent>>,
+        ) -> Result<RunnerResult> {
+            self.seen_configs.lock().unwrap().push(config.clone());
             Ok(RunnerResult {
                 output: String::new(),
                 exit_code: 0,
@@ -565,6 +592,49 @@ mod tests {
         assert_eq!(
             resolve_available_agent(CodingAgent::Raijin, &[]),
             CodingAgent::Raijin
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_agent_override_preserves_runner_env_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let seen_configs = Arc::new(Mutex::new(Vec::new()));
+        let app = RalphApp::new(
+            project_dir.clone(),
+            AppConfig {
+                max_iterations: 1,
+                runner: RunnerConfig {
+                    env: BTreeMap::from([("OPENAI_API_KEY".to_owned(), "test-key".to_owned())]),
+                    ..RunnerConfig::for_agent(CodingAgent::Opencode)
+                },
+                ..Default::default()
+            },
+            ConfigCapturingRunner {
+                seen_configs: seen_configs.clone(),
+            },
+        );
+        app.create_target("demo", Some(ScaffoldId::SinglePrompt))
+            .unwrap();
+
+        let mut delegate = TestDelegate;
+        let control = RunControl::new();
+        control.set_coding_agent(CodingAgent::Codex);
+        let summary = app
+            .run_target_with_control("demo", None, control, &mut delegate)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.last_run_status,
+            ralph_core::LastRunStatus::Completed
+        );
+        let seen = seen_configs.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].program, "codex");
+        assert_eq!(
+            seen[0].env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("test-key")
         );
     }
 }

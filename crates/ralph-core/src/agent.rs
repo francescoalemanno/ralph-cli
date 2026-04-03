@@ -108,6 +108,12 @@ impl RunnerConfig {
         }
     }
 
+    pub fn with_agent_preserving_env(&self, agent: CodingAgent) -> Self {
+        let mut config = Self::for_agent(agent);
+        config.env = self.env.clone();
+        config
+    }
+
     pub fn inferred_agent(&self) -> Option<CodingAgent> {
         match normalized_program_name(&self.program).as_deref() {
             Some("opencode") => Some(CodingAgent::Opencode),
@@ -170,6 +176,8 @@ fn default_prompt_env_var() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{CodingAgent, PromptTransport, RunnerConfig};
 
     #[test]
@@ -198,6 +206,37 @@ mod tests {
         assert_eq!(
             raijin.shell_template.as_deref(),
             Some(r#"raijin -ephemeral "$PROMPT""#)
+        );
+    }
+
+    #[test]
+    fn switching_agent_preserves_env_overrides() {
+        let config = RunnerConfig {
+            env: BTreeMap::from([
+                ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
+                ("RUST_LOG".to_owned(), "debug".to_owned()),
+            ]),
+            ..RunnerConfig::for_agent(CodingAgent::Opencode)
+        };
+
+        let switched = config.with_agent_preserving_env(CodingAgent::Codex);
+
+        assert_eq!(switched.program, "codex");
+        assert_eq!(
+            switched.args,
+            vec![
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--ephemeral"
+            ]
+        );
+        assert_eq!(
+            switched.env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("test-key")
+        );
+        assert_eq!(
+            switched.env.get("RUST_LOG").map(String::as_str),
+            Some("debug")
         );
     }
 }
