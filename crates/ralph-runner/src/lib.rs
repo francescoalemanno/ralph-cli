@@ -1,4 +1,4 @@
-use std::{env, process::Stdio};
+use std::{env, path::Path, process::Stdio};
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -99,7 +99,10 @@ impl RunnerAdapter for CommandRunner {
             "RALPH_PROMPT_NAME".to_owned(),
             invocation.prompt_name.clone(),
         ));
-        envs.push(("RALPH_MODE".to_owned(), invocation.prompt_name.clone()));
+        envs.push((
+            "RALPH_MODE".to_owned(),
+            invocation_mode(&invocation.prompt_name),
+        ));
         if matches!(config.prompt_transport, PromptTransport::EnvVar) {
             envs.push((
                 config.prompt_env_var.clone(),
@@ -338,11 +341,12 @@ fn render_template(
     prompt_file: Option<&str>,
 ) -> String {
     let mut rendered = template.to_owned();
+    let mode = invocation_mode(&invocation.prompt_name);
     let replacements = [
         ("{project_dir}", invocation.project_dir.as_str()),
         ("{target_dir}", invocation.target_dir.as_str()),
         ("{prompt_name}", invocation.prompt_name.as_str()),
-        ("{mode}", invocation.prompt_name.as_str()),
+        ("{mode}", mode.as_str()),
         ("{prompt_path}", invocation.prompt_path.as_str()),
         ("{prompt}", invocation.prompt_text.as_str()),
         ("{prompt_file}", prompt_file.unwrap_or("")),
@@ -351,6 +355,14 @@ fn render_template(
         rendered = rendered.replace(needle, value);
     }
     rendered
+}
+
+fn invocation_mode(prompt_name: &str) -> String {
+    Path::new(prompt_name)
+        .file_stem()
+        .or_else(|| Path::new(prompt_name).file_name())
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| prompt_name.to_owned())
 }
 
 fn shell_command() -> Command {
@@ -367,7 +379,12 @@ fn shell_command() -> Command {
 
 #[cfg(test)]
 mod tests {
-    use super::{has_explicit_opencode_config, is_opencode_program, opencode_auto_approve_config};
+    use ralph_core::RunnerInvocation;
+
+    use super::{
+        has_explicit_opencode_config, invocation_mode, is_opencode_program,
+        opencode_auto_approve_config, render_template,
+    };
 
     #[test]
     fn detects_opencode_program_names() {
@@ -399,5 +416,27 @@ mod tests {
             opencode_auto_approve_config(),
             r#"{"$schema":"https://opencode.ai/config.json","permission":"allow"}"#
         );
+    }
+
+    #[test]
+    fn mode_uses_prompt_stem_for_file_backed_prompts() {
+        assert_eq!(invocation_mode("prompt_main.md"), "prompt_main");
+        assert_eq!(invocation_mode("0_plan.md"), "0_plan");
+        assert_eq!(invocation_mode("goal_driven_build"), "goal_driven_build");
+    }
+
+    #[test]
+    fn mode_template_is_distinct_from_prompt_name() {
+        let invocation = RunnerInvocation {
+            prompt_text: "hello".to_owned(),
+            project_dir: "/tmp/project".into(),
+            target_dir: "/tmp/project/.ralph/targets/demo".into(),
+            prompt_path: "/tmp/project/.ralph/targets/demo/prompt_main.md".into(),
+            prompt_name: "prompt_main.md".to_owned(),
+        };
+
+        let rendered = render_template("{prompt_name}|{mode}", &invocation, None);
+
+        assert_eq!(rendered, "prompt_main.md|prompt_main");
     }
 }

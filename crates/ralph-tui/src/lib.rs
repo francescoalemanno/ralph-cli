@@ -640,35 +640,24 @@ impl RunDelegate for ChannelDelegate {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
     use anyhow::Result;
     use camino::Utf8PathBuf;
     use ralph_app::RalphApp;
     use ralph_core::ScaffoldId;
+    use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
     use super::TuiApp;
 
-    fn temp_project_dir() -> Utf8PathBuf {
-        let unique = format!(
-            "ralph-tui-test-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let path = std::env::temp_dir().join(unique);
-        fs::create_dir_all(&path).unwrap();
-        Utf8PathBuf::from_path_buf(path).unwrap()
+    fn temp_project_dir() -> (TempDir, Utf8PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        (temp, path)
     }
 
     #[test]
     fn selected_target_review_tracks_selection() -> Result<()> {
-        let project_dir = temp_project_dir();
+        let (_temp, project_dir) = temp_project_dir();
         let app = RalphApp::load(project_dir.clone())?;
         app.create_target("alpha", Some(ScaffoldId::SinglePrompt))?;
         app.create_target("beta", Some(ScaffoldId::SinglePrompt))?;
@@ -695,7 +684,7 @@ mod tests {
 
     #[test]
     fn selected_target_review_refreshes_after_file_changes() -> Result<()> {
-        let project_dir = temp_project_dir();
+        let (_temp, project_dir) = temp_project_dir();
         let app = RalphApp::load(project_dir.clone())?;
         let summary = app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
         let prompt_path = summary.prompt_files[0].path.clone();
@@ -732,7 +721,7 @@ mod tests {
 
     #[test]
     fn workflow_targets_are_detected_from_mode_even_without_scaffold() -> Result<()> {
-        let project_dir = temp_project_dir();
+        let (_temp, project_dir) = temp_project_dir();
         let app = RalphApp::load(project_dir.clone())?;
         app.create_target("demo", Some(ScaffoldId::GoalDriven))?;
         std::fs::write(
