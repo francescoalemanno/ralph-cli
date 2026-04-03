@@ -12,7 +12,7 @@ use ratatui::{
 use crate::{
     Screen, TuiApp,
     ui::{
-        ColorMode, centered_rect, key_style, resolved_accent_color, resolved_success_color,
+        centered_rect, key_style, resolved_accent_color, resolved_success_color,
         resolved_warning_color, status_badge, status_label, status_style, styled_title,
     },
 };
@@ -34,6 +34,11 @@ struct ShortcutHint {
 
 impl TuiApp {
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>) {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(self.background_color())),
+            frame.area(),
+        );
+
         let has_notice = !self.message.trim().is_empty();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -107,11 +112,7 @@ impl TuiApp {
                 Style::default().fg(self.muted_color()),
             ),
         ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        );
+        .block(self.panel_block());
         frame.render_widget(header, area);
     }
 
@@ -130,11 +131,7 @@ impl TuiApp {
                     .add_modifier(Modifier::BOLD),
             ),
         ]))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        );
+        .block(self.panel_block());
         frame.render_widget(banner, area);
     }
 
@@ -290,10 +287,8 @@ impl TuiApp {
 
         let list = List::new(items)
             .block(
-                Block::default()
-                    .title(self.title_line("Targets", "Select a workspace"))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
+                self.panel_block()
+                    .title(self.title_line("Targets", "Select a workspace")),
             )
             .highlight_style(
                 Style::default()
@@ -306,10 +301,10 @@ impl TuiApp {
     }
 
     fn draw_target_detail(&self, frame: &mut Frame<'_>, area: Rect) {
-        let block = Block::default()
+        let block = self
+            .panel_block()
             .title(self.title_line("Selected Target", "Prompt selection and durable files"))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded);
+            .style(Style::default().bg(self.background_color()));
 
         if let Some(target) = self.selected_target() {
             let inner = block.inner(area);
@@ -366,10 +361,8 @@ impl TuiApp {
                 )]),
             ]))
             .block(
-                Block::default()
-                    .title(self.title_line("Overview", "Current target metadata"))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
+                self.panel_block()
+                    .title(self.title_line("Overview", "Current target metadata")),
             );
             frame.render_widget(header, sections[0]);
 
@@ -390,19 +383,14 @@ impl TuiApp {
                     self.selected_prompt
                         .min(target.prompt_files.len().saturating_sub(1)),
                 )
-                .block(
-                    Block::default()
-                        .title(self.title_line(
-                            "Prompts",
-                            if uses_hidden_workflow {
-                                "Workflow targets run internally"
-                            } else {
-                                "Choose which loop prompt to run"
-                            },
-                        ))
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded),
-                )
+                .block(self.panel_block().title(self.title_line(
+                    "Prompts",
+                    if uses_hidden_workflow {
+                        "Workflow targets run internally"
+                    } else {
+                        "Choose which loop prompt to run"
+                    },
+                )))
                 .highlight_style(
                     Style::default()
                         .fg(self.accent_color())
@@ -440,23 +428,18 @@ impl TuiApp {
                 });
 
             let preview = Paragraph::new(prompt_preview)
-                .block(
-                    Block::default()
-                        .title(self.title_line(
-                            if uses_hidden_workflow {
-                                "Goal Preview"
-                            } else {
-                                "Prompt Preview"
-                            },
-                            if uses_hidden_workflow {
-                                "User-facing workflow input"
-                            } else {
-                                "Selected runnable prompt"
-                            },
-                        ))
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded),
-                )
+                .block(self.panel_block().title(self.title_line(
+                    if uses_hidden_workflow {
+                        "Goal Preview"
+                    } else {
+                        "Prompt Preview"
+                    },
+                    if uses_hidden_workflow {
+                        "User-facing workflow input"
+                    } else {
+                        "Selected runnable prompt"
+                    },
+                )))
                 .style(Style::default().fg(self.text_color()))
                 .wrap(Wrap { trim: false });
             frame.render_widget(preview, sections[2]);
@@ -475,19 +458,14 @@ impl TuiApp {
                     .collect::<Vec<_>>()
                     .join("\n"),
             )
-            .block(
-                Block::default()
-                    .title(self.title_line(
-                        "Files",
-                        if uses_hidden_workflow {
-                            "Workflow targets expose GOAL.md and state files"
-                        } else {
-                            "Runnable prompts are marked with *"
-                        },
-                    ))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
+            .block(self.panel_block().title(self.title_line(
+                "Files",
+                if uses_hidden_workflow {
+                    "Workflow targets expose GOAL.md and state files"
+                } else {
+                    "Runnable prompts are marked with *"
+                },
+            )))
             .style(Style::default().fg(self.muted_color()))
             .wrap(Wrap { trim: false });
             frame.render_widget(files, sections[3]);
@@ -545,16 +523,15 @@ impl TuiApp {
             ]),
         ]);
         let widget = Paragraph::new(text)
-            .block(
-                Block::default()
-                    .title(self.title_line(
-                        "New Target",
-                        "Task-based, goal-driven, single-prompt, or plan-build scaffold",
-                    ))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
+            .block(self.panel_block().title(self.title_line(
+                "New Target",
+                "Task-based, goal-driven, single-prompt, or plan-build scaffold",
+            )))
+            .style(
+                Style::default()
+                    .fg(self.text_color())
+                    .bg(self.background_color()),
             )
-            .style(Style::default().fg(self.text_color()))
             .wrap(Wrap { trim: false });
         frame.render_widget(widget, area);
     }
@@ -626,17 +603,15 @@ impl TuiApp {
             Paragraph::new("No run selected")
         }
         .block(
-            Block::default()
-                .title(self.title_line("Live Run", "Telemetry and controls"))
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
+            self.panel_block()
+                .title(self.title_line("Live Run", "Telemetry and controls")),
         );
         frame.render_widget(telemetry, sections[0]);
 
-        let block = Block::default()
+        let block = self
+            .panel_block()
             .title(self.title_line("Agent Stream", "stdout and stderr"))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded);
+            .style(Style::default().bg(self.background_color()));
         let inner = block.inner(sections[1]);
         let output = if let Some(running) = &mut self.running {
             running
@@ -712,43 +687,35 @@ impl TuiApp {
     }
 
     fn accent_color(&self) -> Color {
-        resolved_accent_color(&self.app.config().theme.accent_color, self.color_mode)
+        resolved_accent_color(&self.app.config().theme.accent_color)
     }
 
     fn success_color(&self) -> Color {
-        resolved_success_color(&self.app.config().theme.success_color, self.color_mode)
+        resolved_success_color(&self.app.config().theme.success_color)
     }
 
     fn warning_color(&self) -> Color {
-        resolved_warning_color(&self.app.config().theme.warning_color, self.color_mode)
+        resolved_warning_color(&self.app.config().theme.warning_color)
     }
 
     fn text_color(&self) -> Color {
-        match self.color_mode {
-            ColorMode::Light => Color::Black,
-            ColorMode::Dark => Color::White,
-        }
+        Color::White
     }
 
     fn muted_color(&self) -> Color {
-        match self.color_mode {
-            ColorMode::Light => Color::Rgb(96, 103, 112),
-            ColorMode::Dark => Color::Gray,
-        }
+        Color::Gray
     }
 
     fn subtle_color(&self) -> Color {
-        match self.color_mode {
-            ColorMode::Light => Color::Rgb(150, 157, 166),
-            ColorMode::Dark => Color::DarkGray,
-        }
+        Color::DarkGray
+    }
+
+    fn background_color(&self) -> Color {
+        Color::Rgb(8, 12, 18)
     }
 
     fn panel_highlight(&self) -> Color {
-        match self.color_mode {
-            ColorMode::Light => Color::Rgb(220, 234, 242),
-            ColorMode::Dark => Color::Rgb(24, 47, 56),
-        }
+        Color::Rgb(24, 47, 56)
     }
 
     fn title_line(&self, title: &str, subtitle: &str) -> Line<'static> {
@@ -761,11 +728,15 @@ impl TuiApp {
         )
     }
 
+    fn panel_block(&self) -> Block<'static> {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(self.background_color()))
+    }
+
     fn notice_palette(&self) -> (&'static str, Color, Color) {
-        match self.color_mode {
-            ColorMode::Light => (" INFO ", Color::Black, Color::Rgb(191, 219, 254)),
-            ColorMode::Dark => (" INFO ", Color::Black, Color::Rgb(103, 232, 249)),
-        }
+        (" INFO ", Color::Black, Color::Rgb(103, 232, 249))
     }
 }
 

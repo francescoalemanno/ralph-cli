@@ -1,4 +1,4 @@
-use std::{env, io};
+use std::io;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -16,12 +16,6 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-
-#[derive(Clone, Copy)]
-pub(crate) enum ColorMode {
-    Light,
-    Dark,
-}
 
 pub(crate) fn suspend_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -63,31 +57,6 @@ pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect 
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup[1])[1]
-}
-
-pub(crate) fn detect_color_mode() -> ColorMode {
-    if let Ok(value) = env::var("RALPH_COLOR_MODE") {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "light" => return ColorMode::Light,
-            "dark" => return ColorMode::Dark,
-            _ => {}
-        }
-    }
-
-    if let Ok(value) = env::var("COLORFGBG")
-        && let Some(background) = value
-            .split(';')
-            .next_back()
-            .and_then(|token| token.parse::<u8>().ok())
-    {
-        return if background >= 7 {
-            ColorMode::Light
-        } else {
-            ColorMode::Dark
-        };
-    }
-
-    ColorMode::Dark
 }
 
 pub(crate) fn styled_title(
@@ -160,45 +129,27 @@ pub(crate) fn status_style(
     }
 }
 
-pub(crate) fn resolved_accent_color(name: &str, color_mode: ColorMode) -> Color {
+pub(crate) fn resolved_accent_color(name: &str) -> Color {
     if name.trim().eq_ignore_ascii_case("cyan") {
-        match color_mode {
-            ColorMode::Light => Color::Rgb(0, 102, 204),
-            ColorMode::Dark => Color::Cyan,
-        }
+        Color::Cyan
     } else {
-        color_from_name(name).unwrap_or(match color_mode {
-            ColorMode::Light => Color::Rgb(0, 102, 204),
-            ColorMode::Dark => Color::Cyan,
-        })
+        color_from_name(name).unwrap_or(Color::Cyan)
     }
 }
 
-pub(crate) fn resolved_success_color(name: &str, color_mode: ColorMode) -> Color {
+pub(crate) fn resolved_success_color(name: &str) -> Color {
     if name.trim().eq_ignore_ascii_case("green") {
-        match color_mode {
-            ColorMode::Light => Color::Rgb(36, 138, 61),
-            ColorMode::Dark => Color::LightGreen,
-        }
+        Color::LightGreen
     } else {
-        color_from_name(name).unwrap_or(match color_mode {
-            ColorMode::Light => Color::Rgb(36, 138, 61),
-            ColorMode::Dark => Color::LightGreen,
-        })
+        color_from_name(name).unwrap_or(Color::LightGreen)
     }
 }
 
-pub(crate) fn resolved_warning_color(name: &str, color_mode: ColorMode) -> Color {
+pub(crate) fn resolved_warning_color(name: &str) -> Color {
     if name.trim().eq_ignore_ascii_case("yellow") {
-        match color_mode {
-            ColorMode::Light => Color::Rgb(160, 100, 0),
-            ColorMode::Dark => Color::LightYellow,
-        }
+        Color::LightYellow
     } else {
-        color_from_name(name).unwrap_or(match color_mode {
-            ColorMode::Light => Color::Rgb(160, 100, 0),
-            ColorMode::Dark => Color::LightYellow,
-        })
+        color_from_name(name).unwrap_or(Color::LightYellow)
     }
 }
 

@@ -23,7 +23,7 @@ use ralph_app::{RalphApp, RunDelegate, RunEvent};
 use ralph_core::{RunControl, ScaffoldId, TargetReview, TargetSummary};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::runtime::Handle;
-use ui::{ColorMode, detect_color_mode, process_terminal_text, resume_terminal, suspend_terminal};
+use ui::{process_terminal_text, resume_terminal, suspend_terminal};
 
 pub fn run_tui(app: RalphApp) -> Result<()> {
     run_tui_with_target(app, None)
@@ -108,7 +108,6 @@ struct TuiApp {
     message: String,
     running: Option<RunningState>,
     tick_count: u64,
-    color_mode: ColorMode,
 }
 
 impl TuiApp {
@@ -134,7 +133,6 @@ impl TuiApp {
             message: String::new(),
             running: None,
             tick_count: 0,
-            color_mode: detect_color_mode(),
         };
         this.reload_targets();
         if let Some(target) = target {
