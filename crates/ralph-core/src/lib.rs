@@ -12,6 +12,7 @@ pub use store::{
     ARTIFACT_DIR_NAME, TARGETS_DIR_NAME, TargetStore, bare_prompt_template, is_prompt_file_name,
 };
 pub use types::{
-    LastRunStatus, PromptFile, RunControl, RunnerInvocation, RunnerResult, ScaffoldId,
-    TargetConfig, TargetFile, TargetFileContents, TargetPaths, TargetReview, TargetSummary,
+    GoalDrivenInflight, GoalDrivenPhase, GoalDrivenWorkflowState, LastRunStatus, PromptFile,
+    RunControl, RunnerInvocation, RunnerResult, ScaffoldId, TargetConfig, TargetFile,
+    TargetFileContents, TargetPaths, TargetReview, TargetSummary, WorkflowMode,
 };

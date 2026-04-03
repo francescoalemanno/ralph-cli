@@ -51,6 +51,8 @@ enum OutputArg {
 enum ScaffoldArg {
     SinglePrompt,
     PlanBuild,
+    TaskBased,
+    GoalDriven,
 }
 
 impl From<ScaffoldArg> for ScaffoldId {
@@ -58,6 +60,8 @@ impl From<ScaffoldArg> for ScaffoldId {
         match value {
             ScaffoldArg::SinglePrompt => ScaffoldId::SinglePrompt,
             ScaffoldArg::PlanBuild => ScaffoldId::PlanBuild,
+            ScaffoldArg::TaskBased => ScaffoldId::TaskBased,
+            ScaffoldArg::GoalDriven => ScaffoldId::GoalDriven,
         }
     }
 }
@@ -113,13 +117,13 @@ struct Cli {
 enum Commands {
     #[command(about = "Create a new target")]
     New(NewArgs),
-    #[command(about = "Run a selected prompt loop for a target")]
+    #[command(about = "Run a target workflow or selected prompt loop")]
     Run(RunArgs),
     #[command(about = "List targets", visible_alias = "status")]
     Ls,
     #[command(about = "Show target files")]
     Show(ShowArgs),
-    #[command(about = "Edit a target prompt")]
+    #[command(about = "Edit a target prompt or workflow input")]
     Edit(EditArgs),
     #[command(subcommand, about = "Inspect and manage supported coding agents")]
     Agent(AgentCommands),
@@ -289,15 +293,22 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
                         let prompt = match args.prompt.as_deref() {
                             Some(name) => Some(name),
                             None if args.scaffold == ScaffoldArg::PlanBuild => Some("0_plan.md"),
+                            None if args.scaffold == ScaffoldArg::TaskBased => Some("GOAL.md"),
+                            None if args.scaffold == ScaffoldArg::GoalDriven => Some("GOAL.md"),
                             None => None,
                         };
-                        let prompt_path = app.resolve_prompt(target, prompt)?.path;
+                        let prompt_path = app.resolve_target_edit_path(target, prompt)?;
                         edit_file(&prompt_path)?;
                     }
                     print_summary(output, &summary)
                 }
                 TargetMode::BarePrompt(prompt_path) => {
                     let scaffold: ScaffoldId = args.scaffold.into();
+                    if matches!(scaffold, ScaffoldId::GoalDriven | ScaffoldId::TaskBased) {
+                        return Err(anyhow!(
+                            "workflow targets require a TARGET; bare prompt files are not supported"
+                        ));
+                    }
                     create_bare_prompt_file(&prompt_path, scaffold)?;
                     if args.edit {
                         edit_file(&prompt_path)?;
@@ -360,7 +371,8 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
             let app = RalphApp::load(project_dir)?;
             match resolve_target_mode(args.target.as_deref(), args.prompt.as_deref())? {
                 TargetMode::Target(target) => {
-                    let prompt_path = app.resolve_prompt(target, args.prompt.as_deref())?.path;
+                    let prompt_path =
+                        app.resolve_target_edit_path(target, args.prompt.as_deref())?;
                     edit_file(&prompt_path)
                 }
                 TargetMode::BarePrompt(prompt_path) => edit_file(&prompt_path),

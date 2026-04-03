@@ -2,7 +2,7 @@
 
 `ralph` is a Rust CLI and terminal UI for running durable agent loops against target folders inside a repository.
 
-It keeps prompts on disk, treats target folders as the source of truth, and lets prompt files drive completion through explicit watch directives instead of hidden controller modes.
+It keeps target state on disk, treats target folders as the source of truth, and supports both prompt-driven scaffolds and workflow-driven targets.
 
 ![Ralph TUI](tui.png)
 
@@ -25,7 +25,7 @@ This repository packages that style into a local tool with:
 - runnable prompt files discovered from disk
 - a TUI and CLI
 - persisted config and agent presets
-- explicit prompt-side watch directives
+- explicit prompt-side NDJSON directives
 
 ## What Ralph Does
 
@@ -35,7 +35,7 @@ Ralph manages repository-local targets under:
 .ralph/targets/<target-id>/
 ```
 
-Each target is just a folder. All `*.md` files directly inside that folder are runnable prompts.
+Each target is just a folder. Legacy prompt-driven scaffolds discover runnable `*.md` files directly inside that folder, while workflow-driven scaffolds can expose a different user-facing surface.
 
 Example:
 
@@ -55,11 +55,20 @@ Or:
   notes.md
 ```
 
+Or:
+
+```text
+.ralph/targets/feature-goal/
+  target.toml
+  GOAL.md
+  specs/
+```
+
 At runtime Ralph:
 
-1. loads a selected prompt file from the target folder
+1. loads the selected prompt file or workflow entrypoint for the target
 2. interpolates prompt env placeholders such as `{ralph-env:TARGET_DIR}`
-3. parses `<<ralph-watch:...>>` directives from the prompt
+3. parses Ralph NDJSON directives from the prompt
 4. removes those directives before sending the prompt to the agent
 5. runs the selected coding agent in a loop
 6. marks the run complete when watched files stay unchanged after an iteration, or when the agent emits the done token
@@ -116,9 +125,9 @@ Typical flow:
 
 1. Open the TUI.
 2. Press `N` to create a new target.
-3. Pick the `single-prompt` or `plan-build` scaffold.
-4. Press `R` to run the selected prompt.
-5. Press `E` to edit a prompt.
+3. Pick the `task-based`, `goal-driven`, `single-prompt`, or `plan-build` scaffold.
+4. Press `R` to run the selected prompt or workflow.
+5. Press `E` to edit the active prompt or `GOAL.md`.
 6. Press `A` to cycle and persist the coding agent.
 
 You can also open the TUI scoped to one target:
@@ -135,7 +144,7 @@ The current CLI model is:
 ralph
 ralph <target>
 
-ralph new <target> [--scaffold single-prompt|plan-build] [--edit] [--prompt <file>]
+ralph new <target> [--scaffold single-prompt|plan-build|task-based|goal-driven] [--edit] [--prompt <file>]
 ralph run <target> [--prompt <file>]
 ralph ls
 ralph show <target> [--file <name>]
@@ -154,10 +163,10 @@ ralph doctor
 Daily workflow:
 
 - `new`: create a target folder and initialize scaffold files
-- `run`: run one prompt loop for a target
+- `run`: run one prompt loop or workflow for a target
 - `ls`: list known targets
 - `show`: inspect target files
-- `edit`: open one selected prompt in your editor
+- `edit`: open the selected prompt or workflow input in your editor
 
 ## Target Model
 
@@ -167,15 +176,20 @@ Target discovery is directory-based:
 - the folder name is the target id
 - `target.toml` is optional metadata, not the source of truth
 
-Prompt discovery is file-based:
+Prompt discovery depends on the target mode:
 
-- every file ending in `.md` directly inside the target folder is runnable
-- non-`.md` files in the target folder are ordinary companion files
+- legacy targets treat every `.md` file directly inside the target folder as runnable
+- `goal_driven` targets do not expose runnable prompt files; they expose `GOAL.md` and run internal `plan/build` prompts
+- `task_based` targets do not expose runnable prompt files; they expose `GOAL.md` and run an internal iterative build loop
+- non-runnable files in the target folder are ordinary companion files
 
 Target metadata in `target.toml` currently includes:
 
 - `id`
 - `scaffold`
+- `mode`
+- `workflow`
+- `inflight`
 - `created_at`
 - `max_iterations`
 - `last_prompt`
@@ -185,14 +199,14 @@ Targets are sorted newest-first using `created_at` when available.
 
 ## Scaffolds
 
-Ralph currently ships two initialization scaffolds.
+Ralph currently ships four initialization scaffolds.
 
 Plan-build scaffold:
 
 - `0_plan.md`
 - `1_build.md`
 
-These prompts watch `IMPLEMENTATION_PLAN.md` through prompt-local watch directives.
+These prompts watch `IMPLEMENTATION_PLAN.md` through prompt-local NDJSON directives.
 
 Single-prompt scaffold:
 
@@ -212,24 +226,43 @@ The single-prompt template uses runtime interpolation:
 3. Update your progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item
 4. Stop
 
-<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>
+{"ralph":"watch","path":"{ralph-env:TARGET_DIR}/progress.txt"}
 ```
+
+Goal-driven scaffold:
+
+- `GOAL.md`
+- `target.toml`
+- `specs/`
+
+This scaffold uses `mode = "goal_driven"` in `target.toml`. The user edits only `GOAL.md`. Ralph decides internally whether the next run should `plan`, `build`, or remain `paused`, and stores workflow state in `target.toml`. Target-local specs live under `{ralph-env:TARGET_DIR}/specs/*`, and the operational plan lives at `{ralph-env:TARGET_DIR}/plan.toml`.
+
+Task-based scaffold:
+
+- `GOAL.md`
+- `target.toml`
+- `progress.toml`
+
+This scaffold uses `mode = "task_based"` in `target.toml`. The user edits only `GOAL.md`. Ralph runs a hidden iterative build loop against `{ralph-env:TARGET_DIR}/progress.toml`, updates `{ralph-env:TARGET_DIR}/journal.txt` over time, and considers the workflow complete when `progress.toml` has no remaining items with `completed = false`.
 
 ## Prompt Directives
 
-Ralph recognizes watch directives inside prompt files:
+Ralph recognizes NDJSON directives inside prompt files:
 
 ```md
-<<ralph-watch:IMPLEMENTATION_PLAN.md>>
-<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>
+{"ralph":"watch","path":"IMPLEMENTATION_PLAN.md"}
+{"ralph":"watch","path":"{ralph-env:TARGET_DIR}/progress.txt"}
+{"ralph":"complete_when","type":"no_line_contains_all","path":"{ralph-env:TARGET_DIR}/plan.toml","tokens":["completed","false"]}
 ```
 
 Behavior:
 
-- watch directives are parsed from the prompt before execution
-- watch directives are removed before prompt text is sent to the LLM
-- watched files are compared before and after each iteration
-- if watched files do not change, Ralph marks the run complete
+- each line is checked independently
+- if a line parses as a valid Ralph JSON directive, it is removed before prompt text is sent to the LLM
+- if a line does not parse as a valid Ralph directive, it remains ordinary prompt text
+- all completion criteria are combined with logical AND
+- `watch` compares file contents before and after an iteration
+- `complete_when` evaluates content predicates after an iteration
 
 ## Runtime Prompt Env Interpolation
 
@@ -240,12 +273,12 @@ Prompt files can contain runtime placeholders:
 - `{ralph-env:PROMPT_PATH}`
 - `{ralph-env:PROMPT_NAME}`
 
-These are expanded before watch parsing and before runner invocation.
+These are expanded before directive parsing and before runner invocation.
 
 For example:
 
 ```md
-<<ralph-watch:{ralph-env:TARGET_DIR}/progress.txt>>
+{"ralph":"watch","path":"{ralph-env:TARGET_DIR}/progress.txt"}
 ```
 
 becomes an absolute Unix-style target path at runtime.
@@ -349,4 +382,4 @@ cargo package -p ralph-cli --allow-dirty --no-verify
 
 ## Current Status
 
-Ralph is a local durable loop tool centered on target folders, markdown prompts, prompt-local watch directives, and pluggable terminal coding agents.
+Ralph is a local durable loop tool centered on target folders, markdown prompts, prompt-local NDJSON directives, and pluggable terminal coding agents.

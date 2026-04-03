@@ -37,6 +37,8 @@ pub enum ScaffoldId {
     #[default]
     SinglePrompt,
     PlanBuild,
+    TaskBased,
+    GoalDriven,
 }
 
 impl ScaffoldId {
@@ -44,8 +46,48 @@ impl ScaffoldId {
         match self {
             Self::SinglePrompt => "single_prompt",
             Self::PlanBuild => "plan_build",
+            Self::TaskBased => "task_based",
+            Self::GoalDriven => "goal_driven",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowMode {
+    TaskBased,
+    GoalDriven,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalDrivenPhase {
+    #[default]
+    Plan,
+    Build,
+    Paused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GoalDrivenWorkflowState {
+    #[serde(default)]
+    pub phase: GoalDrivenPhase,
+    #[serde(default)]
+    pub last_goal_hash: Option<String>,
+    #[serde(default)]
+    pub last_content_hash: Option<String>,
+    #[serde(default)]
+    pub last_planned_at: Option<u64>,
+    #[serde(default)]
+    pub last_built_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalDrivenInflight {
+    pub phase: GoalDrivenPhase,
+    pub goal_hash: String,
+    pub content_hash: String,
+    pub started_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +95,12 @@ pub struct TargetConfig {
     pub id: String,
     #[serde(default)]
     pub scaffold: Option<ScaffoldId>,
+    #[serde(default)]
+    pub mode: Option<WorkflowMode>,
+    #[serde(default)]
+    pub workflow: Option<GoalDrivenWorkflowState>,
+    #[serde(default)]
+    pub inflight: Option<GoalDrivenInflight>,
     #[serde(default)]
     pub created_at: Option<u64>,
     #[serde(default)]
@@ -89,6 +137,7 @@ pub struct TargetSummary {
     pub prompt_files: Vec<PromptFile>,
     pub files: Vec<TargetFile>,
     pub scaffold: Option<ScaffoldId>,
+    pub mode: Option<WorkflowMode>,
     pub created_at: Option<u64>,
     pub last_prompt: Option<String>,
     pub last_run_status: LastRunStatus,
@@ -219,5 +268,7 @@ mod tests {
         assert_eq!(LastRunStatus::Completed.label(), "completed");
         assert_eq!(ScaffoldId::SinglePrompt.as_str(), "single_prompt");
         assert_eq!(ScaffoldId::PlanBuild.as_str(), "plan_build");
+        assert_eq!(ScaffoldId::TaskBased.as_str(), "task_based");
+        assert_eq!(ScaffoldId::GoalDriven.as_str(), "goal_driven");
     }
 }

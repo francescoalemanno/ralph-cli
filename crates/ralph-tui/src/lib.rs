@@ -106,6 +106,7 @@ enum ColorMode {
 struct RunningState {
     target_id: String,
     prompt_name: String,
+    requested_prompt: Option<String>,
     iteration: usize,
     max_iterations: usize,
     control: RunControl,
@@ -148,6 +149,15 @@ struct TuiApp {
 }
 
 impl TuiApp {
+    fn selected_target_uses_hidden_workflow(&self) -> bool {
+        self.selected_target().is_some_and(|target| {
+            matches!(
+                target.scaffold,
+                Some(ScaffoldId::TaskBased | ScaffoldId::GoalDriven)
+            )
+        })
+    }
+
     fn new(app: RalphApp, handle: Handle, target: Option<String>) -> Self {
         let (tx, rx) = mpsc::channel();
         let mut this = Self {
@@ -160,7 +170,7 @@ impl TuiApp {
             selected_prompt: 0,
             screen: Screen::Dashboard,
             new_target_name: String::new(),
-            new_scaffold: ScaffoldId::SinglePrompt,
+            new_scaffold: ScaffoldId::TaskBased,
             message: String::new(),
             running: None,
             tick_count: 0,
@@ -220,7 +230,7 @@ impl TuiApp {
     ) -> Result<()> {
         match self.screen {
             Screen::Dashboard => self.handle_dashboard_key(key, terminal),
-            Screen::NewTarget => self.handle_new_target_key(key),
+            Screen::NewTarget => self.handle_new_target_key(key, terminal),
             Screen::Running => self.handle_running_key(key, terminal),
         }
     }
@@ -268,23 +278,21 @@ impl TuiApp {
             KeyCode::Char('n') => {
                 self.screen = Screen::NewTarget;
                 self.new_target_name.clear();
-                self.new_scaffold = ScaffoldId::SinglePrompt;
+                self.new_scaffold = ScaffoldId::TaskBased;
             }
             KeyCode::Char('r') => self.start_run()?,
             KeyCode::Char('e') => {
-                let Some((target_id, prompt_name)) = self.selected_target_and_prompt() else {
-                    self.message = "select a target and prompt first".to_owned();
+                let Some(target) = self.selected_target() else {
+                    self.message = "select a target first".to_owned();
                     return Ok(());
                 };
-                let prompt_path = self
-                    .app
-                    .resolve_prompt(&target_id, Some(&prompt_name))?
-                    .path;
+                let target_id = target.id.clone();
+                let prompt_path = self.app.resolve_target_edit_path(&target_id, None)?;
                 suspend_terminal(terminal)?;
                 let result = edit_file(&prompt_path);
                 resume_terminal(terminal)?;
                 result?;
-                self.message = format!("opened {prompt_name}");
+                self.message = format!("opened {}", prompt_path.file_name().unwrap_or("file"));
             }
             KeyCode::Char('d') => {
                 let Some(target) = self.selected_target() else {
@@ -303,15 +311,21 @@ impl TuiApp {
         Ok(())
     }
 
-    fn handle_new_target_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn handle_new_target_key(
+        &mut self,
+        key: KeyEvent,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
         match key.code {
             KeyCode::Esc => {
                 self.screen = Screen::Dashboard;
             }
             KeyCode::Tab => {
                 self.new_scaffold = match self.new_scaffold {
+                    ScaffoldId::TaskBased => ScaffoldId::GoalDriven,
+                    ScaffoldId::GoalDriven => ScaffoldId::SinglePrompt,
                     ScaffoldId::SinglePrompt => ScaffoldId::PlanBuild,
-                    ScaffoldId::PlanBuild => ScaffoldId::SinglePrompt,
+                    ScaffoldId::PlanBuild => ScaffoldId::TaskBased,
                 };
             }
             KeyCode::Backspace => {
@@ -322,16 +336,38 @@ impl TuiApp {
                     self.message = "target name cannot be empty".to_owned();
                     return Ok(());
                 }
+                let scaffold = self.new_scaffold;
                 let summary = self
                     .app
-                    .create_target(self.new_target_name.trim(), Some(self.new_scaffold))?;
+                    .create_target(self.new_target_name.trim(), Some(scaffold))?;
                 self.reload_targets();
                 if let Some(index) = self.targets.iter().position(|item| item.id == summary.id) {
                     self.selected_target = index;
                     self.selected_prompt = 0;
                 }
-                self.message = format!("created {}", summary.id);
                 self.screen = Screen::Dashboard;
+                let opened_path =
+                    if matches!(scaffold, ScaffoldId::TaskBased | ScaffoldId::GoalDriven) {
+                        Some(self.app.resolve_target_edit_path(&summary.id, None)?)
+                    } else {
+                        summary
+                            .prompt_files
+                            .first()
+                            .map(|prompt| prompt.path.clone())
+                    };
+                if let Some(opened_path) = opened_path {
+                    suspend_terminal(terminal)?;
+                    let result = edit_file(&opened_path);
+                    resume_terminal(terminal)?;
+                    result?;
+                    self.message = format!(
+                        "created {} and opened {}",
+                        summary.id,
+                        opened_path.file_name().unwrap_or("file")
+                    );
+                } else {
+                    self.message = format!("created {}", summary.id);
+                }
             }
             KeyCode::Char(ch) => {
                 self.new_target_name.push(ch);
@@ -367,8 +403,8 @@ impl TuiApp {
                     && running.finished
                 {
                     let target_id = running.target_id.clone();
-                    let prompt_name = running.prompt_name.clone();
-                    self.start_run_for(&target_id, &prompt_name)?;
+                    let requested_prompt = running.requested_prompt.clone();
+                    self.start_run_for(&target_id, requested_prompt.as_deref())?;
                 }
             }
             KeyCode::Char('a') => {
@@ -380,16 +416,15 @@ impl TuiApp {
                     return Ok(());
                 };
                 let target_id = running.target_id.clone();
-                let prompt_name = running.prompt_name.clone();
-                let prompt_path = self
-                    .app
-                    .resolve_prompt(&target_id, Some(&prompt_name))?
-                    .path;
+                let prompt_path = self.app.resolve_target_edit_path(&target_id, None)?;
                 suspend_terminal(terminal)?;
                 let result = edit_file(&prompt_path);
                 resume_terminal(terminal)?;
                 result?;
-                self.message = format!("opened {prompt_name} for steering");
+                self.message = format!(
+                    "opened {} for steering",
+                    prompt_path.file_name().unwrap_or("file")
+                );
             }
             KeyCode::Up => self.scroll_running(1),
             KeyCode::Down => self.scroll_running(-1),
@@ -426,6 +461,7 @@ impl TuiApp {
                             iteration,
                             max_iterations,
                         } => {
+                            running.prompt_name = prompt_name.clone();
                             running.iteration = iteration;
                             running.max_iterations = max_iterations;
                             process_terminal_text(
@@ -820,7 +856,13 @@ impl TuiApp {
             );
             frame.render_widget(header, sections[0]);
 
-            let titles = if target.prompt_files.is_empty() {
+            let uses_hidden_workflow = matches!(
+                target.scaffold,
+                Some(ScaffoldId::TaskBased | ScaffoldId::GoalDriven)
+            );
+            let titles = if uses_hidden_workflow {
+                vec![Line::from("workflow input")]
+            } else if target.prompt_files.is_empty() {
                 vec![Line::from("no prompts")]
             } else {
                 target
@@ -836,7 +878,14 @@ impl TuiApp {
                 )
                 .block(
                     Block::default()
-                        .title(self.title_line("Prompts", "Choose which loop prompt to run"))
+                        .title(self.title_line(
+                            "Prompts",
+                            if uses_hidden_workflow {
+                                "Workflow targets run internally"
+                            } else {
+                                "Choose which loop prompt to run"
+                            },
+                        ))
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded),
                 )
@@ -850,22 +899,49 @@ impl TuiApp {
             frame.render_widget(tabs, sections[1]);
 
             let prompt_preview = self
-                .selected_prompt()
-                .and_then(|prompt| {
-                    self.app.review_target(&target.id).ok().and_then(|review| {
+                .app
+                .review_target(&target.id)
+                .ok()
+                .and_then(|review| {
+                    if uses_hidden_workflow {
                         review
                             .files
                             .into_iter()
-                            .find(|file| file.name == prompt.name)
+                            .find(|file| file.name == "GOAL.md")
                             .map(|file| file.contents)
-                    })
+                    } else {
+                        self.selected_prompt().and_then(|prompt| {
+                            review
+                                .files
+                                .into_iter()
+                                .find(|file| file.name == prompt.name)
+                                .map(|file| file.contents)
+                        })
+                    }
                 })
-                .unwrap_or_else(|| "<missing prompt>".to_owned());
+                .unwrap_or_else(|| {
+                    if uses_hidden_workflow {
+                        "<missing GOAL.md>".to_owned()
+                    } else {
+                        "<missing prompt>".to_owned()
+                    }
+                });
 
             let preview = Paragraph::new(prompt_preview)
                 .block(
                     Block::default()
-                        .title(self.title_line("Prompt Preview", "Selected runnable prompt"))
+                        .title(self.title_line(
+                            if uses_hidden_workflow {
+                                "Goal Preview"
+                            } else {
+                                "Prompt Preview"
+                            },
+                            if uses_hidden_workflow {
+                                "User-facing workflow input"
+                            } else {
+                                "Selected runnable prompt"
+                            },
+                        ))
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded),
                 )
@@ -889,7 +965,14 @@ impl TuiApp {
             )
             .block(
                 Block::default()
-                    .title(self.title_line("Files", "Runnable prompts are marked with *"))
+                    .title(self.title_line(
+                        "Files",
+                        if uses_hidden_workflow {
+                            "Workflow targets expose GOAL.md and state files"
+                        } else {
+                            "Runnable prompts are marked with *"
+                        },
+                    ))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded),
             )
@@ -952,7 +1035,10 @@ impl TuiApp {
         let widget = Paragraph::new(text)
             .block(
                 Block::default()
-                    .title(self.title_line("New Target", "Single-prompt or plan-build scaffold"))
+                    .title(self.title_line(
+                        "New Target",
+                        "Task-based, goal-driven, single-prompt, or plan-build scaffold",
+                    ))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded),
             )
@@ -1016,9 +1102,9 @@ impl TuiApp {
                     Span::styled("  ◆  ", Style::default().fg(self.subtle_color())),
                     Span::styled(
                         if running.finished {
-                            "E steers prompt  ◆  R reruns  ◆  Esc returns"
+                            "E edits input  ◆  R reruns  ◆  Esc returns"
                         } else {
-                            "E steers prompt  ◆  A switches agent  ◆  Q cancels"
+                            "E edits input  ◆  A switches agent  ◆  Q cancels"
                         },
                         Style::default().fg(self.muted_color()),
                     ),
@@ -1096,24 +1182,37 @@ impl TuiApp {
     }
 
     fn start_run(&mut self) -> Result<()> {
+        if self.selected_target_uses_hidden_workflow() {
+            let Some(target) = self.selected_target() else {
+                self.message = "select a target first".to_owned();
+                return Ok(());
+            };
+            let target_id = target.id.clone();
+            return self.start_run_for(&target_id, None);
+        }
+
         let Some((target_id, prompt_name)) = self.selected_target_and_prompt() else {
             self.message = "select a target and prompt first".to_owned();
             return Ok(());
         };
 
-        self.start_run_for(&target_id, &prompt_name)
+        self.start_run_for(&target_id, Some(&prompt_name))
     }
 
-    fn start_run_for(&mut self, target_id: &str, prompt_name: &str) -> Result<()> {
+    fn start_run_for(&mut self, target_id: &str, prompt_name: Option<&str>) -> Result<()> {
         let tx = self.tx.clone();
         let app = self.app.clone();
         let control = RunControl::new();
         let run_control = control.clone();
         let target_id = target_id.to_owned();
-        let prompt_name = prompt_name.to_owned();
+        let requested_prompt = prompt_name.map(ToOwned::to_owned);
+        let display_prompt = requested_prompt
+            .clone()
+            .unwrap_or_else(|| "workflow_auto".to_owned());
         self.running = Some(RunningState {
             target_id: target_id.to_owned(),
-            prompt_name: prompt_name.to_owned(),
+            prompt_name: display_prompt,
+            requested_prompt: requested_prompt.clone(),
             iteration: 0,
             max_iterations: 0,
             control,
@@ -1127,7 +1226,12 @@ impl TuiApp {
         self.handle.spawn(async move {
             let mut delegate = ChannelDelegate { tx: tx.clone() };
             let result = app
-                .run_target_with_control(&target_id, Some(&prompt_name), run_control, &mut delegate)
+                .run_target_with_control(
+                    &target_id,
+                    requested_prompt.as_deref(),
+                    run_control,
+                    &mut delegate,
+                )
                 .await
                 .map_err(|error| error.to_string());
             let _ = tx.send(UiEvent::RunDone(result));
@@ -1165,7 +1269,7 @@ impl TuiApp {
         let mut hints = vec![
             ShortcutHint {
                 key: "E",
-                label: "edit prompt",
+                label: "edit input",
                 tone: ShortcutTone::Accent,
             },
             ShortcutHint {
