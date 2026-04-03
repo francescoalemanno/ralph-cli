@@ -83,14 +83,26 @@ struct PromptEditor<'a> {
 
 impl<'a> PromptEditor<'a> {
     fn new(path: PathBuf) -> Result<Self> {
-        let mut stdout = io::stdout();
-        enable_raw_mode().context("failed to enable raw mode for internal editor")?;
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-            .context("failed to enter alternate screen for internal editor")?;
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend).context("failed to create editor terminal")?;
-
         let mut textarea = load_text_area(&path)?;
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = Terminal::new(backend).context("failed to create editor terminal")?;
+        enable_raw_mode().context("failed to enable raw mode for internal editor")?;
+        if let Err(error) = execute!(
+            terminal.backend_mut(),
+            EnterAlternateScreen,
+            EnableMouseCapture
+        )
+        .context("failed to enter alternate screen for internal editor")
+        {
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )
+            .ok();
+            disable_raw_mode().ok();
+            return Err(error);
+        }
         textarea.set_block(
             Block::default()
                 .title(styled_title(

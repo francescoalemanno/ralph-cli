@@ -35,12 +35,25 @@ pub fn run_tui_scoped(app: RalphApp, target: &str) -> Result<()> {
 
 fn run_tui_with_target(app: RalphApp, target: Option<String>) -> Result<()> {
     let handle = Handle::current();
-    enable_raw_mode().context("failed to enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("failed to enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("failed to create terminal backend")?;
+    enable_raw_mode().context("failed to enable raw mode")?;
+    if let Err(error) = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )
+    .context("failed to enter alternate screen")
+    {
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )
+        .ok();
+        disable_raw_mode().ok();
+        return Err(error);
+    }
 
     let result = TuiApp::new(app, handle, target).run(&mut terminal);
 
