@@ -416,23 +416,21 @@ impl TuiApp {
             frame.render_widget(tabs, sections[1]);
 
             let prompt_preview = self
-                .app
-                .review_target(&target.id)
-                .ok()
+                .selected_target_review()
                 .and_then(|review| {
                     if uses_hidden_workflow {
                         review
                             .files
-                            .into_iter()
+                            .iter()
                             .find(|file| file.name == "GOAL.md")
-                            .map(|file| file.contents)
+                            .map(|file| file.contents.clone())
                     } else {
                         self.selected_prompt().and_then(|prompt| {
                             review
                                 .files
-                                .into_iter()
+                                .iter()
                                 .find(|file| file.name == prompt.name)
-                                .map(|file| file.contents)
+                                .map(|file| file.contents.clone())
                         })
                     }
                 })

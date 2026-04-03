@@ -20,7 +20,7 @@ use crossterm::{
 };
 pub use editor::edit_file;
 use ralph_app::{RalphApp, RunDelegate, RunEvent};
-use ralph_core::{RunControl, ScaffoldId, TargetSummary};
+use ralph_core::{RunControl, ScaffoldId, TargetReview, TargetSummary};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::runtime::Handle;
 use ui::{ColorMode, detect_color_mode, process_terminal_text, resume_terminal, suspend_terminal};
@@ -86,6 +86,7 @@ struct TuiApp {
     tx: Sender<UiEvent>,
     rx: Receiver<UiEvent>,
     targets: Vec<TargetSummary>,
+    selected_target_review: Option<TargetReview>,
     selected_target: usize,
     selected_prompt: usize,
     screen: Screen,
@@ -115,6 +116,7 @@ impl TuiApp {
             tx,
             rx,
             targets: Vec::new(),
+            selected_target_review: None,
             selected_target: 0,
             selected_prompt: 0,
             screen: Screen::Dashboard,
@@ -129,6 +131,7 @@ impl TuiApp {
         if let Some(target) = target {
             if let Some(index) = this.targets.iter().position(|summary| summary.id == target) {
                 this.selected_target = index;
+                this.refresh_selected_target_review();
             } else {
                 this.message = format!("target '{target}' was not found");
             }
@@ -207,11 +210,13 @@ impl TuiApp {
             KeyCode::Up => {
                 self.selected_target = self.selected_target.saturating_sub(1);
                 self.selected_prompt = 0;
+                self.refresh_selected_target_review();
             }
             KeyCode::Down => {
                 if self.selected_target + 1 < self.targets.len() {
                     self.selected_target += 1;
                     self.selected_prompt = 0;
+                    self.refresh_selected_target_review();
                 }
             }
             KeyCode::Left => {
@@ -241,6 +246,7 @@ impl TuiApp {
                 let result = edit_file(&prompt_path);
                 resume_terminal(terminal)?;
                 result?;
+                self.refresh_selected_target_review();
                 self.message = format!("opened {}", prompt_path.file_name().unwrap_or("file"));
             }
             KeyCode::Char('d') => {
@@ -293,6 +299,7 @@ impl TuiApp {
                 if let Some(index) = self.targets.iter().position(|item| item.id == summary.id) {
                     self.selected_target = index;
                     self.selected_prompt = 0;
+                    self.refresh_selected_target_review();
                 }
                 self.screen = Screen::Dashboard;
                 let opened_path =
@@ -309,6 +316,7 @@ impl TuiApp {
                     let result = edit_file(&opened_path);
                     resume_terminal(terminal)?;
                     result?;
+                    self.refresh_selected_target_review();
                     self.message = format!(
                         "created {} and opened {}",
                         summary.id,
@@ -370,6 +378,7 @@ impl TuiApp {
                 let result = edit_file(&prompt_path);
                 resume_terminal(terminal)?;
                 result?;
+                self.refresh_selected_target_review();
                 self.message = format!(
                     "opened {} for steering",
                     prompt_path.file_name().unwrap_or("file")
@@ -450,6 +459,7 @@ impl TuiApp {
                     if let Some(index) = self.targets.iter().position(|item| item.id == summary.id)
                     {
                         self.selected_target = index;
+                        self.refresh_selected_target_review();
                     }
                 }
                 Err(error) => {
@@ -481,9 +491,11 @@ impl TuiApp {
                         self.selected_prompt.min(prompt_count - 1)
                     };
                 }
+                self.refresh_selected_target_review();
             }
             Err(error) => {
                 self.targets = Vec::new();
+                self.selected_target_review = None;
                 self.message = error.to_string();
             }
         }
@@ -491,6 +503,10 @@ impl TuiApp {
 
     fn selected_target(&self) -> Option<&TargetSummary> {
         self.targets.get(self.selected_target)
+    }
+
+    fn selected_target_review(&self) -> Option<&TargetReview> {
+        self.selected_target_review.as_ref()
     }
 
     fn selected_prompt(&self) -> Option<&ralph_core::PromptFile> {
@@ -605,6 +621,12 @@ impl TuiApp {
         running.terminal.set_scrollback(current.min(max));
         max
     }
+
+    fn refresh_selected_target_review(&mut self) {
+        self.selected_target_review = self
+            .selected_target()
+            .and_then(|target| self.app.review_target(&target.id).ok());
+    }
 }
 
 struct ChannelDelegate {
@@ -617,5 +639,98 @@ impl RunDelegate for ChannelDelegate {
         self.tx
             .send(UiEvent::RunEvent(event))
             .map_err(|_| anyhow!("failed to send run event"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use anyhow::Result;
+    use camino::Utf8PathBuf;
+    use ralph_app::RalphApp;
+    use ralph_core::ScaffoldId;
+    use tokio::runtime::Runtime;
+
+    use super::TuiApp;
+
+    fn temp_project_dir() -> Utf8PathBuf {
+        let unique = format!(
+            "ralph-tui-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&path).unwrap();
+        Utf8PathBuf::from_path_buf(path).unwrap()
+    }
+
+    #[test]
+    fn selected_target_review_tracks_selection() -> Result<()> {
+        let project_dir = temp_project_dir();
+        let app = RalphApp::load(project_dir.clone())?;
+        app.create_target("alpha", Some(ScaffoldId::SinglePrompt))?;
+        app.create_target("beta", Some(ScaffoldId::SinglePrompt))?;
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), None);
+
+        assert_eq!(
+            tui.selected_target_review()
+                .map(|review| review.summary.id.as_str()),
+            tui.selected_target().map(|target| target.id.as_str())
+        );
+
+        tui.selected_target = 1;
+        tui.refresh_selected_target_review();
+
+        assert_eq!(
+            tui.selected_target_review()
+                .map(|review| review.summary.id.as_str()),
+            tui.selected_target().map(|target| target.id.as_str())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_target_review_refreshes_after_file_changes() -> Result<()> {
+        let project_dir = temp_project_dir();
+        let app = RalphApp::load(project_dir.clone())?;
+        let summary = app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
+        let prompt_path = summary.prompt_files[0].path.clone();
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), None);
+        let original_contents = tui
+            .selected_target_review()
+            .and_then(|review| {
+                review
+                    .files
+                    .iter()
+                    .find(|file| file.name == "prompt_main.md")
+            })
+            .map(|file| file.contents.clone());
+
+        std::fs::write(&prompt_path, "# Prompt\n\nUpdated\n")?;
+        tui.refresh_selected_target_review();
+
+        let refreshed_contents = tui
+            .selected_target_review()
+            .and_then(|review| {
+                review
+                    .files
+                    .iter()
+                    .find(|file| file.name == "prompt_main.md")
+            })
+            .map(|file| file.contents.clone());
+
+        assert_ne!(original_contents, refreshed_contents);
+        assert_eq!(refreshed_contents.as_deref(), Some("# Prompt\n\nUpdated\n"));
+        Ok(())
     }
 }
