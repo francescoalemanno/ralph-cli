@@ -1,5 +1,6 @@
 mod console;
 mod prompt;
+mod prompt_run;
 mod run;
 mod workflow;
 mod workflow_run;
