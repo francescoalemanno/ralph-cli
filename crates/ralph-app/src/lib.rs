@@ -2,6 +2,7 @@ mod console;
 mod prompt;
 mod run;
 mod workflow;
+mod workflow_run;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
