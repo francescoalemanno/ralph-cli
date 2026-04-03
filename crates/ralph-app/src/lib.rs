@@ -1457,8 +1457,10 @@ mod tests {
     async fn single_prompt_targets_still_run_to_max_iterations_without_plan_change_stop() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let mut config = AppConfig::default();
-        config.max_iterations = 1;
+        let config = AppConfig {
+            max_iterations: 1,
+            ..Default::default()
+        };
         let app = RalphApp::new(
             project_dir.clone(),
             config,
@@ -1489,8 +1491,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let seen_prompts = Arc::new(Mutex::new(Vec::new()));
-        let mut config = AppConfig::default();
-        config.max_iterations = 2;
+        let config = AppConfig {
+            max_iterations: 2,
+            ..Default::default()
+        };
         let app = RalphApp::new(
             project_dir.clone(),
             config,

@@ -260,7 +260,9 @@ impl AppConfig {
     }
 
     pub fn select_detected_coding_agent(&mut self, detected: &[CodingAgent]) -> bool {
-        let current = self.coding_agent();
+        let Some(current) = self.runner.inferred_agent() else {
+            return false;
+        };
         if detected.is_empty() || detected.contains(&current) {
             return false;
         }
@@ -597,6 +599,42 @@ mod tests {
         let mut config = AppConfig::default();
         config.set_coding_agent(CodingAgent::Codex);
         assert_eq!(config.runner.program, "codex");
+    }
+
+    #[test]
+    fn detected_agent_fallback_still_switches_known_built_in_runner() {
+        let mut config = AppConfig::default();
+        assert!(config.select_detected_coding_agent(&[CodingAgent::Codex]));
+        assert_eq!(config.runner.program, "codex");
+    }
+
+    #[test]
+    fn detected_agent_fallback_preserves_unknown_custom_runner() {
+        let mut config = AppConfig {
+            runner: RunnerConfig {
+                program: "custom-runner".to_owned(),
+                args: vec!["--json".to_owned()],
+                env: BTreeMap::from([("CUSTOM_ENV".to_owned(), "1".to_owned())]),
+                prompt_transport: PromptTransport::TempFile,
+                prompt_env_var: "CUSTOM_PROMPT".to_owned(),
+                shell_template: Some("custom-runner {prompt_file}".to_owned()),
+            },
+            ..Default::default()
+        };
+
+        assert!(!config.select_detected_coding_agent(&[CodingAgent::Codex]));
+        assert_eq!(config.runner.program, "custom-runner");
+        assert_eq!(config.runner.args, vec!["--json"]);
+        assert_eq!(
+            config.runner.env.get("CUSTOM_ENV").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(config.runner.prompt_transport, PromptTransport::TempFile);
+        assert_eq!(config.runner.prompt_env_var, "CUSTOM_PROMPT");
+        assert_eq!(
+            config.runner.shell_template.as_deref(),
+            Some("custom-runner {prompt_file}")
+        );
     }
 
     #[test]

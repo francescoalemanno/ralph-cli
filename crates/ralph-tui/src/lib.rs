@@ -1680,11 +1680,7 @@ fn shortcut_spans(hints: &[ShortcutHint], app: &TuiApp) -> Vec<Span<'static>> {
             }),
         ));
         spans.push(Span::styled(
-            format!(
-                " {}{}",
-                hint.label,
-                if index + 1 == hints.len() { "" } else { "" }
-            ),
+            format!(" {}", hint.label),
             Style::default().fg(app.muted_color()),
         ));
     }
