@@ -41,6 +41,7 @@ pub struct FlowStatus {
     pub entrypoint_id: String,
     pub current_node: Option<String>,
     pub pause: Option<FlowPauseStatus>,
+    pub actions: Vec<FlowActionStatus>,
     pub flow_ref: String,
 }
 
@@ -207,6 +208,17 @@ impl<R> RalphApp<R> {
                         })
                         .collect(),
                 }),
+                actions: status
+                    .actions
+                    .into_iter()
+                    .map(|action| FlowActionStatus {
+                        id: action.id,
+                        label: action.label,
+                        shortcut: action.shortcut,
+                        confirm_title: action.confirm_title,
+                        confirm_message: action.confirm_message,
+                    })
+                    .collect(),
                 flow_ref: status.flow_ref,
             }))
     }

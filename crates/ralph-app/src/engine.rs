@@ -175,6 +175,7 @@ pub(crate) struct FlowStatusSummary {
     pub(crate) entrypoint_id: String,
     pub(crate) current_node: Option<String>,
     pub(crate) pause: Option<FlowPauseState>,
+    pub(crate) actions: Vec<FlowPauseAction>,
     pub(crate) flow_ref: String,
 }
 
@@ -400,11 +401,34 @@ pub(crate) fn load_flow_status(
             }),
             _ => None,
         });
+    let mut actions = Vec::new();
+    let mut seen_action_ids = std::collections::BTreeSet::new();
+    if let Some(current_pause) = &pause {
+        for action in &current_pause.actions {
+            if seen_action_ids.insert(action.id.clone()) {
+                actions.push(action.clone());
+            }
+        }
+    }
+    for node in &flow_definition.definition.nodes {
+        if let FlowNodeSpec::Pause {
+            actions: node_actions,
+            ..
+        } = &node.spec
+        {
+            for action in node_actions {
+                if seen_action_ids.insert(action.id.clone()) {
+                    actions.push(action.clone());
+                }
+            }
+        }
+    }
 
     Ok(Some(FlowStatusSummary {
         entrypoint_id: entrypoint.id().to_owned(),
         current_node: current_node_id,
         pause,
+        actions,
         flow_ref: flow.clone(),
     }))
 }

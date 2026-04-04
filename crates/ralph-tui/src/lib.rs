@@ -220,10 +220,15 @@ impl TuiApp {
         self.app.flow_status(&target.id).ok().flatten()
     }
 
-    fn selected_pause_actions(&self) -> Vec<ralph_app::FlowActionStatus> {
+    fn selected_flow_actions(&self) -> Vec<ralph_app::FlowActionStatus> {
         self.selected_flow_status()
-            .and_then(|status| status.pause)
-            .map(|pause| pause.actions)
+            .map(|status| {
+                if let Some(pause) = status.pause {
+                    pause.actions
+                } else {
+                    status.actions
+                }
+            })
             .unwrap_or_default()
     }
 
@@ -236,7 +241,7 @@ impl TuiApp {
         };
         let pressed = ch.to_ascii_lowercase();
 
-        for action in self.selected_pause_actions() {
+        for action in self.selected_flow_actions() {
             let Some(shortcut) = action.shortcut.as_deref() else {
                 continue;
             };

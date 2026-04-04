@@ -221,7 +221,7 @@ impl TuiApp {
                 let mut spans = shortcut_spans(&hints, self);
                 if self.selected_target_has_flow_entrypoints() {
                     let dynamic_hints = self
-                        .selected_pause_actions()
+                        .selected_flow_actions()
                         .into_iter()
                         .filter_map(|action| {
                             let shortcut = action.shortcut?;
@@ -1179,6 +1179,28 @@ mod tests {
         assert!(workflow_footer.contains("Interview goal"));
         assert!(workflow_footer.contains("Rebase plan"));
         assert!(workflow_footer.contains("Rebuild from scratch"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_footer_shows_flow_actions_for_fresh_flow_targets() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(&project_dir)?;
+        app.create_target("tasks", Some(ScaffoldId::TaskDriven))?;
+
+        let runtime = Runtime::new()?;
+        let tui = TuiApp::new(app, runtime.handle().clone(), Some("tasks".to_owned()));
+        let footer = tui
+            .footer_spans()
+            .into_iter()
+            .map(|span| span.content.to_string())
+            .collect::<String>();
+
+        assert!(footer.contains("Build current backlog"));
+        assert!(footer.contains("Interview goal"));
+        assert!(footer.contains("Rebase backlog"));
+        assert!(footer.contains("Rebuild from scratch"));
 
         Ok(())
     }
