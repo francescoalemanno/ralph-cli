@@ -14,8 +14,9 @@ use crate::{
     RalphApp, RunDelegate, RunEvent,
     engine::{
         FlowEvalContext, FlowNodeSpec, FlowPauseAction, FlowStatusSummary, clear_inflight,
-        ensure_runtime, load_flow, load_prompt_text, resolve_default_entrypoint,
-        resolve_prompt_entrypoint, resolve_target_entrypoints, select_transition, set_inflight,
+        ensure_runtime, hash_optional_file, load_flow, load_prompt_text,
+        resolve_default_entrypoint, resolve_prompt_entrypoint, resolve_target_entrypoints,
+        select_transition, set_inflight,
     },
 };
 
@@ -664,7 +665,7 @@ where
             "set_path_hash_var" => {
                 let key = table_string(args, "key")?;
                 let path = table_string(args, "path")?;
-                let value = hash_file_or_missing(&target_dir.join(path))?;
+                let value = hash_optional_file(&target_dir.join(path))?;
                 let runtime = target_config.runtime.get_or_insert_with(Default::default);
                 match value {
                     Some(value) => {
@@ -814,19 +815,6 @@ fn table_string_list(args: &toml::Table, key: &str) -> Result<Vec<String>> {
                 .ok_or_else(|| anyhow!("flow action arg '{}' must contain only strings", key))
         })
         .collect()
-}
-
-fn hash_file_or_missing(path: &Utf8Path) -> Result<Option<String>> {
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(bytes);
-            Ok(Some(format!("sha256:{:x}", hasher.finalize())))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path)),
-    }
 }
 
 fn current_unix_timestamp() -> u64 {
