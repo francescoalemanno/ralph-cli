@@ -50,6 +50,19 @@ impl FlowDefinition {
 
         self.node(&self.start)
             .ok_or_else(|| anyhow!("flow start node '{}' does not exist", self.start))?;
+
+        for node in &self.nodes {
+            for target in node.transition_targets() {
+                if !ids.contains(target) {
+                    return Err(anyhow!(
+                        "flow node '{}' references unknown target '{}'",
+                        node.id,
+                        target
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -63,6 +76,66 @@ pub(crate) struct FlowNode {
     pub(crate) id: String,
     #[serde(flatten)]
     pub(crate) spec: FlowNodeSpec,
+}
+
+impl FlowNode {
+    fn transition_targets(&self) -> Vec<&str> {
+        let mut targets = Vec::new();
+        match &self.spec {
+            FlowNodeSpec::Prompt {
+                rules,
+                on_completed,
+                on_max_iterations,
+                on_failed,
+                on_canceled,
+                ..
+            } => {
+                for rule in rules {
+                    targets.push(rule.goto.as_str());
+                }
+                for target in [on_completed, on_max_iterations, on_failed, on_canceled]
+                    .into_iter()
+                    .flatten()
+                {
+                    targets.push(target.as_str());
+                }
+            }
+            FlowNodeSpec::Decision { rules } => {
+                for rule in rules {
+                    targets.push(rule.goto.as_str());
+                }
+            }
+            FlowNodeSpec::Pause { actions, .. } => {
+                for action in actions {
+                    targets.push(action.goto.as_str());
+                }
+            }
+            FlowNodeSpec::Interactive {
+                rules,
+                on_completed,
+                on_failed,
+                ..
+            } => {
+                for rule in rules {
+                    targets.push(rule.goto.as_str());
+                }
+                for target in [on_completed, on_failed].into_iter().flatten() {
+                    targets.push(target.as_str());
+                }
+            }
+            FlowNodeSpec::Action {
+                on_success,
+                on_error,
+                ..
+            } => {
+                for target in [on_success, on_error].into_iter().flatten() {
+                    targets.push(target.as_str());
+                }
+            }
+            FlowNodeSpec::Finish { .. } => {}
+        }
+        targets
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
