@@ -9,42 +9,6 @@ use crate::{AgentConfig, atomic_write, builtin_agents, store::ARTIFACT_DIR_NAME}
 
 const PROJECT_CONFIG_FILE_NAME: &str = "config.toml";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CliColorMode {
-    #[default]
-    Auto,
-    Always,
-    Never,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CliPagerMode {
-    #[default]
-    Auto,
-    Always,
-    Never,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CliOutputMode {
-    #[default]
-    Text,
-    Json,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CliPromptInputMode {
-    #[default]
-    Auto,
-    Stdin,
-    Editor,
-    Prompt,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFileScope {
     User,
@@ -72,29 +36,6 @@ impl Default for ThemeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CliConfig {
-    #[serde(default)]
-    pub color: CliColorMode,
-    #[serde(default)]
-    pub pager: CliPagerMode,
-    #[serde(default)]
-    pub output: CliOutputMode,
-    #[serde(default)]
-    pub prompt_input: CliPromptInputMode,
-}
-
-impl Default for CliConfig {
-    fn default() -> Self {
-        Self {
-            color: CliColorMode::Auto,
-            pager: CliPagerMode::Auto,
-            output: CliOutputMode::Text,
-            prompt_input: CliPromptInputMode::Auto,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_default_agent")]
     pub default_agent: String,
@@ -108,8 +49,6 @@ pub struct AppConfig {
     pub editor_override: Option<String>,
     #[serde(default)]
     pub theme: ThemeConfig,
-    #[serde(default)]
-    pub cli: CliConfig,
 }
 
 impl Default for AppConfig {
@@ -121,7 +60,6 @@ impl Default for AppConfig {
             max_iterations: default_max_iterations(),
             editor_override: None,
             theme: ThemeConfig::default(),
-            cli: CliConfig::default(),
         }
     }
 }
@@ -181,10 +119,6 @@ impl AppConfig {
             .collect()
     }
 
-    pub fn persist_project_coding_agent(project_dir: &Utf8Path, agent_id: &str) -> Result<()> {
-        Self::persist_scoped_coding_agent(project_dir, ConfigFileScope::Project, agent_id)
-    }
-
     pub fn persist_scoped_coding_agent(
         project_dir: &Utf8Path,
         scope: ConfigFileScope,
@@ -215,13 +149,6 @@ impl AppConfig {
 
     pub fn project_config_path(project_dir: &Utf8Path) -> Utf8PathBuf {
         project_config_path(project_dir)
-    }
-
-    pub fn config_path_for_scope(
-        project_dir: &Utf8Path,
-        scope: ConfigFileScope,
-    ) -> Result<Option<Utf8PathBuf>> {
-        config_path_for_scope(project_dir, scope)
     }
 
     pub fn scoped_config_toml(
@@ -296,18 +223,6 @@ struct PartialThemeConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-struct PartialCliConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    color: Option<CliColorMode>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pager: Option<CliPagerMode>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    output: Option<CliOutputMode>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_input: Option<CliPromptInputMode>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct PartialAppConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     default_agent: Option<String>,
@@ -321,8 +236,6 @@ struct PartialAppConfig {
     editor_override: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     theme: Option<PartialThemeConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cli: Option<PartialCliConfig>,
 }
 
 fn read_partial_config(path: &Utf8Path) -> Result<PartialAppConfig> {
@@ -415,20 +328,6 @@ fn merge_config(mut base: AppConfig, partial: PartialAppConfig) -> AppConfig {
         }
         if let Some(value) = theme.warning_color {
             base.theme.warning_color = value;
-        }
-    }
-    if let Some(cli) = partial.cli {
-        if let Some(value) = cli.color {
-            base.cli.color = value;
-        }
-        if let Some(value) = cli.pager {
-            base.cli.pager = value;
-        }
-        if let Some(value) = cli.output {
-            base.cli.output = value;
-        }
-        if let Some(value) = cli.prompt_input {
-            base.cli.prompt_input = value;
         }
     }
     base

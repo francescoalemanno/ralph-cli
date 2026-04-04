@@ -9,11 +9,11 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crate::{
     GoalDrivenWorkflowState, LastRunStatus, PromptFile, ScaffoldId, TargetConfig, TargetFile,
     TargetFileContents, TargetPaths, TargetReview, TargetSummary, WorkflowMode, atomic_write,
-    generate_slug, scaffold::materialize_target_scaffold,
+    scaffold::materialize_target_scaffold,
 };
 
-pub const ARTIFACT_DIR_NAME: &str = ".ralph";
-pub const TARGETS_DIR_NAME: &str = "targets";
+pub(crate) const ARTIFACT_DIR_NAME: &str = ".ralph";
+const TARGETS_DIR_NAME: &str = "targets";
 
 #[derive(Debug, Clone)]
 pub struct TargetStore {
@@ -60,36 +60,21 @@ impl TargetStore {
         }
     }
 
-    pub fn project_dir(&self) -> &Utf8Path {
-        &self.project_dir
-    }
-
-    pub fn ralph_dir(&self) -> Utf8PathBuf {
+    fn ralph_dir(&self) -> Utf8PathBuf {
         self.project_dir.join(ARTIFACT_DIR_NAME)
     }
 
-    pub fn targets_dir(&self) -> Utf8PathBuf {
+    fn targets_dir(&self) -> Utf8PathBuf {
         self.ralph_dir().join(TARGETS_DIR_NAME)
     }
 
-    pub fn ensure_targets_dir(&self) -> Result<()> {
+    fn ensure_targets_dir(&self) -> Result<()> {
         fs::create_dir_all(self.targets_dir())
             .with_context(|| format!("failed to create {}", self.targets_dir()))?;
         Ok(())
     }
 
-    pub fn allocate_target_id(&self) -> Result<String> {
-        self.ensure_targets_dir()?;
-        for _ in 0..128 {
-            let id = generate_slug();
-            if !self.target_dir(&id).exists() {
-                return Ok(id);
-            }
-        }
-        Err(anyhow!("failed to allocate a unique target id"))
-    }
-
-    pub fn validate_target_id(&self, target_id: &str) -> Result<()> {
+    fn validate_target_id(&self, target_id: &str) -> Result<()> {
         let trimmed = target_id.trim();
         if trimmed.is_empty() {
             return Err(anyhow!("target id cannot be empty"));
@@ -103,7 +88,7 @@ impl TargetStore {
         Ok(())
     }
 
-    pub fn target_dir(&self, target_id: &str) -> Utf8PathBuf {
+    fn target_dir(&self, target_id: &str) -> Utf8PathBuf {
         self.targets_dir().join(target_id)
     }
 
@@ -276,35 +261,6 @@ impl TargetStore {
         self.write_target_config(&config)
     }
 
-    pub fn write_target_file(&self, target_id: &str, name: &str, contents: &str) -> Result<()> {
-        let path = self.target_named_file_path(target_id, name)?;
-        self.write_file(&path, contents)
-    }
-
-    pub fn read_named_target_file(&self, target_id: &str, name: &str) -> Result<String> {
-        let path = self.target_named_file_path(target_id, name)?;
-        self.read_file(&path)
-    }
-
-    pub fn list_prompt_files(&self, target_id: &str) -> Result<Vec<PromptFile>> {
-        let mut prompts = self
-            .list_target_files(target_id)?
-            .into_iter()
-            .filter(|file| file.is_prompt)
-            .map(|file| PromptFile {
-                name: file.name,
-                path: file.path,
-            })
-            .collect::<Vec<_>>();
-        prompts.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(prompts)
-    }
-
-    pub fn list_target_files(&self, target_id: &str) -> Result<Vec<TargetFile>> {
-        let config = self.read_target_config(target_id)?;
-        self.list_target_files_with_config(target_id, &config)
-    }
-
     fn list_target_files_with_config(
         &self,
         target_id: &str,
@@ -338,36 +294,10 @@ impl TargetStore {
     pub fn read_file(&self, path: &Utf8Path) -> Result<String> {
         fs::read_to_string(path).with_context(|| format!("failed to read {path}"))
     }
-
-    fn target_named_file_path(&self, target_id: &str, name: &str) -> Result<Utf8PathBuf> {
-        validate_target_file_name(name)?;
-        let paths = self.target_paths(target_id)?;
-        Ok(paths.dir.join(name))
-    }
-
-    fn write_file(&self, path: &Utf8Path, contents: &str) -> Result<()> {
-        atomic_write(path, contents).with_context(|| format!("failed to write {path}"))
-    }
 }
 
-pub fn is_prompt_file_name(name: &str) -> bool {
+fn is_prompt_file_name(name: &str) -> bool {
     name.ends_with(".md")
-}
-
-fn validate_target_file_name(name: &str) -> Result<()> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("target file name cannot be empty"));
-    }
-    if trimmed == "." || trimmed == ".." {
-        return Err(anyhow!(
-            "target file name must resolve inside the target directory"
-        ));
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') {
-        return Err(anyhow!("target file name cannot contain path separators"));
-    }
-    Ok(())
 }
 
 fn current_unix_timestamp() -> u64 {
@@ -435,8 +365,12 @@ mod tests {
         );
         assert_eq!(summary.last_run_status, LastRunStatus::NeverRun);
 
-        let plan_prompt = store.read_named_target_file("demo", "0_plan.md").unwrap();
-        let build_prompt = store.read_named_target_file("demo", "1_build.md").unwrap();
+        let plan_prompt =
+            std::fs::read_to_string(store.target_paths("demo").unwrap().dir.join("0_plan.md"))
+                .unwrap();
+        let build_prompt =
+            std::fs::read_to_string(store.target_paths("demo").unwrap().dir.join("1_build.md"))
+                .unwrap();
         assert!(
             plan_prompt.contains("ULTIMATE GOAL - We want to achieve:\n[project-specific goal].")
         );
@@ -477,7 +411,14 @@ mod tests {
         assert_eq!(summary.mode, Some(WorkflowMode::GoalDriven));
         assert!(summary.files.iter().any(|file| file.name == "GOAL.md"));
         assert!(summary.files.iter().all(|file| !file.is_prompt));
-        assert!(store.target_dir("demo").join("specs").is_dir());
+        assert!(
+            store
+                .target_paths("demo")
+                .unwrap()
+                .dir
+                .join("specs")
+                .is_dir()
+        );
 
         let config = store.read_target_config("demo").unwrap();
         assert_eq!(config.mode, Some(WorkflowMode::GoalDriven));
@@ -515,9 +456,14 @@ mod tests {
             config.workflow.as_ref().map(|workflow| workflow.phase),
             Some(GoalDrivenPhase::Build)
         );
-        let progress = store
-            .read_named_target_file("demo", "progress.toml")
-            .unwrap();
+        let progress = std::fs::read_to_string(
+            store
+                .target_paths("demo")
+                .unwrap()
+                .dir
+                .join("progress.toml"),
+        )
+        .unwrap();
         assert!(progress.contains("description = \"Planning phase\""));
     }
 
@@ -646,9 +592,14 @@ mod tests {
         store
             .create_target("demo", Some(ScaffoldId::SinglePrompt))
             .unwrap();
-        let prompt = store
-            .read_named_target_file("demo", "prompt_main.md")
-            .unwrap();
+        let prompt = std::fs::read_to_string(
+            store
+                .target_paths("demo")
+                .unwrap()
+                .dir
+                .join("prompt_main.md"),
+        )
+        .unwrap();
 
         assert!(
             prompt
@@ -662,42 +613,5 @@ mod tests {
             )
         );
         assert!(prompt.contains("4. Stop"));
-    }
-
-    #[test]
-    fn read_named_target_file_rejects_path_traversal() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = TargetStore::new(
-            camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
-        );
-        store
-            .create_target("demo", Some(ScaffoldId::SinglePrompt))
-            .unwrap();
-
-        let error = store
-            .read_named_target_file("demo", "../outside.md")
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("target file name cannot contain path separators"));
-    }
-
-    #[test]
-    fn write_target_file_rejects_path_traversal() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let store = TargetStore::new(project_dir.clone());
-        store
-            .create_target("demo", Some(ScaffoldId::SinglePrompt))
-            .unwrap();
-
-        let outside_path = project_dir.join(".ralph/targets/escaped.md");
-        let error = store
-            .write_target_file("demo", "../escaped.md", "bad\n")
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("target file name cannot contain path separators"));
-        assert!(!outside_path.exists());
     }
 }

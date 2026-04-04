@@ -77,7 +77,8 @@ impl RalphApp<CommandRunner> {
 }
 
 impl<R> RalphApp<R> {
-    pub fn new(project_dir: Utf8PathBuf, config: AppConfig, runner: R) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(project_dir: Utf8PathBuf, config: AppConfig, runner: R) -> Self {
         Self {
             store: TargetStore::new(project_dir.clone()),
             project_dir,
@@ -119,7 +120,11 @@ impl<R> RalphApp<R> {
     }
 
     pub fn persist_agent(&mut self, agent_id: &str) -> Result<()> {
-        AppConfig::persist_project_coding_agent(&self.project_dir, agent_id)?;
+        AppConfig::persist_scoped_coding_agent(
+            &self.project_dir,
+            ralph_core::ConfigFileScope::Project,
+            agent_id,
+        )?;
         self.config.set_agent(agent_id);
         Ok(())
     }
@@ -168,7 +173,7 @@ impl<R> RalphApp<R> {
         Ok(self.resolve_prompt(target, requested_file)?.path)
     }
 
-    pub fn resolve_prompt(&self, target: &str, prompt_name: Option<&str>) -> Result<PromptFile> {
+    fn resolve_prompt(&self, target: &str, prompt_name: Option<&str>) -> Result<PromptFile> {
         let target_summary = self.store.load_target(target)?;
         self.select_prompt(&target_summary, prompt_name)
     }
