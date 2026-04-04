@@ -2,7 +2,7 @@ use std::fs;
 
 use anyhow::{Context, Result, anyhow};
 use camino::Utf8Path;
-use ralph_core::{CodingAgent, TargetReview, TargetSummary};
+use ralph_core::{AgentConfig, TargetReview, TargetSummary};
 use serde::Serialize;
 
 use crate::cli::OutputArg;
@@ -161,20 +161,15 @@ where
     }
 }
 
-pub(crate) fn agent_list_rows(detected: &[CodingAgent], commands: &[String]) -> Vec<AgentListRow> {
-    [
-        CodingAgent::Opencode,
-        CodingAgent::Codex,
-        CodingAgent::Raijin,
-    ]
-    .into_iter()
-    .zip(commands.iter())
-    .map(|(agent, command)| AgentListRow {
-        agent: agent.label().to_owned(),
-        detected: detected.contains(&agent),
-        command: command.clone(),
-    })
-    .collect()
+pub(crate) fn agent_list_rows(agents: &[AgentConfig]) -> Vec<AgentListRow> {
+    agents
+        .iter()
+        .map(|agent| AgentListRow {
+            agent: format!("{} ({})", agent.name, agent.id),
+            detected: agent.is_available(),
+            command: agent.non_interactive.command_preview(),
+        })
+        .collect()
 }
 
 fn target_row(summary: TargetSummary) -> TargetListRow {

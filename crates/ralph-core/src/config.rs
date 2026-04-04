@@ -1,11 +1,11 @@
-use std::{collections::BTreeMap, fs};
+use std::fs;
 
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 
-use crate::{CodingAgent, PromptTransport, RunnerConfig, atomic_write, store::ARTIFACT_DIR_NAME};
+use crate::{AgentConfig, atomic_write, builtin_agents, store::ARTIFACT_DIR_NAME};
 
 const PROJECT_CONFIG_FILE_NAME: &str = "config.toml";
 
@@ -96,8 +96,12 @@ impl Default for CliConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default = "default_default_agent")]
+    pub default_agent: String,
     #[serde(default)]
-    pub runner: RunnerConfig,
+    pub agent: Option<String>,
+    #[serde(default = "builtin_agents")]
+    pub agents: Vec<AgentConfig>,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
     #[serde(default)]
@@ -111,7 +115,9 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            runner: RunnerConfig::default(),
+            default_agent: default_default_agent(),
+            agent: None,
+            agents: builtin_agents(),
             max_iterations: default_max_iterations(),
             editor_override: None,
             theme: ThemeConfig::default(),
@@ -122,6 +128,8 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn load(project_dir: &Utf8Path) -> Result<Self> {
+        seed_user_config_if_missing()?;
+
         let mut config = Self::default();
 
         if let Some(user_path) = user_config_path()?
@@ -135,48 +143,70 @@ impl AppConfig {
             config = merge_config(config, read_partial_config(&project_path)?);
         }
 
-        config.select_detected_coding_agent(&CodingAgent::detected());
+        config.validate()?;
         Ok(config)
     }
 
-    pub fn coding_agent(&self) -> CodingAgent {
-        self.runner.inferred_agent().unwrap_or_default()
+    pub fn agent_id(&self) -> &str {
+        self.agent.as_deref().unwrap_or(&self.default_agent)
     }
 
-    pub fn set_coding_agent(&mut self, agent: CodingAgent) {
-        self.runner = self.runner.with_agent_preserving_env(agent);
+    pub fn agent_name(&self) -> String {
+        self.agent_definition(self.agent_id())
+            .map(|agent| agent.name.clone())
+            .unwrap_or_else(|| self.agent_id().to_owned())
     }
 
-    pub fn select_detected_coding_agent(&mut self, detected: &[CodingAgent]) -> bool {
-        let Some(current) = self.runner.inferred_agent() else {
-            return false;
-        };
-        if detected.is_empty() || detected.contains(&current) {
-            return false;
-        }
-        self.set_coding_agent(detected[0]);
-        true
+    pub fn set_agent(&mut self, agent_id: impl Into<String>) {
+        self.agent = Some(agent_id.into());
     }
 
-    pub fn persist_project_coding_agent(project_dir: &Utf8Path, agent: CodingAgent) -> Result<()> {
-        Self::persist_scoped_coding_agent(project_dir, ConfigFileScope::Project, agent)
+    pub fn agent_definition(&self, agent_id: &str) -> Option<&AgentConfig> {
+        self.agents.iter().find(|agent| agent.id == agent_id)
+    }
+
+    pub fn selected_agent(&self) -> Result<&AgentConfig> {
+        self.agent_definition(self.agent_id())
+            .ok_or_else(|| anyhow!("selected agent '{}' is not defined", self.agent_id()))
+    }
+
+    pub fn all_agents(&self) -> &[AgentConfig] {
+        &self.agents
+    }
+
+    pub fn available_agents(&self) -> Vec<&AgentConfig> {
+        self.agents
+            .iter()
+            .filter(|agent| agent.is_available())
+            .collect()
+    }
+
+    pub fn persist_project_coding_agent(project_dir: &Utf8Path, agent_id: &str) -> Result<()> {
+        Self::persist_scoped_coding_agent(project_dir, ConfigFileScope::Project, agent_id)
     }
 
     pub fn persist_scoped_coding_agent(
         project_dir: &Utf8Path,
         scope: ConfigFileScope,
-        agent: CodingAgent,
+        agent_id: &str,
     ) -> Result<()> {
+        let config = Self::load(project_dir)?;
+        if config.agent_definition(agent_id).is_none() {
+            return Err(anyhow!("agent '{}' is not defined", agent_id));
+        }
+
         let path = config_path_for_scope(project_dir, scope)?
             .ok_or_else(|| anyhow!("unable to resolve config path for scope"))?;
-        let mut config = if path.exists() {
-            let partial = read_partial_config(&path)?;
-            merge_config(AppConfig::default(), partial)
+        let mut partial = if path.exists() {
+            read_partial_config(&path)?
         } else {
-            AppConfig::default()
+            PartialAppConfig::default()
         };
-        config.set_coding_agent(agent);
-        write_config(&path, &config)
+        match scope {
+            ConfigFileScope::User => partial.default_agent = Some(agent_id.to_owned()),
+            ConfigFileScope::Project => partial.agent = Some(agent_id.to_owned()),
+        }
+        write_partial_config(&path, &partial)
     }
 
     pub fn user_config_path() -> Result<Option<Utf8PathBuf>> {
@@ -217,26 +247,42 @@ impl AppConfig {
         if let Some(path) = config_path_for_scope(project_dir, scope)?
             && path.exists()
         {
-            read_partial_config(&path)?;
+            let partial = read_partial_config(&path)?;
+            let merged = merge_config(AppConfig::default(), partial);
+            merged.validate()?;
         }
         Ok(())
     }
-}
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-struct PartialRunnerConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    program: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    args: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    env: Option<BTreeMap<String, String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_transport: Option<PromptTransport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_env_var: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    shell_template: Option<String>,
+    fn validate(&self) -> Result<()> {
+        if self.agents.is_empty() {
+            return Err(anyhow!("config defines no agents"));
+        }
+
+        let mut seen = std::collections::BTreeSet::new();
+        for agent in &self.agents {
+            if agent.id.trim().is_empty() {
+                return Err(anyhow!("agent id cannot be empty"));
+            }
+            if !seen.insert(agent.id.clone()) {
+                return Err(anyhow!("duplicate agent id '{}'", agent.id));
+            }
+        }
+
+        if self.agent_definition(&self.default_agent).is_none() {
+            return Err(anyhow!(
+                "default_agent '{}' is not defined in agents",
+                self.default_agent
+            ));
+        }
+        if let Some(agent) = &self.agent
+            && self.agent_definition(agent).is_none()
+        {
+            return Err(anyhow!("agent '{}' is not defined in agents", agent));
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -264,7 +310,11 @@ struct PartialCliConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct PartialAppConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    runner: Option<PartialRunnerConfig>,
+    default_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agents: Option<Vec<AgentConfig>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_iterations: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -278,12 +328,32 @@ struct PartialAppConfig {
 fn read_partial_config(path: &Utf8Path) -> Result<PartialAppConfig> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config file at {path}"))?;
-    toml::from_str(&raw).with_context(|| format!("failed to parse config file at {path}"))
+    toml::from_str(&raw).with_context(|| {
+        if raw.contains("[runner]") {
+            format!(
+                "failed to parse config file at {path}; the legacy [runner] schema is no longer supported, regenerate this config with default_agent/agent and [[agents]] entries"
+            )
+        } else {
+            format!("failed to parse config file at {path}")
+        }
+    })
 }
 
-fn write_config(path: &Utf8Path, config: &AppConfig) -> Result<()> {
+fn write_partial_config(path: &Utf8Path, config: &PartialAppConfig) -> Result<()> {
     let raw = toml::to_string_pretty(config).context("failed to serialize config")?;
     atomic_write(path, raw).with_context(|| format!("failed to write config at {path}"))
+}
+
+fn seed_user_config_if_missing() -> Result<()> {
+    let Some(path) = user_config_path()? else {
+        return Ok(());
+    };
+    if path.exists() {
+        return Ok(());
+    }
+    let raw = toml::to_string_pretty(&AppConfig::default())
+        .context("failed to serialize default user config")?;
+    atomic_write(&path, raw).with_context(|| format!("failed to seed user config at {path}"))
 }
 
 fn project_config_path(project_dir: &Utf8Path) -> Utf8PathBuf {
@@ -303,21 +373,32 @@ fn config_path_for_scope(
 }
 
 fn user_config_path() -> Result<Option<Utf8PathBuf>> {
-    let Some(home) = home_dir() else {
-        return Ok(None);
+    let path = if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        std::path::PathBuf::from(config_home)
+            .join("ralph")
+            .join(PROJECT_CONFIG_FILE_NAME)
+    } else {
+        let Some(home) = home_dir() else {
+            return Ok(None);
+        };
+        home.join(".config")
+            .join("ralph")
+            .join(PROJECT_CONFIG_FILE_NAME)
     };
-    let path = home
-        .join(".config")
-        .join("ralph")
-        .join(PROJECT_CONFIG_FILE_NAME);
     Utf8PathBuf::from_path_buf(path)
         .map(Some)
         .map_err(|_| anyhow!("user config path is not valid UTF-8"))
 }
 
 fn merge_config(mut base: AppConfig, partial: PartialAppConfig) -> AppConfig {
-    if let Some(runner) = partial.runner {
-        base.runner = merge_runner(base.runner, runner);
+    if let Some(default_agent) = partial.default_agent {
+        base.default_agent = default_agent;
+    }
+    if let Some(agent) = partial.agent {
+        base.agent = normalize_optional_string(agent);
+    }
+    if let Some(agents) = partial.agents {
+        base.agents = agents;
     }
     if let Some(max_iterations) = partial.max_iterations {
         base.max_iterations = max_iterations;
@@ -353,34 +434,16 @@ fn merge_config(mut base: AppConfig, partial: PartialAppConfig) -> AppConfig {
     base
 }
 
-fn merge_runner(mut runner: RunnerConfig, partial: PartialRunnerConfig) -> RunnerConfig {
-    if let Some(program) = partial.program {
-        runner.program = program;
-    }
-    if let Some(args) = partial.args {
-        runner.args = args;
-    }
-    if let Some(env) = partial.env {
-        runner.env = env;
-    }
-    if let Some(prompt_transport) = partial.prompt_transport {
-        runner.prompt_transport = prompt_transport;
-    }
-    if let Some(prompt_env_var) = partial.prompt_env_var {
-        runner.prompt_env_var = prompt_env_var;
-    }
-    if let Some(shell_template) = partial.shell_template {
-        runner.shell_template = normalize_optional_string(shell_template);
-    }
-    runner
-}
-
 fn normalize_optional_string(value: String) -> Option<String> {
     if value.trim().is_empty() {
         None
     } else {
         Some(value)
     }
+}
+
+fn default_default_agent() -> String {
+    "codex".to_owned()
 }
 
 fn default_max_iterations() -> usize {
@@ -401,192 +464,117 @@ fn default_warning_color() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::fs;
+    use std::sync::OnceLock;
 
     use camino::Utf8PathBuf;
 
-    use super::{
-        AppConfig, ConfigFileScope, PartialAppConfig, PartialRunnerConfig, merge_config,
-        merge_runner,
-    };
-    use crate::{CodingAgent, PromptTransport, RunnerConfig};
+    use super::{AppConfig, ConfigFileScope, PartialAppConfig, merge_config};
+    use crate::AgentConfig;
 
-    #[test]
-    fn app_config_switches_runner_agent() {
-        let mut config = AppConfig::default();
-        config.set_coding_agent(CodingAgent::Codex);
-        assert_eq!(config.runner.program, "codex");
+    fn configure_test_user_config_home() {
+        static TEST_CONFIG_HOME: OnceLock<Utf8PathBuf> = OnceLock::new();
+        let path = TEST_CONFIG_HOME.get_or_init(|| {
+            let path = Utf8PathBuf::from_path_buf(
+                std::env::temp_dir().join(format!("ralph-test-config-{}", std::process::id())),
+            )
+            .unwrap();
+            fs::create_dir_all(&path).unwrap();
+            path
+        });
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", path.as_str());
+        }
     }
 
     #[test]
-    fn switching_agent_preserves_runner_env_overrides() {
-        let mut config = AppConfig {
-            runner: RunnerConfig {
-                env: BTreeMap::from([
-                    ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
-                    ("RUST_LOG".to_owned(), "debug".to_owned()),
-                ]),
-                ..RunnerConfig::for_agent(CodingAgent::Opencode)
-            },
-            ..Default::default()
-        };
-
-        config.set_coding_agent(CodingAgent::Codex);
-
-        assert_eq!(config.runner.program, "codex");
-        assert_eq!(
-            config.runner.args,
-            vec![
-                "exec",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--ephemeral"
-            ]
-        );
-        assert_eq!(
-            config.runner.env.get("OPENAI_API_KEY").map(String::as_str),
-            Some("test-key")
-        );
-        assert_eq!(
-            config.runner.env.get("RUST_LOG").map(String::as_str),
-            Some("debug")
-        );
+    fn app_config_defaults_to_seeded_agents() {
+        let config = AppConfig::default();
+        assert_eq!(config.default_agent, "codex");
+        assert!(config.agent_definition("codex").is_some());
+        assert!(config.agent_definition("opencode").is_some());
+        assert!(config.agent_definition("raijin").is_some());
     }
 
     #[test]
-    fn detected_agent_fallback_still_switches_known_built_in_runner() {
-        let mut config = AppConfig::default();
-        assert!(config.select_detected_coding_agent(&[CodingAgent::Codex]));
-        assert_eq!(config.runner.program, "codex");
-    }
-
-    #[test]
-    fn detected_agent_fallback_preserves_unknown_custom_runner() {
-        let mut config = AppConfig {
-            runner: RunnerConfig {
-                program: "custom-runner".to_owned(),
-                args: vec!["--json".to_owned()],
-                env: BTreeMap::from([("CUSTOM_ENV".to_owned(), "1".to_owned())]),
-                prompt_transport: PromptTransport::TempFile,
-                prompt_env_var: "CUSTOM_PROMPT".to_owned(),
-                shell_template: Some("custom-runner {prompt_file}".to_owned()),
-            },
-            ..Default::default()
-        };
-
-        assert!(!config.select_detected_coding_agent(&[CodingAgent::Codex]));
-        assert_eq!(config.runner.program, "custom-runner");
-        assert_eq!(config.runner.args, vec!["--json"]);
-        assert_eq!(
-            config.runner.env.get("CUSTOM_ENV").map(String::as_str),
-            Some("1")
-        );
-        assert_eq!(config.runner.prompt_transport, PromptTransport::TempFile);
-        assert_eq!(config.runner.prompt_env_var, "CUSTOM_PROMPT");
-        assert_eq!(
-            config.runner.shell_template.as_deref(),
-            Some("custom-runner {prompt_file}")
-        );
-    }
-
-    #[test]
-    fn merge_runner_overrides_selected_fields() {
-        let merged = merge_runner(
-            RunnerConfig::default(),
-            PartialRunnerConfig {
-                env: Some(BTreeMap::from([("A".to_owned(), "B".to_owned())])),
+    fn merge_config_can_override_project_agent() {
+        let merged = merge_config(
+            AppConfig::default(),
+            PartialAppConfig {
+                agent: Some("raijin".to_owned()),
                 ..Default::default()
             },
         );
-        assert_eq!(merged.env.get("A").map(String::as_str), Some("B"));
+        assert_eq!(merged.agent_id(), "raijin");
     }
 
     #[test]
-    fn persisted_agent_switch_keeps_project_runner_env() {
+    fn persisted_agent_switch_updates_project_agent_only() {
+        configure_test_user_config_home();
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let config_dir = project_dir.join(".ralph");
-        fs::create_dir_all(&config_dir).unwrap();
-        fs::write(
-            config_dir.join("config.toml"),
-            r#"[runner]
-program = "opencode"
-args = ["run"]
 
-[runner.env]
-OPENAI_API_KEY = "test-key"
-RUST_LOG = "debug"
-"#,
-        )
-        .unwrap();
+        AppConfig::persist_scoped_coding_agent(&project_dir, ConfigFileScope::Project, "raijin")
+            .unwrap();
 
-        AppConfig::persist_scoped_coding_agent(
-            &project_dir,
-            ConfigFileScope::Project,
-            CodingAgent::Codex,
-        )
-        .unwrap();
-
-        let config = AppConfig::load(&project_dir).unwrap();
-        assert_eq!(config.runner.program, "codex");
-        assert_eq!(
-            config.runner.env.get("OPENAI_API_KEY").map(String::as_str),
-            Some("test-key")
-        );
-        assert_eq!(
-            config.runner.env.get("RUST_LOG").map(String::as_str),
-            Some("debug")
-        );
+        let raw = fs::read_to_string(project_dir.join(".ralph/config.toml")).unwrap();
+        assert!(raw.contains("agent = \"raijin\""));
+        assert!(!raw.contains("[[agents]]"));
     }
 
     #[test]
-    fn blank_project_editor_override_clears_inherited_user_value() {
+    fn user_config_is_seeded_with_builtin_agents() {
+        configure_test_user_config_home();
+
+        let user_path = AppConfig::user_config_path().unwrap().unwrap();
+        if user_path.exists() {
+            fs::remove_file(&user_path).unwrap();
+        }
+
+        let _ = AppConfig::load(Utf8PathBuf::from("/tmp/project").as_ref()).unwrap();
+        let raw = fs::read_to_string(user_path).unwrap();
+        assert!(raw.contains("[[agents]]"));
+        assert!(raw.contains("id = \"codex\""));
+        assert!(raw.contains("id = \"opencode\""));
+        assert!(raw.contains("id = \"raijin\""));
+    }
+
+    #[test]
+    fn effective_agent_name_comes_from_definition() {
+        let config = AppConfig {
+            agent: Some("raijin".to_owned()),
+            ..AppConfig::default()
+        };
+        assert_eq!(config.agent_name(), "Raijin");
+    }
+
+    #[test]
+    fn invalid_selected_agent_is_rejected() {
+        let config = AppConfig {
+            agent: Some("missing".to_owned()),
+            ..AppConfig::default()
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("missing"));
+    }
+
+    #[test]
+    fn replacing_agents_replaces_registry() {
         let merged = merge_config(
-            AppConfig {
-                editor_override: Some("nvim".to_owned()),
-                ..Default::default()
-            },
+            AppConfig::default(),
             PartialAppConfig {
-                editor_override: Some("   ".to_owned()),
+                agents: Some(vec![AgentConfig {
+                    id: "custom".to_owned(),
+                    name: "Custom".to_owned(),
+                    builtin: false,
+                    non_interactive: crate::CodingAgent::Codex.definition().non_interactive,
+                    interactive: crate::CodingAgent::Codex.definition().interactive,
+                }]),
+                default_agent: Some("custom".to_owned()),
                 ..Default::default()
             },
         );
-
-        assert_eq!(merged.editor_override, None);
-    }
-
-    #[test]
-    fn blank_project_shell_template_clears_inherited_user_value() {
-        let merged = merge_runner(
-            RunnerConfig {
-                program: "custom-runner".to_owned(),
-                args: vec!["--json".to_owned()],
-                env: BTreeMap::new(),
-                prompt_transport: PromptTransport::TempFile,
-                prompt_env_var: "PROMPT".to_owned(),
-                shell_template: Some("custom-runner {prompt_file}".to_owned()),
-            },
-            PartialRunnerConfig {
-                program: Some("codex".to_owned()),
-                args: Some(vec![
-                    "exec".to_owned(),
-                    "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-                    "--ephemeral".to_owned(),
-                ]),
-                shell_template: Some("".to_owned()),
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(merged.program, "codex");
-        assert_eq!(
-            merged.args,
-            vec![
-                "exec",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--ephemeral"
-            ]
-        );
-        assert_eq!(merged.shell_template, None);
+        assert_eq!(merged.agents.len(), 1);
+        assert_eq!(merged.agent_id(), "custom");
     }
 }

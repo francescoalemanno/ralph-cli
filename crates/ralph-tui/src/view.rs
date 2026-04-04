@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 use crate::{
-    Screen, TuiApp,
+    ConfirmationDialog, Screen, TuiApp,
     ui::{
         centered_rect, key_style, resolved_accent_color, resolved_success_color,
         resolved_warning_color, status_badge, status_label, status_style, styled_title,
@@ -59,7 +59,12 @@ impl TuiApp {
         let footer_area = chunks[3];
 
         match self.screen {
-            Screen::Dashboard => self.draw_dashboard(frame, content_area),
+            Screen::Dashboard => {
+                self.draw_dashboard(frame, content_area);
+                if let Some(dialog) = self.confirmation.as_ref() {
+                    self.draw_confirmation_modal(frame, dialog);
+                }
+            }
             Screen::NewTarget => {
                 self.draw_dashboard(frame, content_area);
                 self.draw_new_target_modal(frame);
@@ -106,7 +111,7 @@ impl TuiApp {
                     "active {}  ◆  completed {}  ◆  agent {}  ◆  {}",
                     active_count,
                     completed_count,
-                    self.app.coding_agent().label(),
+                    self.app.agent_name(),
                     self.app.project_dir()
                 ),
                 Style::default().fg(self.muted_color()),
@@ -143,9 +148,32 @@ impl TuiApp {
     }
 
     fn footer_spans(&self) -> Vec<Span<'static>> {
-        match self.screen {
-            Screen::Dashboard => shortcut_spans(
+        if let Some(_dialog) = self.confirmation.as_ref() {
+            return shortcut_spans(
                 &[
+                    ShortcutHint {
+                        key: "Tab/←→",
+                        label: "switch",
+                        tone: ShortcutTone::Accent,
+                    },
+                    ShortcutHint {
+                        key: "Enter",
+                        label: "choose",
+                        tone: ShortcutTone::Success,
+                    },
+                    ShortcutHint {
+                        key: "Esc",
+                        label: "cancel",
+                        tone: ShortcutTone::Warning,
+                    },
+                ],
+                self,
+            );
+        }
+
+        match self.screen {
+            Screen::Dashboard => {
+                let mut hints = vec![
                     ShortcutHint {
                         key: "N",
                         label: "new",
@@ -161,6 +189,30 @@ impl TuiApp {
                         label: "edit",
                         tone: ShortcutTone::Accent,
                     },
+                ];
+                if self.selected_target_uses_hidden_workflow() {
+                    hints.push(ShortcutHint {
+                        key: "B",
+                        label: "build",
+                        tone: ShortcutTone::Success,
+                    });
+                    hints.push(ShortcutHint {
+                        key: "I",
+                        label: "interview goal",
+                        tone: ShortcutTone::Accent,
+                    });
+                    hints.push(ShortcutHint {
+                        key: "G",
+                        label: "rebase",
+                        tone: ShortcutTone::Accent,
+                    });
+                    hints.push(ShortcutHint {
+                        key: "X",
+                        label: "rebuild",
+                        tone: ShortcutTone::Warning,
+                    });
+                }
+                hints.extend([
                     ShortcutHint {
                         key: "D",
                         label: "delete",
@@ -181,9 +233,9 @@ impl TuiApp {
                         label: "quit/cancel",
                         tone: ShortcutTone::Warning,
                     },
-                ],
-                self,
-            ),
+                ]);
+                shortcut_spans(&hints, self)
+            }
             Screen::NewTarget => shortcut_spans(
                 &[
                     ShortcutHint {
@@ -313,14 +365,15 @@ impl TuiApp {
             let sections = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(4),
+                    Constraint::Length(5),
                     Constraint::Length(3),
                     Constraint::Min(8),
                     Constraint::Length(7),
                 ])
                 .split(inner);
 
-            let header = Paragraph::new(Text::from(vec![
+            let workflow_status = self.selected_workflow_status();
+            let mut header_lines = vec![
                 Line::from(vec![
                     Span::styled(
                         format!(" {} ", status_badge(target.last_run_status)),
@@ -359,8 +412,20 @@ impl TuiApp {
                     ),
                     Style::default().fg(self.muted_color()),
                 )]),
-            ]))
-            .block(
+            ];
+            if let Some(workflow_status) = workflow_status {
+                header_lines.push(Line::from(vec![Span::styled(
+                    format!(
+                        "workflow {}  ◆  state {}  ◆  smart_run {}",
+                        workflow_status.kind.label(),
+                        workflow_status.derived_state.label(),
+                        workflow_status.run_advice.label()
+                    ),
+                    Style::default().fg(self.muted_color()),
+                )]));
+            }
+
+            let header = Paragraph::new(Text::from(header_lines)).block(
                 self.panel_block()
                     .title(self.title_line("Overview", "Current target metadata")),
             );
@@ -527,6 +592,70 @@ impl TuiApp {
                 "New Target",
                 "Task-based, goal-driven, single-prompt, or plan-build scaffold",
             )))
+            .style(
+                Style::default()
+                    .fg(self.text_color())
+                    .bg(self.background_color()),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(widget, area);
+    }
+
+    fn draw_confirmation_modal(&self, frame: &mut Frame<'_>, dialog: &ConfirmationDialog) {
+        let area = centered_rect(58, 32, frame.area());
+        frame.render_widget(Clear, area);
+
+        let no_style = if dialog.confirm_selected {
+            Style::default().fg(self.muted_color())
+        } else {
+            Style::default()
+                .fg(Color::Black)
+                .bg(self.warning_color())
+                .add_modifier(Modifier::BOLD)
+        };
+        let yes_style = if dialog.confirm_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(self.success_color())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self.muted_color())
+        };
+
+        let text = Text::from(vec![
+            Line::from(vec![Span::styled(
+                "This action is destructive.",
+                Style::default()
+                    .fg(self.warning_color())
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+            Line::from(vec![Span::styled(
+                dialog.body.clone(),
+                Style::default().fg(self.text_color()),
+            )]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Tab", key_style(self.accent_color())),
+                Span::styled(" switch  ", Style::default().fg(self.muted_color())),
+                Span::styled("Enter", key_style(self.success_color())),
+                Span::styled(" choose  ", Style::default().fg(self.muted_color())),
+                Span::styled("Esc", key_style(self.warning_color())),
+                Span::styled(" cancel", Style::default().fg(self.muted_color())),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(" No ", no_style),
+                Span::styled("   ", Style::default().fg(self.background_color())),
+                Span::styled(" Yes ", yes_style),
+            ]),
+        ]);
+
+        let widget = Paragraph::new(text)
+            .block(
+                self.panel_block()
+                    .title(self.title_line(&dialog.title, "No is selected by default")),
+            )
             .style(
                 Style::default()
                     .fg(self.text_color())
@@ -818,12 +947,29 @@ mod tests {
     use ralph_app::RalphApp;
     use ralph_core::{LastRunStatus, ScaffoldId};
     use ratatui::{Terminal, backend::TestBackend};
+    use std::sync::OnceLock;
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
     use crate::{RunningState, Screen, TuiApp};
 
+    fn configure_test_user_config_home() {
+        static TEST_CONFIG_HOME: OnceLock<Utf8PathBuf> = OnceLock::new();
+        let path = TEST_CONFIG_HOME.get_or_init(|| {
+            let path = Utf8PathBuf::from_path_buf(
+                std::env::temp_dir().join(format!("ralph-test-config-{}", std::process::id())),
+            )
+            .unwrap();
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        });
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", path.as_str());
+        }
+    }
+
     fn temp_project_dir() -> (TempDir, Utf8PathBuf) {
+        configure_test_user_config_home();
         let temp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         (temp, path)
@@ -917,6 +1063,59 @@ mod tests {
                 "live spinner text still shown for {status:?}"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_footer_shows_workflow_specific_shortcuts_only_when_relevant() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir)?;
+        app.create_target("prompt", Some(ScaffoldId::SinglePrompt))?;
+        app.create_target("tasks", Some(ScaffoldId::TaskBased))?;
+        app.create_target("workflow", Some(ScaffoldId::GoalDriven))?;
+
+        let runtime = Runtime::new()?;
+        let prompt_tui = TuiApp::new(
+            app.clone(),
+            runtime.handle().clone(),
+            Some("prompt".to_owned()),
+        );
+        let prompt_footer = prompt_tui
+            .footer_spans()
+            .into_iter()
+            .map(|span| span.content.to_string())
+            .collect::<String>();
+        assert!(!prompt_footer.contains("interview goal"));
+        assert!(!prompt_footer.contains("rebase"));
+        assert!(!prompt_footer.contains("rebuild"));
+        assert!(!prompt_footer.contains("build"));
+
+        let task_tui = TuiApp::new(
+            app.clone(),
+            runtime.handle().clone(),
+            Some("tasks".to_owned()),
+        );
+        let task_footer = task_tui
+            .footer_spans()
+            .into_iter()
+            .map(|span| span.content.to_string())
+            .collect::<String>();
+        assert!(task_footer.contains("interview goal"));
+        assert!(task_footer.contains("rebase"));
+        assert!(task_footer.contains("rebuild"));
+        assert!(task_footer.contains("build"));
+
+        let workflow_tui = TuiApp::new(app, runtime.handle().clone(), Some("workflow".to_owned()));
+        let workflow_footer = workflow_tui
+            .footer_spans()
+            .into_iter()
+            .map(|span| span.content.to_string())
+            .collect::<String>();
+        assert!(workflow_footer.contains("interview goal"));
+        assert!(workflow_footer.contains("rebase"));
+        assert!(workflow_footer.contains("rebuild"));
+        assert!(workflow_footer.contains("build"));
 
         Ok(())
     }

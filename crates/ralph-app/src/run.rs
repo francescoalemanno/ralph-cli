@@ -54,6 +54,7 @@ where
                         target_config,
                         control,
                         delegate,
+                        crate::workflow_run::WorkflowRunMode::Smart,
                     )
                     .await;
             }
@@ -65,6 +66,7 @@ where
                         target_config,
                         control,
                         delegate,
+                        crate::workflow_run::WorkflowRunMode::Smart,
                     )
                     .await;
             }
@@ -144,7 +146,7 @@ mod tests {
         RalphApp, RunDelegate, RunEvent,
         workflow::{
             GOAL_DRIVEN_BUILD_PROMPT, GOAL_DRIVEN_PAUSED_PROMPT, GOAL_DRIVEN_PLAN_PROMPT,
-            TASK_BASED_BUILD_PROMPT, TASK_BASED_PAUSED_PROMPT,
+            TASK_BASED_BUILD_PROMPT, TASK_BASED_PAUSED_PROMPT, TASK_BASED_REBASE_PROMPT,
         },
     };
 
@@ -232,6 +234,9 @@ mod tests {
 
             let progress_path = invocation.target_dir.join("progress.toml");
             let contents = match invocation.prompt_name.as_str() {
+                TASK_BASED_REBASE_PROMPT => {
+                    "version = 1\n\n[[items]]\ndescription = \"Ship the feature\"\nsteps = [\"Implement it\", \"Verify it\"]\ncompleted = false\n".to_owned()
+                }
                 TASK_BASED_BUILD_PROMPT => {
                     "version = 1\n\n[[items]]\ndescription = \"Ship the feature\"\nsteps = [\"Implement it\", \"Verify it\"]\ncompleted = true\n".to_owned()
                 }
@@ -257,7 +262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_driven_targets_plan_then_build_then_pause() {
+    async fn goal_driven_targets_plan_then_build_and_keep_building_even_if_goal_changes() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let seen_prompt_names = Arc::new(Mutex::new(Vec::new()));
@@ -309,13 +314,14 @@ mod tests {
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
-            Some(GOAL_DRIVEN_PAUSED_PROMPT)
+            Some(GOAL_DRIVEN_BUILD_PROMPT)
         );
         assert_eq!(
             *seen_prompt_names.lock().unwrap(),
             vec![
                 GOAL_DRIVEN_PLAN_PROMPT.to_owned(),
                 GOAL_DRIVEN_PLAN_PROMPT.to_owned(),
+                GOAL_DRIVEN_BUILD_PROMPT.to_owned(),
                 GOAL_DRIVEN_BUILD_PROMPT.to_owned()
             ]
         );
@@ -328,7 +334,7 @@ mod tests {
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
-            Some(GOAL_DRIVEN_PLAN_PROMPT)
+            Some(GOAL_DRIVEN_PAUSED_PROMPT)
         );
         assert_eq!(
             *seen_prompt_names.lock().unwrap(),
@@ -336,14 +342,13 @@ mod tests {
                 GOAL_DRIVEN_PLAN_PROMPT.to_owned(),
                 GOAL_DRIVEN_PLAN_PROMPT.to_owned(),
                 GOAL_DRIVEN_BUILD_PROMPT.to_owned(),
-                GOAL_DRIVEN_PLAN_PROMPT.to_owned(),
-                GOAL_DRIVEN_PLAN_PROMPT.to_owned()
+                GOAL_DRIVEN_BUILD_PROMPT.to_owned()
             ]
         );
     }
 
     #[tokio::test]
-    async fn task_based_targets_build_then_pause_and_resume_on_goal_change() {
+    async fn task_based_targets_rebase_then_build_then_require_choice_on_goal_change() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let seen_prompt_names = Arc::new(Mutex::new(Vec::new()));
@@ -361,7 +366,7 @@ mod tests {
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
-            Some(TASK_BASED_BUILD_PROMPT)
+            Some(TASK_BASED_REBASE_PROMPT)
         );
         assert_eq!(
             summary.last_run_status,
@@ -374,17 +379,21 @@ mod tests {
                 .workflow
                 .as_ref()
                 .map(|workflow| workflow.phase),
-            Some(GoalDrivenPhase::Paused)
+            Some(GoalDrivenPhase::Build)
         );
 
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
-            Some(TASK_BASED_PAUSED_PROMPT)
+            Some(TASK_BASED_BUILD_PROMPT)
         );
         assert_eq!(
             *seen_prompt_names.lock().unwrap(),
-            vec![TASK_BASED_BUILD_PROMPT.to_owned()]
+            vec![
+                TASK_BASED_REBASE_PROMPT.to_owned(),
+                TASK_BASED_REBASE_PROMPT.to_owned(),
+                TASK_BASED_BUILD_PROMPT.to_owned()
+            ]
         );
 
         std::fs::write(
@@ -395,13 +404,14 @@ mod tests {
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
-            Some(TASK_BASED_BUILD_PROMPT)
+            Some(TASK_BASED_PAUSED_PROMPT)
         );
         assert_eq!(
             *seen_prompt_names.lock().unwrap(),
             vec![
+                TASK_BASED_REBASE_PROMPT.to_owned(),
+                TASK_BASED_REBASE_PROMPT.to_owned(),
                 TASK_BASED_BUILD_PROMPT.to_owned(),
-                TASK_BASED_BUILD_PROMPT.to_owned()
             ]
         );
     }
@@ -429,7 +439,10 @@ mod tests {
 
         assert!(error.to_string().contains("runner exited with code 1"));
         let config = app.store.read_target_config("demo").unwrap();
-        assert_eq!(config.last_prompt.as_deref(), Some(TASK_BASED_BUILD_PROMPT));
+        assert_eq!(
+            config.last_prompt.as_deref(),
+            Some(TASK_BASED_REBASE_PROMPT)
+        );
         assert_eq!(config.last_run_status, ralph_core::LastRunStatus::Failed);
     }
 }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
-use ralph_core::{CodingAgent, LastRunStatus, RunControl, RunnerConfig, RunnerInvocation};
+use ralph_core::{LastRunStatus, RunControl, RunnerConfig, RunnerInvocation};
 use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -107,7 +107,7 @@ where
                 })
                 .await?;
 
-            let config = self.runner_config_for(control);
+            let config = self.runner_config_for(control)?;
             let result = self
                 .execute_runner(
                     &config,
@@ -209,23 +209,15 @@ where
         ))
     }
 
-    fn runner_config_for(&self, control: &RunControl) -> RunnerConfig {
-        let detected = CodingAgent::detected();
-        if let Some(agent) = control.coding_agent() {
-            return self
-                .config
-                .runner
-                .with_agent_preserving_env(resolve_available_agent(agent, &detected));
-        }
-
-        if let Some(agent) = self.config.runner.inferred_agent() {
-            let resolved = resolve_available_agent(agent, &detected);
-            if resolved != agent {
-                return self.config.runner.with_agent_preserving_env(resolved);
-            }
-        }
-
-        self.config.runner.clone()
+    fn runner_config_for(&self, control: &RunControl) -> Result<RunnerConfig> {
+        let agent_id = control
+            .agent_id()
+            .unwrap_or_else(|| self.config.agent_id().to_owned());
+        let agent = self
+            .config
+            .agent_definition(&agent_id)
+            .ok_or_else(|| anyhow!("agent '{}' is not defined", agent_id))?;
+        Ok(agent.non_interactive.clone())
     }
 
     async fn execute_runner<D>(
@@ -271,25 +263,15 @@ where
     }
 }
 
-fn resolve_available_agent(preferred: CodingAgent, detected: &[CodingAgent]) -> CodingAgent {
-    if detected.is_empty() || detected.contains(&preferred) {
-        preferred
-    } else {
-        detected[0]
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
     use anyhow::Result;
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
     use ralph_core::{
-        AppConfig, CodingAgent, RunControl, RunnerConfig, RunnerInvocation, RunnerResult,
-        ScaffoldId,
+        AppConfig, RunControl, RunnerConfig, RunnerInvocation, RunnerResult, ScaffoldId,
     };
     use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
     use tokio::sync::mpsc::UnboundedSender;
@@ -298,9 +280,6 @@ mod tests {
         RalphApp, RunDelegate, RunEvent,
         prompt::{CompletionCriterion, interpolate_prompt_env, parse_prompt_directives},
     };
-
-    use super::resolve_available_agent;
-
     #[derive(Clone)]
     struct ScriptedRunner {
         output: String,
@@ -606,30 +585,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn agent_resolution_falls_back_to_first_detected_agent() {
-        assert_eq!(
-            resolve_available_agent(
-                CodingAgent::Codex,
-                &[CodingAgent::Opencode, CodingAgent::Raijin]
-            ),
-            CodingAgent::Opencode
-        );
-        assert_eq!(
-            resolve_available_agent(
-                CodingAgent::Codex,
-                &[CodingAgent::Codex, CodingAgent::Opencode]
-            ),
-            CodingAgent::Codex
-        );
-        assert_eq!(
-            resolve_available_agent(CodingAgent::Raijin, &[]),
-            CodingAgent::Raijin
-        );
-    }
-
     #[tokio::test]
-    async fn runtime_agent_override_preserves_runner_env_overrides() {
+    async fn runtime_agent_override_uses_selected_agent_definition() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let seen_configs = Arc::new(Mutex::new(Vec::new()));
@@ -637,10 +594,6 @@ mod tests {
             project_dir.clone(),
             AppConfig {
                 max_iterations: 1,
-                runner: RunnerConfig {
-                    env: BTreeMap::from([("OPENAI_API_KEY".to_owned(), "test-key".to_owned())]),
-                    ..RunnerConfig::for_agent(CodingAgent::Opencode)
-                },
                 ..Default::default()
             },
             ConfigCapturingRunner {
@@ -657,7 +610,7 @@ mod tests {
 
         let mut delegate = TestDelegate;
         let control = RunControl::new();
-        control.set_coding_agent(CodingAgent::Codex);
+        control.set_agent_id("raijin");
         let summary = app
             .run_target_with_control("demo", None, control, &mut delegate)
             .await
@@ -669,10 +622,6 @@ mod tests {
         );
         let seen = seen_configs.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].program, "codex");
-        assert_eq!(
-            seen[0].env.get("OPENAI_API_KEY").map(String::as_str),
-            Some("test-key")
-        );
+        assert_eq!(seen[0].program.as_deref(), Some("raijin"));
     }
 }

@@ -1,21 +1,30 @@
-use std::{collections::BTreeMap, env, ffi::OsStr, path::Path};
+use std::{collections::BTreeMap, env, ffi::OsStr};
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum PromptTransport {
+pub enum PromptInput {
+    Argv,
     #[default]
     Stdin,
-    EnvVar,
-    TempFile,
+    Env,
+    File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandMode {
+    #[default]
+    Exec,
+    Shell,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CodingAgent {
-    #[default]
     Opencode,
+    #[default]
     Codex,
     Raijin,
 }
@@ -25,6 +34,14 @@ impl CodingAgent {
         let path = env::var_os("PATH");
         let pathext = env::var_os("PATHEXT");
         detect_agents_in_path(path.as_deref(), pathext.as_deref())
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Opencode => "opencode",
+            Self::Codex => "codex",
+            Self::Raijin => "raijin",
+        }
     }
 
     pub fn label(self) -> &'static str {
@@ -43,85 +60,180 @@ impl CodingAgent {
         }
     }
 
+    pub fn definition(self) -> AgentConfig {
+        match self {
+            Self::Opencode => AgentConfig {
+                id: self.id().to_owned(),
+                name: self.label().to_owned(),
+                builtin: true,
+                non_interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("opencode".to_owned()),
+                    args: vec![
+                        "run".to_owned(),
+                        "--format".to_owned(),
+                        "default".to_owned(),
+                        "--thinking".to_owned(),
+                    ],
+                    command: None,
+                    prompt_input: PromptInput::Stdin,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::from([(
+                        "OPENCODE_CONFIG_CONTENT".to_owned(),
+                        r#"{"$schema":"https://opencode.ai/config.json","permission":"allow"}"#
+                            .to_owned(),
+                    )]),
+                },
+                interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("opencode".to_owned()),
+                    args: vec![
+                        "{project_dir}".to_owned(),
+                        "--prompt".to_owned(),
+                        "{prompt}".to_owned(),
+                    ],
+                    command: None,
+                    prompt_input: PromptInput::Argv,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::from([(
+                        "OPENCODE_CONFIG_CONTENT".to_owned(),
+                        r#"{"$schema":"https://opencode.ai/config.json","permission":"allow"}"#
+                            .to_owned(),
+                    )]),
+                },
+            },
+            Self::Codex => AgentConfig {
+                id: self.id().to_owned(),
+                name: self.label().to_owned(),
+                builtin: true,
+                non_interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("codex".to_owned()),
+                    args: vec![
+                        "exec".to_owned(),
+                        "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+                        "--ephemeral".to_owned(),
+                    ],
+                    command: None,
+                    prompt_input: PromptInput::Stdin,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::new(),
+                },
+                interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("codex".to_owned()),
+                    args: vec!["{prompt}".to_owned()],
+                    command: None,
+                    prompt_input: PromptInput::Argv,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::new(),
+                },
+            },
+            Self::Raijin => AgentConfig {
+                id: self.id().to_owned(),
+                name: self.label().to_owned(),
+                builtin: true,
+                non_interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("raijin".to_owned()),
+                    args: vec!["-ephemeral".to_owned(), "{prompt}".to_owned()],
+                    command: None,
+                    prompt_input: PromptInput::Argv,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::new(),
+                },
+                interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("raijin".to_owned()),
+                    args: vec!["-new".to_owned(), "{prompt}".to_owned()],
+                    command: None,
+                    prompt_input: PromptInput::Argv,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::new(),
+                },
+            },
+        }
+    }
+
     fn all() -> [Self; 3] {
         [Self::Opencode, Self::Codex, Self::Raijin]
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunnerConfig {
-    pub program: String,
+    #[serde(default)]
+    pub mode: CommandMode,
+    #[serde(default)]
+    pub program: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
-    pub env: BTreeMap<String, String>,
+    pub command: Option<String>,
     #[serde(default)]
-    pub prompt_transport: PromptTransport,
+    pub prompt_input: PromptInput,
     #[serde(default = "default_prompt_env_var")]
     pub prompt_env_var: String,
     #[serde(default)]
-    pub shell_template: Option<String>,
+    pub env: BTreeMap<String, String>,
 }
 
 impl Default for RunnerConfig {
     fn default() -> Self {
-        Self::for_agent(CodingAgent::default())
+        CodingAgent::default().definition().non_interactive
     }
 }
 
 impl RunnerConfig {
-    pub fn for_agent(agent: CodingAgent) -> Self {
-        match agent {
-            CodingAgent::Opencode => Self {
-                program: "opencode".to_owned(),
-                args: vec![
-                    "run".to_owned(),
-                    "--format".to_owned(),
-                    "default".to_owned(),
-                    "--thinking".to_owned(),
-                ],
-                env: BTreeMap::new(),
-                prompt_transport: PromptTransport::Stdin,
-                prompt_env_var: default_prompt_env_var(),
-                shell_template: None,
-            },
-            CodingAgent::Codex => Self {
-                program: "codex".to_owned(),
-                args: vec![
-                    "exec".to_owned(),
-                    "--dangerously-bypass-approvals-and-sandbox".to_owned(),
-                    "--ephemeral".to_owned(),
-                ],
-                env: BTreeMap::new(),
-                prompt_transport: PromptTransport::Stdin,
-                prompt_env_var: default_prompt_env_var(),
-                shell_template: None,
-            },
-            CodingAgent::Raijin => Self {
-                program: "raijin".to_owned(),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                prompt_transport: PromptTransport::EnvVar,
-                prompt_env_var: default_prompt_env_var(),
-                shell_template: Some(r#"raijin -ephemeral "$PROMPT""#.to_owned()),
-            },
+    pub fn command_preview(&self) -> String {
+        match self.mode {
+            CommandMode::Exec => {
+                let mut pieces = Vec::new();
+                if let Some(program) = &self.program {
+                    pieces.push(program.clone());
+                }
+                pieces.extend(self.args.clone());
+                pieces.join(" ")
+            }
+            CommandMode::Shell => self.command.clone().unwrap_or_default(),
         }
     }
 
-    pub fn with_agent_preserving_env(&self, agent: CodingAgent) -> Self {
-        let mut config = Self::for_agent(agent);
-        config.env = self.env.clone();
-        config
-    }
-
-    pub fn inferred_agent(&self) -> Option<CodingAgent> {
-        match normalized_program_name(&self.program).as_deref() {
-            Some("opencode") => Some(CodingAgent::Opencode),
-            Some("codex") => Some(CodingAgent::Codex),
-            Some("raijin") => Some(CodingAgent::Raijin),
-            _ => None,
+    pub fn is_available(&self) -> bool {
+        match self.mode {
+            CommandMode::Shell => true,
+            CommandMode::Exec => self.program.as_deref().is_some_and(|program| {
+                program_is_on_path(
+                    program,
+                    env::var_os("PATH").as_deref(),
+                    env::var_os("PATHEXT").as_deref(),
+                )
+            }),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub builtin: bool,
+    pub non_interactive: RunnerConfig,
+    pub interactive: RunnerConfig,
+}
+
+impl AgentConfig {
+    pub fn is_available(&self) -> bool {
+        self.non_interactive.is_available() || self.interactive.is_available()
+    }
+}
+
+pub fn builtin_agents() -> Vec<AgentConfig> {
+    CodingAgent::all()
+        .into_iter()
+        .map(CodingAgent::definition)
+        .collect()
 }
 
 fn detect_agents_in_path(path: Option<&OsStr>, pathext: Option<&OsStr>) -> Vec<CodingAgent> {
@@ -165,78 +277,78 @@ fn executable_extensions(pathext: Option<&OsStr>) -> Vec<String> {
     }
 }
 
-fn normalized_program_name(program: &str) -> Option<String> {
-    let file_name = Path::new(program).file_name()?.to_string_lossy();
-    Some(file_name.trim_end_matches(".exe").to_ascii_lowercase())
-}
-
 fn default_prompt_env_var() -> String {
     "PROMPT".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use super::{CodingAgent, PromptTransport, RunnerConfig};
+    use super::{CodingAgent, CommandMode, PromptInput, builtin_agents};
 
     #[test]
-    fn agent_presets_preserve_commands() {
-        let opencode = RunnerConfig::for_agent(CodingAgent::Opencode);
-        assert_eq!(opencode.program, "opencode");
-        assert_eq!(
-            opencode.args,
-            vec!["run", "--format", "default", "--thinking"]
-        );
+    fn builtin_agent_definitions_are_seeded() {
+        let builtin_ids = builtin_agents()
+            .into_iter()
+            .map(|agent| agent.id)
+            .collect::<Vec<_>>();
+        assert_eq!(builtin_ids, vec!["opencode", "codex", "raijin"]);
+    }
 
-        let codex = RunnerConfig::for_agent(CodingAgent::Codex);
-        assert_eq!(codex.program, "codex");
+    #[test]
+    fn codex_builtin_uses_stdin_noninteractive_and_argv_interactive() {
+        let codex = CodingAgent::Codex.definition();
+        assert_eq!(codex.non_interactive.mode, CommandMode::Exec);
+        assert_eq!(codex.non_interactive.prompt_input, PromptInput::Stdin);
         assert_eq!(
-            codex.args,
+            codex.non_interactive.args,
             vec![
                 "exec",
                 "--dangerously-bypass-approvals-and-sandbox",
-                "--ephemeral"
+                "--ephemeral",
             ]
         );
+        assert_eq!(codex.interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(codex.interactive.args, vec!["{prompt}"]);
+    }
 
-        let raijin = RunnerConfig::for_agent(CodingAgent::Raijin);
-        assert_eq!(raijin.program, "raijin");
-        assert_eq!(raijin.prompt_transport, PromptTransport::EnvVar);
-        assert_eq!(
-            raijin.shell_template.as_deref(),
-            Some(r#"raijin -ephemeral "$PROMPT""#)
+    #[test]
+    fn opencode_builtin_carries_permission_env() {
+        let opencode = CodingAgent::Opencode.definition();
+        assert!(
+            opencode
+                .non_interactive
+                .env
+                .contains_key("OPENCODE_CONFIG_CONTENT")
+        );
+        assert!(
+            opencode
+                .interactive
+                .env
+                .contains_key("OPENCODE_CONFIG_CONTENT")
         );
     }
 
     #[test]
-    fn switching_agent_preserves_env_overrides() {
-        let config = RunnerConfig {
-            env: BTreeMap::from([
-                ("OPENAI_API_KEY".to_owned(), "test-key".to_owned()),
-                ("RUST_LOG".to_owned(), "debug".to_owned()),
-            ]),
-            ..RunnerConfig::for_agent(CodingAgent::Opencode)
-        };
+    fn opencode_builtin_commands_match_expected_shapes() {
+        let opencode = CodingAgent::Opencode.definition();
+        assert_eq!(opencode.non_interactive.prompt_input, PromptInput::Stdin);
+        assert_eq!(
+            opencode.non_interactive.args,
+            vec!["run", "--format", "default", "--thinking"]
+        );
+        assert_eq!(opencode.interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(
+            opencode.interactive.args,
+            vec!["{project_dir}", "--prompt", "{prompt}"]
+        );
+    }
 
-        let switched = config.with_agent_preserving_env(CodingAgent::Codex);
-
-        assert_eq!(switched.program, "codex");
-        assert_eq!(
-            switched.args,
-            vec![
-                "exec",
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--ephemeral"
-            ]
-        );
-        assert_eq!(
-            switched.env.get("OPENAI_API_KEY").map(String::as_str),
-            Some("test-key")
-        );
-        assert_eq!(
-            switched.env.get("RUST_LOG").map(String::as_str),
-            Some("debug")
-        );
+    #[test]
+    fn raijin_builtin_commands_match_expected_shapes() {
+        let raijin = CodingAgent::Raijin.definition();
+        assert_eq!(raijin.non_interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(raijin.non_interactive.args, vec!["-ephemeral", "{prompt}"]);
+        assert_eq!(raijin.interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(raijin.interactive.args, vec!["-new", "{prompt}"]);
     }
 }

@@ -19,8 +19,12 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 pub use editor::edit_file;
-use ralph_app::{RalphApp, RunDelegate, RunEvent};
-use ralph_core::{LastRunStatus, RunControl, ScaffoldId, TargetReview, TargetSummary};
+use ralph_app::{
+    RalphApp, RunDelegate, RunEvent, WorkflowAction, WorkflowRunAdvice, WorkflowStatus,
+};
+use ralph_core::{
+    LastRunStatus, RunControl, ScaffoldId, TargetReview, TargetSummary, WorkflowMode,
+};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::runtime::Handle;
 use ui::{normalize_terminal_text, resume_terminal, suspend_terminal};
@@ -80,6 +84,35 @@ enum Screen {
     Dashboard,
     NewTarget,
     Running,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfirmationAction {
+    DeleteTarget { target_id: String },
+    RebuildWorkflow { target_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfirmationDialog {
+    title: String,
+    body: String,
+    action: ConfirmationAction,
+    confirm_selected: bool,
+}
+
+impl ConfirmationDialog {
+    fn new(title: impl Into<String>, body: impl Into<String>, action: ConfirmationAction) -> Self {
+        Self {
+            title: title.into(),
+            body: body.into(),
+            action,
+            confirm_selected: false,
+        }
+    }
+
+    fn toggle_selection(&mut self) {
+        self.confirm_selected = !self.confirm_selected;
+    }
 }
 
 struct RunningState {
@@ -170,6 +203,7 @@ struct TuiApp {
     new_scaffold: ScaffoldId,
     message: String,
     running: Option<RunningState>,
+    confirmation: Option<ConfirmationDialog>,
     tick_count: u64,
 }
 
@@ -177,6 +211,11 @@ impl TuiApp {
     fn selected_target_uses_hidden_workflow(&self) -> bool {
         self.selected_target()
             .is_some_and(ralph_core::TargetSummary::uses_hidden_workflow)
+    }
+
+    fn selected_workflow_status(&self) -> Option<WorkflowStatus> {
+        let target = self.selected_target()?;
+        self.app.workflow_status(&target.id).ok().flatten()
     }
 
     fn new(app: RalphApp, handle: Handle, target: Option<String>) -> Self {
@@ -195,6 +234,7 @@ impl TuiApp {
             new_scaffold: ScaffoldId::TaskBased,
             message: String::new(),
             running: None,
+            confirmation: None,
             tick_count: 0,
         };
         this.reload_targets();
@@ -228,6 +268,7 @@ impl TuiApp {
                         self.handle_key(key, terminal)?;
                         if matches!(key.code, KeyCode::Char('q'))
                             && matches!(self.screen, Screen::Dashboard)
+                            && self.confirmation.is_none()
                         {
                             break;
                         }
@@ -276,6 +317,10 @@ impl TuiApp {
         key: KeyEvent,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<()> {
+        if self.confirmation.is_some() {
+            return self.handle_confirmation_key(key);
+        }
+
         match key.code {
             KeyCode::Up => {
                 self.selected_target = self.selected_target.saturating_sub(1);
@@ -305,6 +350,7 @@ impl TuiApp {
                 self.new_scaffold = ScaffoldId::TaskBased;
             }
             KeyCode::Char('r') => self.start_run()?,
+            KeyCode::Char('b') => self.start_workflow_build()?,
             KeyCode::Char('e') => {
                 let prompt_path = match self.resolve_selected_edit_path() {
                     Ok(path) => path,
@@ -321,17 +367,48 @@ impl TuiApp {
                 self.refresh_selected_target_review();
                 self.message = format!("opened {}", prompt_path.file_name().unwrap_or("file"));
             }
+            KeyCode::Char('i') => {
+                self.start_goal_interview(terminal)?;
+            }
+            KeyCode::Char('g') => {
+                self.start_workflow_rebase()?;
+            }
+            KeyCode::Char('x') => {
+                self.confirm_workflow_rebuild()?;
+            }
             KeyCode::Char('d') => {
-                let Some(target) = self.selected_target() else {
-                    return Ok(());
-                };
-                let target_id = target.id.clone();
-                self.app.delete_target(&target_id)?;
-                self.reload_targets();
-                self.message = format!("deleted {target_id}");
+                self.confirm_target_delete();
             }
             KeyCode::Char('a') => {
                 self.cycle_agent(None)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_confirmation_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.confirmation = None;
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                if let Some(dialog) = &mut self.confirmation {
+                    dialog.toggle_selection();
+                }
+            }
+            KeyCode::Char('y') => {
+                if let Some(dialog) = &mut self.confirmation {
+                    dialog.confirm_selected = true;
+                }
+            }
+            KeyCode::Enter => {
+                let Some(dialog) = self.confirmation.take() else {
+                    return Ok(());
+                };
+                if dialog.confirm_selected {
+                    self.execute_confirmation(dialog.action)?;
+                }
             }
             _ => {}
         }
@@ -625,8 +702,30 @@ impl TuiApp {
                 self.message = "select a target first".to_owned();
                 return Ok(());
             };
+            let Some(status) = self.selected_workflow_status() else {
+                self.message = "failed to inspect workflow status".to_owned();
+                return Ok(());
+            };
             let target_id = target.id.clone();
-            return self.start_run_for(&target_id, None);
+            return match status.run_advice {
+                WorkflowRunAdvice::Build => {
+                    self.start_workflow_action_for(&target_id, WorkflowAction::Build, status)
+                }
+                WorkflowRunAdvice::Rebase => {
+                    self.start_workflow_action_for(&target_id, WorkflowAction::Rebase, status)
+                }
+                WorkflowRunAdvice::Choose => {
+                    self.message = match status.kind {
+                        ralph_app::WorkflowKind::GoalDriven => "stale plan detected; press B to build current plan, G to rebase it, X to rebuild from scratch, or I to refine GOAL".to_owned(),
+                        ralph_app::WorkflowKind::TaskBased => "stale task backlog detected; press B to build current backlog, G to rebase it, X to rebuild from scratch, or I to refine GOAL".to_owned(),
+                    };
+                    Ok(())
+                }
+                WorkflowRunAdvice::NoWork => {
+                    self.message = "no workflow changes detected; press B to force the current derived state or edit GOAL/derived files".to_owned();
+                    Ok(())
+                }
+            };
         }
 
         let Some((target_id, prompt_name)) = self.selected_target_and_prompt() else {
@@ -672,24 +771,224 @@ impl TuiApp {
         Ok(())
     }
 
-    fn cycle_agent(&mut self, run_control: Option<RunControl>) -> Result<()> {
-        let detected = ralph_core::CodingAgent::detected();
-        if detected.is_empty() {
-            self.message = "no supported agents detected on PATH".to_owned();
+    fn start_workflow_action_for(
+        &mut self,
+        target_id: &str,
+        action: WorkflowAction,
+        status: WorkflowStatus,
+    ) -> Result<()> {
+        let tx = self.tx.clone();
+        let app = self.app.clone();
+        let control = RunControl::new();
+        let run_control = control.clone();
+        let target_id = target_id.to_owned();
+        let display_prompt = format!("{}_{}", status.kind.label(), action.label());
+        self.running = Some(RunningState::new(
+            target_id.clone(),
+            display_prompt,
+            None,
+            control,
+        ));
+        self.screen = Screen::Running;
+
+        self.handle.spawn(async move {
+            let mut delegate = ChannelDelegate { tx: tx.clone() };
+            let result = app
+                .run_workflow_action_with_control(&target_id, action, run_control, &mut delegate)
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(UiEvent::RunDone(result));
+        });
+
+        Ok(())
+    }
+
+    fn start_workflow_build(&mut self) -> Result<()> {
+        let Some(target_id) = self.selected_target().map(|target| target.id.clone()) else {
+            self.message = "select a target first".to_owned();
+            return Ok(());
+        };
+        let Some(status) = self.selected_workflow_status() else {
+            self.message = "workflow build is only available for workflow targets".to_owned();
+            return Ok(());
+        };
+        self.start_workflow_action_for(&target_id, WorkflowAction::Build, status)
+    }
+
+    fn start_workflow_rebase(&mut self) -> Result<()> {
+        let Some(target_id) = self.selected_target().map(|target| target.id.clone()) else {
+            self.message = "select a target first".to_owned();
+            return Ok(());
+        };
+        let Some(status) = self.selected_workflow_status() else {
+            self.message = "workflow rebase is only available for workflow targets".to_owned();
+            return Ok(());
+        };
+        self.start_workflow_action_for(&target_id, WorkflowAction::Rebase, status)
+    }
+
+    fn start_goal_interview(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
+        let Some(target) = self.selected_target() else {
+            self.message = "select a target first".to_owned();
+            return Ok(());
+        };
+        if !target.uses_hidden_workflow() {
+            self.message = "AI goal refinement is only available for workflow targets".to_owned();
             return Ok(());
         }
 
-        let current = self.app.coding_agent();
-        let index = detected
-            .iter()
-            .position(|agent| *agent == current)
-            .unwrap_or(0);
-        let next = detected[(index + 1) % detected.len()];
-        self.app.persist_coding_agent(next)?;
-        if let Some(control) = run_control {
-            control.set_coding_agent(next);
+        let target_id = target.id.clone();
+        suspend_terminal(terminal)?;
+        let result = self.app.run_workflow_goal_interview(&target_id);
+        resume_terminal(terminal)?;
+
+        match result {
+            Ok(outcome) => {
+                self.reload_targets();
+                if let Some(index) = self.targets.iter().position(|item| item.id == target_id) {
+                    self.selected_target = index;
+                    self.refresh_selected_target_review();
+                }
+                self.message = match (outcome.goal_changed, outcome.exit_code) {
+                    (true, Some(0)) => {
+                        "interactive goal session finished; GOAL.md updated".to_owned()
+                    }
+                    (false, Some(0)) => {
+                        "interactive goal session finished; GOAL.md unchanged".to_owned()
+                    }
+                    (true, Some(code)) => {
+                        format!("interactive goal session exited with code {code}; GOAL.md changed")
+                    }
+                    (false, Some(code)) => format!(
+                        "interactive goal session exited with code {code}; GOAL.md unchanged"
+                    ),
+                    (true, None) => {
+                        "interactive goal session ended by signal; GOAL.md changed".to_owned()
+                    }
+                    (false, None) => {
+                        "interactive goal session ended by signal; GOAL.md unchanged".to_owned()
+                    }
+                };
+                Ok(())
+            }
+            Err(error) => {
+                self.message = error.to_string();
+                Ok(())
+            }
         }
-        self.message = format!("agent={}", next.label());
+    }
+
+    fn start_workflow_rebuild_from_scratch(&mut self) -> Result<()> {
+        let Some(target) = self.selected_target() else {
+            self.message = "select a target first".to_owned();
+            return Ok(());
+        };
+        let target_id = target.id.clone();
+        let Some(status) = self.selected_workflow_status() else {
+            self.message = "scratch rebuild is only available for workflow targets".to_owned();
+            return Ok(());
+        };
+        match target.mode {
+            Some(WorkflowMode::GoalDriven) => {
+                self.app.rebuild_goal_driven_from_scratch(&target_id)?
+            }
+            Some(WorkflowMode::TaskBased) => {
+                self.app.rebuild_task_based_from_scratch(&target_id)?
+            }
+            None => {
+                self.message = "scratch rebuild is only available for workflow targets".to_owned();
+                return Ok(());
+            }
+        }
+        self.reload_targets();
+        if let Some(index) = self.targets.iter().position(|item| item.id == target_id) {
+            self.selected_target = index;
+            self.refresh_selected_target_review();
+        }
+        self.start_workflow_action_for(&target_id, WorkflowAction::Rebase, status)
+    }
+
+    fn confirm_target_delete(&mut self) {
+        let Some(target) = self.selected_target() else {
+            self.message = "select a target first".to_owned();
+            return;
+        };
+
+        self.confirmation = Some(ConfirmationDialog::new(
+            "Delete Target",
+            format!(
+                "Delete target `{}` and all files under its Ralph directory? This cannot be undone.",
+                target.id
+            ),
+            ConfirmationAction::DeleteTarget {
+                target_id: target.id.clone(),
+            },
+        ));
+    }
+
+    fn confirm_workflow_rebuild(&mut self) -> Result<()> {
+        let Some(target) = self.selected_target() else {
+            self.message = "select a target first".to_owned();
+            return Ok(());
+        };
+        if !target.uses_hidden_workflow() {
+            self.message = "scratch rebuild is only available for workflow targets".to_owned();
+            return Ok(());
+        }
+
+        self.confirmation = Some(ConfirmationDialog::new(
+            "Rebuild From Scratch",
+            format!(
+                "Archive the current derived workflow artifacts for `{}` and rebuild from GOAL.md? This replaces the active plan or backlog.",
+                target.id
+            ),
+            ConfirmationAction::RebuildWorkflow {
+                target_id: target.id.clone(),
+            },
+        ));
+        Ok(())
+    }
+
+    fn execute_confirmation(&mut self, action: ConfirmationAction) -> Result<()> {
+        match action {
+            ConfirmationAction::DeleteTarget { target_id } => {
+                self.app.delete_target(&target_id)?;
+                self.reload_targets();
+                self.message = format!("deleted {target_id}");
+                Ok(())
+            }
+            ConfirmationAction::RebuildWorkflow { target_id } => {
+                if let Some(index) = self.targets.iter().position(|item| item.id == target_id) {
+                    self.selected_target = index;
+                }
+                self.start_workflow_rebuild_from_scratch()
+            }
+        }
+    }
+
+    fn cycle_agent(&mut self, run_control: Option<RunControl>) -> Result<()> {
+        let available = self.app.available_agents();
+        if available.is_empty() {
+            self.message = "no configured agents are currently available".to_owned();
+            return Ok(());
+        }
+
+        let current = self.app.agent_id().to_owned();
+        let index = available
+            .iter()
+            .position(|agent| agent.id == current)
+            .unwrap_or(0);
+        let next = available[(index + 1) % available.len()];
+        let next_id = next.id.clone();
+        let next_name = next.name.clone();
+        self.app.persist_agent(&next_id)?;
+        if let Some(control) = run_control {
+            control.set_agent_id(next_id.clone());
+        }
+        self.message = format!("agent={next_name}");
         Ok(())
     }
 
@@ -739,14 +1038,32 @@ impl RunDelegate for ChannelDelegate {
 mod tests {
     use anyhow::Result;
     use camino::Utf8PathBuf;
+    use crossterm::event::{KeyCode, KeyEvent};
     use ralph_app::RalphApp;
     use ralph_core::{LastRunStatus, ScaffoldId};
+    use std::sync::OnceLock;
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
 
     use super::{RunningState, TuiApp, UiEvent};
 
+    fn configure_test_user_config_home() {
+        static TEST_CONFIG_HOME: OnceLock<Utf8PathBuf> = OnceLock::new();
+        let path = TEST_CONFIG_HOME.get_or_init(|| {
+            let path = Utf8PathBuf::from_path_buf(
+                std::env::temp_dir().join(format!("ralph-test-config-{}", std::process::id())),
+            )
+            .unwrap();
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        });
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", path.as_str());
+        }
+    }
+
     fn temp_project_dir() -> (TempDir, Utf8PathBuf) {
+        configure_test_user_config_home();
         let temp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         (temp, path)
@@ -962,6 +1279,51 @@ mod tests {
                 .and_then(RunningState::status),
             Some(LastRunStatus::Canceled)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn delete_target_requires_explicit_yes_confirmation() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir.clone())?;
+        app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+
+        tui.confirm_target_delete();
+        assert!(tui.confirmation.is_some());
+        tui.handle_confirmation_key(KeyEvent::from(KeyCode::Enter))?;
+        assert!(tui.confirmation.is_none());
+        assert_eq!(tui.app.list_targets()?.len(), 1);
+
+        tui.confirm_target_delete();
+        tui.handle_confirmation_key(KeyEvent::from(KeyCode::Tab))?;
+        tui.handle_confirmation_key(KeyEvent::from(KeyCode::Enter))?;
+        assert!(tui.confirmation.is_none());
+        assert!(tui.app.list_targets()?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_rebuild_requires_explicit_yes_confirmation() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir.clone())?;
+        app.create_target("demo", Some(ScaffoldId::GoalDriven))?;
+        let target_dir = project_dir.join(".ralph/targets/demo");
+        std::fs::write(target_dir.join("plan.toml"), "version = 1\n")?;
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+
+        tui.confirm_workflow_rebuild()?;
+        assert!(tui.confirmation.is_some());
+        tui.handle_confirmation_key(KeyEvent::from(KeyCode::Enter))?;
+        assert!(tui.confirmation.is_none());
+        assert!(target_dir.join("plan.toml").exists());
+        assert!(!target_dir.join(".history").exists());
+
         Ok(())
     }
 }

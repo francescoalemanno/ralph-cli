@@ -1,4 +1,5 @@
 mod console;
+mod interactive;
 mod prompt;
 mod prompt_run;
 mod run;
@@ -9,13 +10,16 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
-    AppConfig, CodingAgent, LastRunStatus, PromptFile, ScaffoldId, TargetReview, TargetStore,
+    AgentConfig, AppConfig, LastRunStatus, PromptFile, ScaffoldId, TargetReview, TargetStore,
     TargetSummary,
 };
 use ralph_runner::CommandRunner;
 use workflow::GOAL_DRIVEN_GOAL_FILE;
 
 pub use console::ConsoleDelegate;
+pub use workflow::{
+    WorkflowAction, WorkflowDerivedState, WorkflowKind, WorkflowRunAdvice, WorkflowStatus,
+};
 
 #[derive(Debug, Clone)]
 pub enum RunEvent {
@@ -90,17 +94,33 @@ impl<R> RalphApp<R> {
         &mut self.config
     }
 
-    pub fn coding_agent(&self) -> CodingAgent {
-        self.config.coding_agent()
+    pub fn agent_id(&self) -> &str {
+        self.config.agent_id()
     }
 
-    pub fn set_coding_agent(&mut self, agent: CodingAgent) {
-        self.config.set_coding_agent(agent);
+    pub fn agent_name(&self) -> String {
+        self.config.agent_name()
     }
 
-    pub fn persist_coding_agent(&mut self, agent: CodingAgent) -> Result<()> {
-        AppConfig::persist_project_coding_agent(&self.project_dir, agent)?;
-        self.config.set_coding_agent(agent);
+    pub fn available_agents(&self) -> Vec<&AgentConfig> {
+        self.config.available_agents()
+    }
+
+    pub fn all_agents(&self) -> &[AgentConfig] {
+        self.config.all_agents()
+    }
+
+    pub fn set_agent(&mut self, agent_id: &str) -> Result<()> {
+        if self.config.agent_definition(agent_id).is_none() {
+            return Err(anyhow!("agent '{}' is not defined", agent_id));
+        }
+        self.config.set_agent(agent_id);
+        Ok(())
+    }
+
+    pub fn persist_agent(&mut self, agent_id: &str) -> Result<()> {
+        AppConfig::persist_project_coding_agent(&self.project_dir, agent_id)?;
+        self.config.set_agent(agent_id);
         Ok(())
     }
 

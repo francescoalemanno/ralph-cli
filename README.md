@@ -126,9 +126,10 @@ Typical flow:
 1. Open the TUI.
 2. Press `N` to create a new target.
 3. Pick the `task-based`, `goal-driven`, `single-prompt`, or `plan-build` scaffold.
-4. Press `R` to run the selected prompt or workflow.
+4. Press `R` to smart-run the selected prompt or workflow.
 5. Press `E` to edit the active prompt or `GOAL.md`.
-6. Press `A` to cycle and persist the coding agent.
+6. For workflow targets, use `B` to build the current derived state, `G` to rebase it to the current `GOAL.md`, `X` to archive and rebuild it from scratch, or `I` to refine `GOAL.md` interactively.
+7. Press `A` to cycle and persist the coding agent.
 
 You can also open the TUI scoped to one target:
 
@@ -179,8 +180,8 @@ Target discovery is directory-based:
 Prompt discovery depends on the target mode:
 
 - legacy targets treat every `.md` file directly inside the target folder as runnable
-- `goal_driven` targets do not expose runnable prompt files; they expose `GOAL.md` and run internal `plan/build` prompts
-- `task_based` targets do not expose runnable prompt files; they expose `GOAL.md` and run an internal iterative build loop
+- `goal_driven` targets do not expose runnable prompt files; they expose `GOAL.md`, derive `specs/*` and `plan.toml`, and then build against that plan
+- `task_based` targets do not expose runnable prompt files; they expose `GOAL.md`, derive `progress.toml`, and then build against that backlog
 - non-runnable files in the target folder are ordinary companion files
 
 Target metadata in `target.toml` currently includes:
@@ -235,7 +236,8 @@ Goal-driven scaffold:
 - `target.toml`
 - `specs/`
 
-This scaffold uses `mode = "goal_driven"` in `target.toml`. The user edits only `GOAL.md`. Ralph decides internally whether the next run should `plan`, `build`, or remain `paused`, and stores workflow state in `target.toml`. Target-local specs live under `{ralph-env:TARGET_DIR}/specs/*`, and the operational plan lives at `{ralph-env:TARGET_DIR}/plan.toml`.
+This scaffold uses `mode = "goal_driven"` in `target.toml`. The user edits only `GOAL.md`. Ralph plans once, then keeps subsequent runs on the build loop until you explicitly reset planning, and stores workflow state in `target.toml`. Target-local specs live under `{ralph-env:TARGET_DIR}/specs/*`, and the operational plan lives at `{ralph-env:TARGET_DIR}/plan.toml`.
+`R` smart-runs the workflow: it plans when `plan.toml` is missing, builds when the plan is fresh, and stops for user choice when the plan is stale relative to `GOAL.md`. Use `B` to build the current plan anyway, `G` to rebase `specs/*` and `plan.toml` to the current goal, `X` to archive `plan.toml`/`specs/*`/`journal.txt` and rebuild from scratch, or `I` to refine `GOAL.md` interactively.
 
 Task-based scaffold:
 
@@ -244,6 +246,7 @@ Task-based scaffold:
 - `progress.toml`
 
 This scaffold uses `mode = "task_based"` in `target.toml`. The user edits only `GOAL.md`. Ralph runs a hidden iterative build loop against `{ralph-env:TARGET_DIR}/progress.toml`, updates `{ralph-env:TARGET_DIR}/journal.txt` over time, and considers the workflow complete when `progress.toml` has no remaining items with `completed = false`.
+`R` smart-runs the workflow: it bootstraps or rebases `progress.toml` when the backlog is missing, builds when the backlog is fresh and needs work, and stops for user choice when the backlog is stale relative to `GOAL.md`. Use `B` to build the current backlog, `G` to rebase `progress.toml` to the current goal while preserving still-valid completed items, `X` to archive `progress.toml`/`journal.txt` and rebuild the backlog from scratch, or `I` to refine `GOAL.md` interactively.
 
 ## Prompt Directives
 
@@ -342,8 +345,12 @@ Agent selection behavior:
 Main keys:
 
 - `N`: create target
-- `R`: run selected prompt
+- `R`: smart-run the selected prompt or workflow
+- `B`: for workflow targets, build the current plan or backlog
 - `E`: edit selected prompt
+- `I`: for workflow targets, launch an interactive goal interview session that owns the terminal until the agent exits
+- `G`: for workflow targets, rebase the current plan or backlog to the latest `GOAL.md`
+- `X`: for workflow targets, archive the current derived artifacts and rebuild them from scratch from `GOAL.md`
 - `D`: delete selected target
 - `A`: cycle agent and persist the choice
 - `Q`: quit from dashboard or cancel an active run
