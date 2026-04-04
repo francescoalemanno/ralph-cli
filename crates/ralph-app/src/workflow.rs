@@ -9,23 +9,102 @@ use ralph_core::{GoalDrivenPhase, TargetConfig, TargetStore};
 use sha2::{Digest, Sha256};
 
 pub(crate) const GOAL_DRIVEN_GOAL_FILE: &str = "GOAL.md";
-const GOAL_DRIVEN_PLAN_FILE: &str = "plan.toml";
-const GOAL_DRIVEN_SPECS_DIR: &str = "specs";
+pub(crate) const GOAL_DRIVEN_PLAN_FILE: &str = "plan.toml";
+pub(crate) const GOAL_DRIVEN_SPECS_DIR: &str = "specs";
 pub(crate) const GOAL_DRIVEN_PLAN_PROMPT: &str = "goal_driven_plan";
 pub(crate) const GOAL_DRIVEN_BUILD_PROMPT: &str = "goal_driven_build";
 pub(crate) const GOAL_DRIVEN_PAUSED_PROMPT: &str = "goal_driven_paused";
 pub(crate) const TASK_BASED_PROGRESS_FILE: &str = "progress.toml";
-const TASK_BASED_JOURNAL_FILE: &str = "journal.txt";
+pub(crate) const WORKFLOW_JOURNAL_FILE: &str = "journal.txt";
+pub(crate) const TASK_BASED_REBASE_PROMPT: &str = "task_based_rebase";
 pub(crate) const TASK_BASED_BUILD_PROMPT: &str = "task_based_build";
 pub(crate) const TASK_BASED_PAUSED_PROMPT: &str = "task_based_paused";
 
 const RALPH_ENV_TARGET_DIR: &str = "{ralph-env:TARGET_DIR}";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowKind {
+    GoalDriven,
+    TaskBased,
+}
+
+impl WorkflowKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GoalDriven => "goal_driven",
+            Self::TaskBased => "task_based",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowDerivedState {
+    Missing,
+    Fresh,
+    Stale,
+}
+
+impl WorkflowDerivedState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Fresh => "fresh",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowRunAdvice {
+    Build,
+    Rebase,
+    Choose,
+    NoWork,
+}
+
+impl WorkflowRunAdvice {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Rebase => "rebase",
+            Self::Choose => "choose",
+            Self::NoWork => "no_work",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowAction {
+    Build,
+    Rebase,
+}
+
+impl WorkflowAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Rebase => "rebase",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkflowStatus {
+    pub kind: WorkflowKind,
+    pub derived_state: WorkflowDerivedState,
+    pub run_advice: WorkflowRunAdvice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GoalDrivenAction {
     Plan,
     Build,
-    Paused,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskBasedAction {
+    Rebase,
+    Build,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,46 +119,6 @@ pub(crate) struct TaskBasedHashes {
     pub(crate) content_hash: String,
 }
 
-pub(crate) fn select_goal_driven_action(
-    config: &TargetConfig,
-    hashes: &GoalDrivenHashes,
-) -> GoalDrivenAction {
-    if let Some(inflight) = &config.inflight {
-        return match inflight.phase {
-            GoalDrivenPhase::Plan => GoalDrivenAction::Plan,
-            GoalDrivenPhase::Build => {
-                if inflight.goal_hash == hashes.goal_hash {
-                    GoalDrivenAction::Build
-                } else {
-                    GoalDrivenAction::Plan
-                }
-            }
-            GoalDrivenPhase::Paused => GoalDrivenAction::Paused,
-        };
-    }
-
-    let workflow = config.workflow.clone().unwrap_or_default();
-    if workflow
-        .last_goal_hash
-        .as_deref()
-        .is_none_or(|hash| hash != hashes.goal_hash)
-    {
-        return GoalDrivenAction::Plan;
-    }
-
-    match workflow.phase {
-        GoalDrivenPhase::Plan => GoalDrivenAction::Plan,
-        GoalDrivenPhase::Build => GoalDrivenAction::Build,
-        GoalDrivenPhase::Paused => {
-            if workflow.last_content_hash.as_deref() == Some(hashes.content_hash.as_str()) {
-                GoalDrivenAction::Paused
-            } else {
-                GoalDrivenAction::Plan
-            }
-        }
-    }
-}
-
 pub(crate) fn select_task_based_build_needed(
     config: &TargetConfig,
     hashes: &TaskBasedHashes,
@@ -89,14 +128,6 @@ pub(crate) fn select_task_based_build_needed(
     }
 
     let workflow = config.workflow.clone().unwrap_or_default();
-    if workflow
-        .last_goal_hash
-        .as_deref()
-        .is_none_or(|hash| hash != hashes.goal_hash)
-    {
-        return true;
-    }
-
     match workflow.phase {
         GoalDrivenPhase::Paused => {
             workflow.last_content_hash.as_deref() != Some(hashes.content_hash.as_str())
@@ -177,16 +208,109 @@ pub(crate) fn task_based_hashes(
     })
 }
 
+pub(crate) fn goal_driven_workflow_status(
+    config: &TargetConfig,
+    hashes: &GoalDrivenHashes,
+    target_dir: &Utf8Path,
+) -> WorkflowStatus {
+    if let Some(inflight) = &config.inflight {
+        return WorkflowStatus {
+            kind: WorkflowKind::GoalDriven,
+            derived_state: WorkflowDerivedState::Fresh,
+            run_advice: match inflight.phase {
+                GoalDrivenPhase::Plan => WorkflowRunAdvice::Rebase,
+                GoalDrivenPhase::Build | GoalDrivenPhase::Paused => WorkflowRunAdvice::Build,
+            },
+        };
+    }
+
+    let workflow = config.workflow.clone().unwrap_or_default();
+    let has_plan = target_dir.join(GOAL_DRIVEN_PLAN_FILE).exists();
+    let derived_state = if !has_plan || workflow.last_planned_at.is_none() {
+        WorkflowDerivedState::Missing
+    } else if workflow.last_goal_hash.as_deref() != Some(hashes.goal_hash.as_str()) {
+        WorkflowDerivedState::Stale
+    } else {
+        WorkflowDerivedState::Fresh
+    };
+
+    let run_advice = match derived_state {
+        WorkflowDerivedState::Missing => WorkflowRunAdvice::Rebase,
+        WorkflowDerivedState::Stale => WorkflowRunAdvice::Choose,
+        WorkflowDerivedState::Fresh => WorkflowRunAdvice::Build,
+    };
+
+    WorkflowStatus {
+        kind: WorkflowKind::GoalDriven,
+        derived_state,
+        run_advice,
+    }
+}
+
+pub(crate) fn task_based_workflow_status(
+    config: &TargetConfig,
+    hashes: &TaskBasedHashes,
+    target_dir: &Utf8Path,
+) -> WorkflowStatus {
+    if let Some(inflight) = &config.inflight {
+        return WorkflowStatus {
+            kind: WorkflowKind::TaskBased,
+            derived_state: WorkflowDerivedState::Fresh,
+            run_advice: match inflight.phase {
+                GoalDrivenPhase::Plan => WorkflowRunAdvice::Rebase,
+                GoalDrivenPhase::Build | GoalDrivenPhase::Paused => WorkflowRunAdvice::Build,
+            },
+        };
+    }
+
+    let workflow = config.workflow.clone().unwrap_or_default();
+    let has_progress = target_dir.join(TASK_BASED_PROGRESS_FILE).exists();
+    let derived_state = if !has_progress || workflow.last_goal_hash.is_none() {
+        WorkflowDerivedState::Missing
+    } else if workflow.last_goal_hash.as_deref() != Some(hashes.goal_hash.as_str()) {
+        WorkflowDerivedState::Stale
+    } else {
+        WorkflowDerivedState::Fresh
+    };
+
+    let run_advice = match derived_state {
+        WorkflowDerivedState::Missing => WorkflowRunAdvice::Rebase,
+        WorkflowDerivedState::Stale => WorkflowRunAdvice::Choose,
+        WorkflowDerivedState::Fresh => {
+            if select_task_based_build_needed(config, hashes) {
+                WorkflowRunAdvice::Build
+            } else {
+                WorkflowRunAdvice::NoWork
+            }
+        }
+    };
+
+    WorkflowStatus {
+        kind: WorkflowKind::TaskBased,
+        derived_state,
+        run_advice,
+    }
+}
+
 pub(crate) fn goal_driven_plan_prompt() -> String {
     format!(
         r#"1. Study these inputs before planning:
    a. Study `{target_dir}/GOAL.md`.
    b. Study `{target_dir}/plan.toml` if it exists.
    c. Study all spec files in `{target_dir}/specs/`.
-2. Study the relevant repository documentation and source code (do not assume something is not implemented, look deeply).
-3. Create or revise the spec files in `{target_dir}/specs/` until the functional requirements, non-functional requirements, constraints, and user-visible outcomes are clear enough to build against without guessing.
-4. Only after the specifications are coherent and sufficient, create or revise `{target_dir}/plan.toml` as the current operational plan.
-5. `plan.toml` must stay valid TOML and follow this exact shape:
+   d. Study `{target_dir}/{journal_file}` if it exists.
+2. Study the relevant repository documentation and source code (do not assume something is not implemented, look deeply). Prefer extending existing mechanisms over duplicating them.
+3. Rebase the planning artifacts to the current goal instead of starting from scratch unless the existing plan/spec context is clearly invalid.
+4. Create or revise the spec files in `{target_dir}/specs/` until a builder could implement without guessing. Capture, when relevant:
+   a. user-visible outcomes and acceptance checks
+   b. explicit scope boundaries and non-goals
+   c. interfaces, data flow, storage, and integration points touched
+   d. migrations, rollout or backward-compatibility needs, and operational constraints
+   e. verification strategy, failure modes, and observability or debugging notes
+   f. risks, open questions, and assumptions that must be resolved before coding
+5. If uncertainty remains that would materially change architecture, ordering, or correctness, keep refining `{target_dir}/specs/`. Do not push unresolved design decisions into `{target_dir}/plan.toml`.
+6. Only after the specifications are coherent and sufficient, create or revise `{target_dir}/plan.toml` as the current operational plan.
+7. `plan.toml` must stay valid TOML and follow this exact shape:
 
 ```toml
 version = 1
@@ -198,15 +322,24 @@ steps = ["List the ordered implementation and verification steps"]
 completed = false
 ```
 
-6. Keep the items in the exact execution order. Earlier items must prepare later items; do not rely on later items to make earlier items possible.
-7. Use `category` to distinguish functional and non-functional work when relevant.
-8. Keep every incomplete item at `completed = false`.
-9. Plan only. Do not implement product code or tests.
-10. If the specifications and `plan.toml` are already correct and sufficient, leave `{target_dir}/plan.toml` unchanged.
+8. Each `items.description` must name one concrete, observable outcome, not a vague activity or component area.
+9. Each `items.steps` list must be the ordered implementation and verification sequence for that one outcome.
+10. Preserve completed items that are still coherent with the current goal, and keep their ordering unless the goal makes them obsolete.
+11. Remove or rewrite incomplete items and specs that are no longer coherent with the goal. Do not preserve stale planning context just because it already exists.
+12. Decompose the plan into the smallest high-leverage items that can each be completed in one focused build iteration while leaving the repository in a coherent state.
+13. Keep the items in the exact execution order. Earlier items must prepare later items; do not rely on later items to make earlier items possible.
+14. Front-load prerequisite and risk-reduction work. Resolve unknowns, shared interfaces, migrations, and compatibility work before dependent feature slices.
+15. Use `category` to distinguish functional and non-functional work when relevant.
+16. Include non-functional items only when they are required to satisfy the goal or reduce a concrete delivery risk.
+17. Fold low-value chores into the item they validate; do not create standalone busywork items unless they materially unblock later work.
+18. Keep every incomplete item at `completed = false`.
+19. Plan only. Do not implement product code or tests.
+20. If the specifications and `plan.toml` are already correct and sufficient, leave `{target_dir}/plan.toml` unchanged.
 
 {{"ralph":"watch","path":"{target_dir}/plan.toml"}}
 "#,
-        target_dir = RALPH_ENV_TARGET_DIR
+        target_dir = RALPH_ENV_TARGET_DIR,
+        journal_file = WORKFLOW_JOURNAL_FILE
     )
 }
 
@@ -244,6 +377,39 @@ completed = false
     )
 }
 
+pub(crate) fn task_based_rebase_prompt() -> String {
+    format!(
+        r#"1. Study these inputs before rebasing the task backlog:
+   a. Study `{target_dir}/GOAL.md` as the authoritative intent.
+   b. Study `{target_dir}/progress.toml` if it exists.
+   c. Study `{target_dir}/{journal_file}` if it exists.
+   d. Study `AGENTS.md` if it exists.
+2. Study the relevant repository documentation and source code (do not assume something is not implemented, look deeply).
+3. Rebase `{target_dir}/progress.toml` to match the current goal.
+4. Preserve completed items that are still coherent with the goal. Keep their `completed = true` state when they still represent valid delivered work.
+5. Rewrite or remove items that are no longer coherent with the goal. Add new items required by the updated goal.
+6. Keep the backlog small, concrete, and execution-oriented. Each item should still be completable in one focused build iteration.
+7. `progress.toml` must stay valid TOML and follow this exact shape:
+
+```toml
+version = 1
+
+[[items]]
+description = "..."
+steps = ["..."]
+completed = false
+```
+8. Keep the items in execution order. Earlier items must unblock later ones.
+9. Backlog rebase only. Do not implement product code or tests in this run.
+10. If the existing `progress.toml` is already correct for the current goal, leave it unchanged.
+
+{{"ralph":"watch","path":"{target_dir}/progress.toml"}}
+"#,
+        target_dir = RALPH_ENV_TARGET_DIR,
+        journal_file = WORKFLOW_JOURNAL_FILE
+    )
+}
+
 pub(crate) fn task_based_build_prompt() -> String {
     format!(
         r#"1. Study these inputs before building:
@@ -273,7 +439,32 @@ completed = false
 {{"ralph":"complete_when","type":"no_line_contains_all","path":"{target_dir}/progress.toml","tokens":["completed","false"]}}
 "#,
         target_dir = RALPH_ENV_TARGET_DIR,
-        journal_file = TASK_BASED_JOURNAL_FILE
+        journal_file = WORKFLOW_JOURNAL_FILE
+    )
+}
+
+pub(crate) fn workflow_goal_interview_prompt(goal_path: &Utf8Path) -> String {
+    format!(
+        r#"You are helping the user refine the target goal stored in `{goal_path}`.
+
+1. Read `{goal_path}` before doing anything else.
+2. Treat the current contents as a draft. Do not assume they are complete or precise.
+3. Then run an interactive interview with the user until the desired outcome is concrete and unambiguous.
+4. Ask one focused question at a time. For each question:
+   a. explain briefly why the question matters
+   b. provide your recommended answer
+5. If a question can be answered by studying this repository, inspect the repository instead of asking the user.
+6. Walk the full decision tree until all material ambiguities are resolved. Cover at least:
+   a. desired outcomes and acceptance criteria
+   b. scope boundaries and explicit non-goals
+   c. user-visible behavior, interfaces, and integration points
+   d. technical constraints, migrations, rollout concerns, and compatibility
+   e. failure modes, edge cases, observability, and verification
+7. Surface contradictions, hidden assumptions, and unresolved dependencies explicitly. Do not pretend agreement exists when it does not.
+8. Do not edit `{goal_path}` until the user has explicitly confirmed the final direction.
+9. Once agreement is explicit, rewrite `{goal_path}` into a complete self-contained specification that a planner or builder can execute without guessing.
+10. The rewritten file must be concrete, implementation-oriented, and precise. Record any deliberate assumptions or deferred choices explicitly instead of leaving them implicit.
+"#
     )
 }
 
@@ -310,4 +501,58 @@ fn walk_files(dir: &Utf8Path) -> Result<Vec<Utf8PathBuf>> {
         }
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::workflow::{WorkflowDerivedState, WorkflowRunAdvice};
+    use camino::{Utf8Path, Utf8PathBuf};
+    use ralph_core::TargetStore;
+    use ralph_core::{
+        GoalDrivenPhase, GoalDrivenWorkflowState, LastRunStatus, TargetConfig, WorkflowMode,
+    };
+
+    use super::{goal_driven_hashes, goal_driven_workflow_status, workflow_goal_interview_prompt};
+
+    #[test]
+    fn goal_interview_prompt_mentions_goal_file_and_confirmation_gate() {
+        let prompt = workflow_goal_interview_prompt(Utf8Path::new("/tmp/demo/GOAL.md"));
+
+        assert!(prompt.contains("`/tmp/demo/GOAL.md`"));
+        assert!(prompt.contains("Read `/tmp/demo/GOAL.md` before doing anything else."));
+        assert!(prompt.contains("Do not edit `/tmp/demo/GOAL.md` until the user has explicitly confirmed the final direction."));
+    }
+
+    #[test]
+    fn goal_driven_status_marks_goal_change_as_stale_after_planning() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let store = TargetStore::new(project_dir.clone());
+        let target_dir = project_dir.join(".ralph/targets/demo");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("GOAL.md"), "# Goal\n\nChanged\n").unwrap();
+        std::fs::write(target_dir.join("plan.toml"), "version = 1\n").unwrap();
+
+        let config = TargetConfig {
+            id: "demo".to_owned(),
+            scaffold: None,
+            mode: Some(WorkflowMode::GoalDriven),
+            workflow: Some(GoalDrivenWorkflowState {
+                phase: GoalDrivenPhase::Paused,
+                last_goal_hash: Some("sha256:old".to_owned()),
+                last_planned_at: Some(1),
+                ..GoalDrivenWorkflowState::default()
+            }),
+            inflight: None,
+            created_at: None,
+            max_iterations: None,
+            last_prompt: None,
+            last_run_status: LastRunStatus::NeverRun,
+        };
+        let hashes = goal_driven_hashes(&store, &target_dir).unwrap();
+        let status = goal_driven_workflow_status(&config, &hashes, &target_dir);
+
+        assert_eq!(status.derived_state, WorkflowDerivedState::Stale);
+        assert_eq!(status.run_advice, WorkflowRunAdvice::Choose);
+    }
 }

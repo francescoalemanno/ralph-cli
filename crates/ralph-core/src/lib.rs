@@ -6,7 +6,7 @@ mod slug;
 mod store;
 mod types;
 
-pub use agent::{CodingAgent, PromptTransport, RunnerConfig};
+pub use agent::{AgentConfig, CodingAgent, CommandMode, PromptInput, RunnerConfig, builtin_agents};
 pub use atomic::atomic_write;
 pub use config::{
     AppConfig, CliColorMode, CliConfig, CliOutputMode, CliPagerMode, CliPromptInputMode,

@@ -2,6 +2,7 @@ use std::io;
 
 use anyhow::{Context, Result};
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{
         Clear as TerminalClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
@@ -21,14 +22,22 @@ pub(crate) fn suspend_terminal(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<()> {
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .context("failed to leave alternate screen")?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .context("failed to leave alternate screen")?;
     Ok(())
 }
 
 pub(crate) fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    execute!(terminal.backend_mut(), EnterAlternateScreen)
-        .context("failed to re-enter alternate screen")?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )
+    .context("failed to re-enter alternate screen")?;
     enable_raw_mode().context("failed to re-enable raw mode")?;
     execute!(terminal.backend_mut(), TerminalClear(ClearType::All))
         .context("failed to clear terminal after editor exit")?;

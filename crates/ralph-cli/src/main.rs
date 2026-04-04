@@ -18,10 +18,9 @@ use anyhow::{Context, Result, anyhow};
 use camino::Utf8PathBuf;
 use clap::Parser;
 use ralph_app::{ConsoleDelegate, RalphApp};
-use ralph_core::{
-    AppConfig, CodingAgent, ConfigFileScope, ScaffoldId, atomic_write, bare_prompt_template,
-};
+use ralph_core::{AppConfig, ConfigFileScope, ScaffoldId, atomic_write, bare_prompt_template};
 use ralph_tui::{edit_file, run_tui, run_tui_scoped};
+use serde::Serialize;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +92,7 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
         }
         Commands::Run(args) => {
             let mut app = RalphApp::load(project_dir)?;
-            args.runtime.apply_to(&mut app);
+            args.runtime.apply_to(&mut app)?;
             let mut delegate = ConsoleDelegate;
             match resolve_target_mode(args.target.as_deref(), args.prompt.as_deref())? {
                 TargetMode::Target(target) => {
@@ -154,31 +153,21 @@ fn run_agent_command(
 ) -> Result<()> {
     match command {
         AgentCommands::List => {
-            let detected = CodingAgent::detected();
-            let commands = [
-                CodingAgent::Opencode,
-                CodingAgent::Codex,
-                CodingAgent::Raijin,
-            ]
-            .into_iter()
-            .map(|agent| AppConfig::default().runner.for_agent_fallback(agent))
-            .collect::<Vec<_>>();
-            let rows = agent_list_rows(&detected, &commands);
+            let app = RalphApp::load(project_dir)?;
+            let rows = agent_list_rows(app.all_agents());
             print_agent_list(output, &rows)
         }
         AgentCommands::Current => {
             let app = RalphApp::load(project_dir.clone())?;
             let row = AgentCurrentRow {
-                effective_agent: app.coding_agent().label().to_owned(),
+                effective_agent: format!("{} ({})", app.agent_name(), app.agent_id()),
                 project_dir: project_dir.to_string(),
             };
             print_agent_current(output, &row)
         }
-        AgentCommands::Set(args) => AppConfig::persist_scoped_coding_agent(
-            &project_dir,
-            args.scope.into(),
-            args.agent.into(),
-        ),
+        AgentCommands::Set(args) => {
+            AppConfig::persist_scoped_coding_agent(&project_dir, args.scope.into(), &args.agent)
+        }
     }
 }
 
@@ -230,18 +219,30 @@ fn run_init(project_dir: Utf8PathBuf, args: InitArgs) -> Result<()> {
         ));
     }
 
-    let mut config = AppConfig::default();
-    if let Some(agent) = args.agent {
-        config.set_coding_agent(agent.into());
-    }
-    if let Some(editor) = args.editor {
-        config.editor_override = Some(editor);
-    }
-    if let Some(max_iterations) = args.max_iterations {
-        config.max_iterations = max_iterations;
+    let config = AppConfig::load(&project_dir)?;
+    if let Some(agent) = args.agent.as_deref()
+        && config.agent_definition(agent).is_none()
+    {
+        return Err(anyhow!("agent '{}' is not defined", agent));
     }
 
-    atomic_write(&path, toml::to_string_pretty(&config)?)
+    #[derive(Serialize)]
+    struct ProjectConfigFile {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        editor_override: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_iterations: Option<usize>,
+    }
+
+    let project_config = ProjectConfigFile {
+        agent: args.agent,
+        editor_override: args.editor,
+        max_iterations: args.max_iterations,
+    };
+
+    atomic_write(&path, toml::to_string_pretty(&project_config)?)
         .with_context(|| format!("failed to write config at {path}"))?;
     println!("{path}");
     Ok(())
@@ -253,15 +254,16 @@ fn run_doctor(project_dir: Utf8PathBuf) -> Result<()> {
     fs::create_dir_all(project_dir.join(".ralph"))
         .with_context(|| format!("failed to write under {}", project_dir))?;
 
-    let detected = CodingAgent::detected();
-    if detected.is_empty() {
+    let app = RalphApp::load(project_dir)?;
+    let available = app.available_agents();
+    if available.is_empty() {
         println!("doctor: no supported agents detected on PATH");
     } else {
         println!(
             "doctor: detected agents: {}",
-            detected
+            available
                 .iter()
-                .map(|agent| agent.label())
+                .map(|agent| agent.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -314,19 +316,6 @@ fn init_tracing() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
         )
         .try_init();
-}
-
-trait RunnerConfigCommandExt {
-    fn for_agent_fallback(self, agent: CodingAgent) -> String;
-}
-
-impl RunnerConfigCommandExt for ralph_core::RunnerConfig {
-    fn for_agent_fallback(self, agent: CodingAgent) -> String {
-        let config = ralph_core::RunnerConfig::for_agent(agent);
-        let mut pieces = vec![config.program];
-        pieces.extend(config.args);
-        pieces.join(" ")
-    }
 }
 
 #[cfg(test)]

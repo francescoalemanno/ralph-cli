@@ -1,7 +1,7 @@
 use camino::Utf8PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ralph_app::RalphApp;
-use ralph_core::{CodingAgent, ConfigFileScope, ScaffoldId};
+use ralph_core::{ConfigFileScope, ScaffoldId};
 
 const ROOT_ABOUT: &str = "Minimal Ralph loop for repository targets";
 const ROOT_LONG_ABOUT: &str = "\
@@ -14,23 +14,6 @@ Ralph stores target prompts on disk and runs a bare iteration loop.
 \n\
 \nUse the CLI when you want explicit target management, file inspection, setup tools, or\
 \nscriptable configuration management.";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum AgentArg {
-    Opencode,
-    Codex,
-    Raijin,
-}
-
-impl From<AgentArg> for CodingAgent {
-    fn from(value: AgentArg) -> Self {
-        match value {
-            AgentArg::Opencode => CodingAgent::Opencode,
-            AgentArg::Codex => CodingAgent::Codex,
-            AgentArg::Raijin => CodingAgent::Raijin,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum OutputArg {
@@ -74,20 +57,21 @@ impl From<WritableConfigScopeArg> for ConfigFileScope {
 
 #[derive(Debug, Clone, Args, Default)]
 pub(crate) struct RuntimeArgs {
-    #[arg(long, value_enum)]
-    pub(crate) agent: Option<AgentArg>,
+    #[arg(long, value_name = "ID")]
+    pub(crate) agent: Option<String>,
     #[arg(long, value_name = "N")]
     pub(crate) max_iterations: Option<usize>,
 }
 
 impl RuntimeArgs {
-    pub(crate) fn apply_to<R>(&self, app: &mut RalphApp<R>) {
-        if let Some(agent) = self.agent {
-            app.set_coding_agent(agent.into());
+    pub(crate) fn apply_to<R>(&self, app: &mut RalphApp<R>) -> anyhow::Result<()> {
+        if let Some(agent) = &self.agent {
+            app.set_agent(agent)?;
         }
         if let Some(max_iterations) = self.max_iterations {
             app.config_mut().max_iterations = max_iterations;
         }
+        Ok(())
     }
 }
 
@@ -178,8 +162,8 @@ pub(crate) enum AgentCommands {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct AgentSetArgs {
-    #[arg(value_enum)]
-    pub(crate) agent: AgentArg,
+    #[arg(value_name = "ID")]
+    pub(crate) agent: String,
     #[arg(long, value_enum, default_value_t = WritableConfigScopeArg::Project)]
     pub(crate) scope: WritableConfigScopeArg,
 }
@@ -207,8 +191,8 @@ pub(crate) enum ConfigViewArg {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct InitArgs {
-    #[arg(long, value_enum)]
-    pub(crate) agent: Option<AgentArg>,
+    #[arg(long, value_name = "ID")]
+    pub(crate) agent: Option<String>,
     #[arg(long, value_name = "CMD")]
     pub(crate) editor: Option<String>,
     #[arg(long, value_name = "N")]
