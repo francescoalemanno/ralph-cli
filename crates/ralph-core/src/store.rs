@@ -7,9 +7,9 @@ use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::{
-    EntrypointKind, LastRunStatus, PlanDrivenWorkflowState, PromptFile, ScaffoldId, TargetConfig,
-    TargetEntrypoint, TargetFile, TargetFileContents, TargetPaths, TargetReview, TargetSummary,
-    WorkflowMode, atomic_write, scaffold::materialize_target_scaffold,
+    EntrypointKind, LastRunStatus, PromptFile, ScaffoldId, TargetConfig, TargetEntrypoint,
+    TargetFile, TargetFileContents, TargetPaths, TargetReview, TargetSummary, atomic_write,
+    scaffold::materialize_target_scaffold,
 };
 
 pub(crate) const ARTIFACT_DIR_NAME: &str = ".ralph";
@@ -21,38 +21,14 @@ pub struct TargetStore {
 }
 
 impl TargetStore {
-    fn fallback_target_config(&self, target_id: &str) -> TargetConfig {
-        TargetConfig {
-            id: target_id.to_owned(),
-            scaffold: None,
-            default_entrypoint: None,
-            entrypoints: Vec::new(),
-            runtime: None,
-            mode: None,
-            workflow: None,
-            inflight: None,
-            created_at: None,
-            max_iterations: None,
-            last_prompt: None,
-            last_run_status: LastRunStatus::NeverRun,
-        }
-    }
-
     fn new_target_config(&self, target_id: &str, scaffold: Option<ScaffoldId>) -> TargetConfig {
-        let mode = match scaffold {
-            Some(ScaffoldId::TaskDriven) => Some(WorkflowMode::TaskDriven),
-            Some(ScaffoldId::PlanDriven) => Some(WorkflowMode::PlanDriven),
-            _ => None,
-        };
         TargetConfig {
             id: target_id.to_owned(),
             scaffold,
+            template: scaffold.map(|value| value.as_str().to_owned()),
             default_entrypoint: default_entrypoint_for_scaffold(scaffold),
             entrypoints: default_entrypoints_for_scaffold(scaffold),
             runtime: None,
-            mode,
-            workflow: mode.map(workflow_state_for_mode),
-            inflight: None,
             created_at: Some(current_unix_timestamp()),
             max_iterations: None,
             last_prompt: None,
@@ -142,7 +118,7 @@ impl TargetStore {
         if !paths.dir.exists() {
             return Err(anyhow!("target '{target_id}' does not exist"));
         }
-        let config = self.read_target_config_for_discovery(target_id)?;
+        let config = self.read_target_config(target_id)?;
         let files = self.list_target_files_with_config(target_id, &config)?;
         let prompt_files = files
             .iter()
@@ -159,9 +135,9 @@ impl TargetStore {
             prompt_files,
             files,
             scaffold: config.scaffold,
+            template: config.template.clone(),
             default_entrypoint: resolved_default_entrypoint(&config),
             flow_entrypoints: resolved_flow_entrypoints(&config),
-            mode: config.mode,
             created_at: config.created_at,
             last_prompt: config.last_prompt,
             last_run_status: config.last_run_status,
@@ -212,39 +188,15 @@ impl TargetStore {
     }
 
     pub fn read_target_config(&self, target_id: &str) -> Result<TargetConfig> {
-        self.read_target_config_internal(target_id, true)
+        self.read_target_config_internal(target_id)
     }
 
-    fn read_target_config_for_discovery(&self, target_id: &str) -> Result<TargetConfig> {
-        self.read_target_config_internal(target_id, false)
-    }
-
-    fn read_target_config_internal(
-        &self,
-        target_id: &str,
-        strict_parse: bool,
-    ) -> Result<TargetConfig> {
+    fn read_target_config_internal(&self, target_id: &str) -> Result<TargetConfig> {
         let paths = self.target_paths(target_id)?;
-        let raw = match fs::read_to_string(&paths.config_path) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(self.fallback_target_config(target_id));
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to read target config {}", paths.config_path)
-                });
-            }
-        };
-        let mut config = match toml::from_str(&raw) {
-            Ok(config) => config,
-            Err(_) if !strict_parse => self.fallback_target_config(target_id),
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to parse target config {}", paths.config_path)
-                });
-            }
-        };
+        let raw = fs::read_to_string(&paths.config_path)
+            .with_context(|| format!("failed to read target config {}", paths.config_path))?;
+        let mut config: TargetConfig = toml::from_str(&raw)
+            .with_context(|| format!("failed to parse target config {}", paths.config_path))?;
         config.id = target_id.to_owned();
         Ok(config)
     }
@@ -316,21 +268,13 @@ fn current_unix_timestamp() -> u64 {
 }
 
 fn is_target_prompt_file(config: &TargetConfig, name: &str) -> bool {
-    if config.entrypoints.iter().any(
-        |entrypoint| matches!(entrypoint, TargetEntrypoint::Prompt { path, .. } if path == name),
-    ) {
-        return true;
+    if !config.entrypoints.is_empty() {
+        return config.entrypoints.iter().any(
+            |entrypoint| matches!(entrypoint, TargetEntrypoint::Prompt { path, .. } if path == name),
+        );
     }
 
-    if config.uses_hidden_workflow() && config.entrypoints.is_empty() {
-        return false;
-    }
-
-    match config.mode {
-        Some(WorkflowMode::TaskDriven) => false,
-        Some(WorkflowMode::PlanDriven) => false,
-        None => is_prompt_file_name(name),
-    }
+    is_prompt_file_name(name)
 }
 
 fn default_entrypoint_for_scaffold(scaffold: Option<ScaffoldId>) -> Option<String> {
@@ -380,43 +324,22 @@ fn resolved_default_entrypoint(config: &TargetConfig) -> Option<String> {
         return Some(entrypoint.id().to_owned());
     }
 
-    if config.mode.is_some() {
-        return Some("main".to_owned());
-    }
-
     None
 }
 
 fn resolved_flow_entrypoints(config: &TargetConfig) -> Vec<String> {
-    if !config.entrypoints.is_empty() {
-        return config
-            .entrypoints
-            .iter()
-            .filter(|entrypoint| entrypoint.kind() == EntrypointKind::Flow && !entrypoint.hidden())
-            .map(|entrypoint| entrypoint.id().to_owned())
-            .collect();
-    }
-
-    match config.mode {
-        Some(WorkflowMode::TaskDriven | WorkflowMode::PlanDriven) => vec!["main".to_owned()],
-        None => Vec::new(),
-    }
-}
-
-fn workflow_state_for_mode(mode: WorkflowMode) -> PlanDrivenWorkflowState {
-    PlanDrivenWorkflowState {
-        phase: match mode {
-            WorkflowMode::TaskDriven => crate::PlanDrivenPhase::Build,
-            WorkflowMode::PlanDriven => crate::PlanDrivenPhase::Plan,
-        },
-        ..PlanDrivenWorkflowState::default()
-    }
+    config
+        .entrypoints
+        .iter()
+        .filter(|entrypoint| entrypoint.kind() == EntrypointKind::Flow && !entrypoint.hidden())
+        .map(|entrypoint| entrypoint.id().to_owned())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{TargetStore, is_prompt_file_name};
-    use crate::{LastRunStatus, PlanDrivenPhase, ScaffoldId, WorkflowMode};
+    use crate::{LastRunStatus, ScaffoldId};
 
     #[test]
     fn prompt_file_discovery_accepts_any_target_local_md_file() {
@@ -496,7 +419,8 @@ mod tests {
             .unwrap();
 
         assert!(summary.prompt_files.is_empty());
-        assert_eq!(summary.mode, Some(WorkflowMode::PlanDriven));
+        assert_eq!(summary.flow_entrypoints, vec!["main"]);
+        assert_eq!(summary.default_entrypoint.as_deref(), Some("main"));
         assert!(summary.files.iter().any(|file| file.name == "GOAL.md"));
         assert!(summary.files.iter().all(|file| !file.is_prompt));
         assert!(
@@ -509,11 +433,9 @@ mod tests {
         );
 
         let config = store.read_target_config("demo").unwrap();
-        assert_eq!(config.mode, Some(WorkflowMode::PlanDriven));
-        assert_eq!(
-            config.workflow.as_ref().map(|workflow| workflow.phase),
-            Some(PlanDrivenPhase::Plan)
-        );
+        assert_eq!(config.default_entrypoint.as_deref(), Some("main"));
+        assert_eq!(config.entrypoints.len(), 1);
+        assert!(config.runtime.is_none());
     }
 
     #[test]
@@ -528,7 +450,8 @@ mod tests {
             .unwrap();
 
         assert!(summary.prompt_files.is_empty());
-        assert_eq!(summary.mode, Some(WorkflowMode::TaskDriven));
+        assert_eq!(summary.flow_entrypoints, vec!["main"]);
+        assert_eq!(summary.default_entrypoint.as_deref(), Some("main"));
         assert!(summary.files.iter().any(|file| file.name == "GOAL.md"));
         assert!(
             summary
@@ -539,11 +462,9 @@ mod tests {
         assert!(summary.files.iter().all(|file| !file.is_prompt));
 
         let config = store.read_target_config("demo").unwrap();
-        assert_eq!(config.mode, Some(WorkflowMode::TaskDriven));
-        assert_eq!(
-            config.workflow.as_ref().map(|workflow| workflow.phase),
-            Some(PlanDrivenPhase::Build)
-        );
+        assert_eq!(config.default_entrypoint.as_deref(), Some("main"));
+        assert_eq!(config.entrypoints.len(), 1);
+        assert!(config.runtime.is_none());
         let progress = std::fs::read_to_string(
             store
                 .target_paths("demo")
@@ -556,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn target_directories_are_discovered_even_without_valid_target_config() {
+    fn list_targets_rejects_invalid_target_config() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let store = TargetStore::new(project_dir.clone());
@@ -565,23 +486,13 @@ mod tests {
         std::fs::write(target_dir.join("notes.md"), "# Notes\n").unwrap();
         std::fs::write(target_dir.join("target.toml"), "scaffold = \"playbook\"\n").unwrap();
 
-        let targets = store.list_targets().unwrap();
+        let error = store.list_targets().unwrap_err().to_string();
 
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].id, "awesome-feat-X");
-        assert_eq!(targets[0].created_at, None);
-        assert_eq!(
-            targets[0]
-                .prompt_files
-                .iter()
-                .map(|prompt| prompt.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["notes.md"]
-        );
+        assert!(error.contains("failed to parse target config"));
     }
 
     #[test]
-    fn load_target_tolerates_invalid_target_config_during_discovery() {
+    fn load_target_rejects_invalid_target_config() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let store = TargetStore::new(project_dir.clone());
@@ -590,17 +501,23 @@ mod tests {
         std::fs::write(target_dir.join("notes.md"), "# Notes\n").unwrap();
         std::fs::write(target_dir.join("target.toml"), "scaffold = \"playbook\"\n").unwrap();
 
-        let summary = store.load_target("demo").unwrap();
+        let error = store.load_target("demo").unwrap_err().to_string();
 
-        assert_eq!(summary.id, "demo");
-        assert_eq!(
-            summary
-                .prompt_files
-                .iter()
-                .map(|prompt| prompt.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["notes.md"]
-        );
+        assert!(error.contains("failed to parse target config"));
+    }
+
+    #[test]
+    fn load_target_rejects_missing_target_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let store = TargetStore::new(project_dir.clone());
+        let target_dir = project_dir.join(".ralph/targets/demo");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(target_dir.join("notes.md"), "# Notes\n").unwrap();
+
+        let error = store.load_target("demo").unwrap_err().to_string();
+
+        assert!(error.contains("failed to read target config"));
     }
 
     #[test]

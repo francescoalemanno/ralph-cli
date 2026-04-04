@@ -94,6 +94,8 @@ pub(crate) enum Commands {
     New(NewArgs),
     #[command(about = "Run a target workflow or selected prompt loop")]
     Run(RunArgs),
+    #[command(hide = true)]
+    FakeAgent(FakeAgentArgs),
     #[command(about = "Launch the interactive workflow creator against the user config")]
     WorkflowCreator,
     #[command(about = "List targets", visible_alias = "status")]
@@ -116,6 +118,8 @@ pub(crate) enum Commands {
 pub(crate) struct NewArgs {
     #[arg(value_name = "TARGET")]
     pub(crate) target: Option<String>,
+    #[arg(long, value_name = "ID")]
+    pub(crate) template: Option<String>,
     #[arg(long, value_enum, default_value_t = ScaffoldArg::SinglePrompt)]
     pub(crate) scaffold: ScaffoldArg,
     #[arg(long, action = clap::ArgAction::SetTrue)]
@@ -136,6 +140,18 @@ pub(crate) struct RunArgs {
     pub(crate) action: Option<String>,
     #[command(flatten)]
     pub(crate) runtime: RuntimeArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct FakeAgentArgs {
+    #[command(subcommand)]
+    pub(crate) command: FakeAgentCommand,
+}
+
+#[derive(Debug, Clone, Copy, Subcommand)]
+pub(crate) enum FakeAgentCommand {
+    Run,
+    Interactive,
 }
 
 #[derive(Debug, Clone, Args)]

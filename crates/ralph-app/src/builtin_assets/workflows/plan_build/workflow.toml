@@ -1,0 +1,28 @@
+version = 1
+id = "plan_build"
+name = "Plan Build"
+description = "A two-prompt target-local plan/build loop."
+scaffold = "plan_build"
+default_entrypoint = "0_plan.md"
+
+[[entrypoints]]
+id = "0_plan.md"
+kind = "prompt"
+path = "0_plan.md"
+edit_path = "0_plan.md"
+
+[[entrypoints]]
+id = "1_build.md"
+kind = "prompt"
+path = "1_build.md"
+edit_path = "1_build.md"
+
+[[materialize]]
+kind = "file"
+path = "0_plan.md"
+source = "self://templates/0_plan.md"
+
+[[materialize]]
+kind = "file"
+path = "1_build.md"
+source = "self://templates/1_build.md"

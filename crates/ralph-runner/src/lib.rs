@@ -287,6 +287,7 @@ fn build_async_command(
                 .program
                 .as_deref()
                 .ok_or_else(|| anyhow!("exec command is missing program"))?;
+            let program = render_template(program, context, prompt_file);
             let mut command = AsyncCommand::new(program);
             for arg in &config.args {
                 command.arg(render_template(arg, context, prompt_file));
@@ -317,6 +318,7 @@ fn build_std_command(
                 .program
                 .as_deref()
                 .ok_or_else(|| anyhow!("exec command is missing program"))?;
+            let program = render_template(program, context, prompt_file);
             let mut command = StdCommand::new(program);
             for arg in &config.args {
                 command.arg(render_template(arg, context, prompt_file));
@@ -351,6 +353,10 @@ fn rendered_envs(
         "RALPH_PROJECT_DIR".to_owned(),
         context.project_dir.to_string(),
     ));
+    let ralph_bin = current_binary_path();
+    if !ralph_bin.is_empty() {
+        envs.push(("RALPH_BIN".to_owned(), ralph_bin));
+    }
     envs.push((
         "RALPH_TARGET_DIR".to_owned(),
         context.target_dir.to_string(),
@@ -580,6 +586,7 @@ fn render_template(template: &str, context: &TemplateContext, prompt_file: &str)
     let mut rendered = template.to_owned();
     let mode = invocation_mode(&context.prompt_name);
     let goal_path = context.goal_path.as_ref().unwrap_or(&context.prompt_path);
+    let ralph_bin = current_binary_path();
     let replacements = [
         ("{project_dir}", context.project_dir.as_str()),
         ("{target_dir}", context.target_dir.as_str()),
@@ -589,11 +596,19 @@ fn render_template(template: &str, context: &TemplateContext, prompt_file: &str)
         ("{goal_path}", goal_path.as_str()),
         ("{prompt}", context.prompt_text.as_str()),
         ("{prompt_file}", prompt_file),
+        ("{ralph_bin}", ralph_bin.as_str()),
     ];
     for (needle, value) in replacements {
         rendered = rendered.replace(needle, value);
     }
     rendered
+}
+
+fn current_binary_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_default()
 }
 
 fn invocation_mode(prompt_name: &str) -> String {
@@ -631,6 +646,7 @@ fn shell_std_command() -> StdCommand {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     use camino::Utf8PathBuf;
     use ralph_core::{CodingAgent, CommandMode, PromptInput, RunnerInvocation};
@@ -704,6 +720,49 @@ mod tests {
         });
         let rendered = render_template("X={prompt} Y={prompt_file}", &context, "/tmp/prompt.txt");
         assert_eq!(rendered, "X=hello Y=/tmp/prompt.txt");
+    }
+
+    #[test]
+    fn render_template_exposes_current_binary_placeholder() {
+        let context = TemplateContext::from_invocation(RunnerInvocation {
+            prompt_text: "hello".to_owned(),
+            project_dir: "/tmp/project".into(),
+            target_dir: "/tmp/project/.ralph/targets/demo".into(),
+            prompt_path: "/tmp/project/.ralph/targets/demo/prompt_main.md".into(),
+            prompt_name: "prompt_main.md".to_owned(),
+        });
+        let rendered = render_template("{ralph_bin}", &context, "/tmp/prompt.txt");
+        assert!(!rendered.is_empty());
+        assert!(PathBuf::from(rendered).is_absolute());
+    }
+
+    #[test]
+    fn rendered_envs_include_current_binary_path() {
+        let context = TemplateContext::from_invocation(RunnerInvocation {
+            prompt_text: "hello".to_owned(),
+            project_dir: "/tmp/project".into(),
+            target_dir: "/tmp/project/.ralph/targets/demo".into(),
+            prompt_path: "/tmp/project/.ralph/targets/demo/prompt_main.md".into(),
+            prompt_name: "prompt_main.md".to_owned(),
+        });
+        let config = ralph_core::RunnerConfig {
+            mode: CommandMode::Shell,
+            program: None,
+            args: Vec::new(),
+            command: Some("echo ok".to_owned()),
+            prompt_input: PromptInput::File,
+            prompt_env_var: "PROMPT".to_owned(),
+            env: BTreeMap::new(),
+        };
+
+        let envs = super::rendered_envs(&config, &context, "/tmp/prompt.txt");
+        let ralph_bin = envs
+            .iter()
+            .find(|(key, _)| key == "RALPH_BIN")
+            .map(|(_, value)| PathBuf::from(value))
+            .expect("RALPH_BIN must be present");
+
+        assert!(ralph_bin.is_absolute());
     }
 
     #[test]

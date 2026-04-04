@@ -4,8 +4,7 @@ mod interactive;
 mod prompt;
 mod prompt_run;
 mod run;
-mod workflow;
-mod workflow_run;
+mod template;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -14,15 +13,38 @@ use ralph_core::{
     AgentConfig, AppConfig, LastRunStatus, PromptFile, ScaffoldId, TargetReview, TargetStore,
     TargetSummary,
 };
-use ralph_runner::CommandRunner;
-use workflow::PLAN_DRIVEN_GOAL_FILE;
+use ralph_runner::{CommandRunner, RunnerAdapter};
+use tokio::sync::oneshot;
 
 pub use console::ConsoleDelegate;
-pub use workflow::{
-    WorkflowAction, WorkflowDerivedState, WorkflowKind, WorkflowRunAdvice, WorkflowStatus,
-};
+pub use template::{WorkflowTemplateSource, WorkflowTemplateSummary};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowActionStatus {
+    pub id: String,
+    pub label: String,
+    pub shortcut: Option<String>,
+    pub confirm_title: Option<String>,
+    pub confirm_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowPauseStatus {
+    pub node_id: String,
+    pub message: Option<String>,
+    pub summary: Option<String>,
+    pub actions: Vec<FlowActionStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlowStatus {
+    pub entrypoint_id: String,
+    pub current_node: Option<String>,
+    pub pause: Option<FlowPauseStatus>,
+    pub flow_ref: String,
+}
+
+#[derive(Debug)]
 pub enum RunEvent {
     IterationStarted {
         prompt_name: String,
@@ -31,6 +53,14 @@ pub enum RunEvent {
     },
     Output(String),
     Note(String),
+    InteractiveSessionStart {
+        prompt_name: String,
+        ready: oneshot::Sender<()>,
+    },
+    InteractiveSessionEnd {
+        prompt_name: String,
+        ready: oneshot::Sender<()>,
+    },
     Finished {
         status: LastRunStatus,
         summary: String,
@@ -150,6 +180,37 @@ impl<R> RalphApp<R> {
         self.store.review_target(target)
     }
 
+    pub fn flow_status(&self, target: &str) -> Result<Option<FlowStatus>>
+    where
+        R: RunnerAdapter,
+    {
+        let target_config = self.store.read_target_config(target)?;
+        let target_summary = self.store.load_target(target)?;
+        Ok(self
+            .flow_status_summary(&target_config, &target_summary)?
+            .map(|status| FlowStatus {
+                entrypoint_id: status.entrypoint_id,
+                current_node: status.current_node,
+                pause: status.pause.map(|pause| FlowPauseStatus {
+                    node_id: pause.node_id,
+                    message: pause.message,
+                    summary: pause.summary,
+                    actions: pause
+                        .actions
+                        .into_iter()
+                        .map(|action| FlowActionStatus {
+                            id: action.id,
+                            label: action.label,
+                            shortcut: action.shortcut,
+                            confirm_title: action.confirm_title,
+                            confirm_message: action.confirm_message,
+                        })
+                        .collect(),
+                }),
+                flow_ref: status.flow_ref,
+            }))
+    }
+
     pub fn delete_target(&self, target: &str) -> Result<()> {
         self.store.delete_target(target)
     }
@@ -189,15 +250,6 @@ impl<R> RalphApp<R> {
             }
         }
 
-        if config.uses_hidden_workflow() {
-            return match requested_file {
-                None | Some(PLAN_DRIVEN_GOAL_FILE) => Ok(target_dir.join(PLAN_DRIVEN_GOAL_FILE)),
-                Some(name) => Err(anyhow!(
-                    "workflow targets only expose {PLAN_DRIVEN_GOAL_FILE} for editing, got '{name}'"
-                )),
-            };
-        }
-
         Ok(self.resolve_prompt(target, requested_file)?.path)
     }
 
@@ -211,9 +263,9 @@ impl<R> RalphApp<R> {
         target_summary: &TargetSummary,
         prompt_name: Option<&str>,
     ) -> Result<PromptFile> {
-        if target_summary.uses_hidden_workflow() {
+        if target_summary.has_flow_entrypoints() {
             return Err(anyhow!(
-                "target '{}' uses a workflow mode and does not expose runnable prompts",
+                "target '{}' uses flow entrypoints and does not expose runnable prompts",
                 target_summary.id
             ));
         }

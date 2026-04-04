@@ -1,0 +1,34 @@
+version = 1
+id = "task_driven"
+name = "Task Driven"
+description = "A durable backlog/build workflow driven from GOAL.md."
+scaffold = "task_driven"
+default_entrypoint = "main"
+
+[params.goal_file]
+default = "GOAL.md"
+
+[params.derived_file]
+default = "progress.toml"
+
+[params.journal_file]
+default = "journal.txt"
+
+[params.archive_prefix]
+default = "task_rebuild"
+
+[[entrypoints]]
+id = "main"
+kind = "flow"
+flow = "builtin://flows/task_driven.toml"
+edit_path = "{{goal_file}}"
+
+[[materialize]]
+kind = "file"
+path = "{{goal_file}}"
+source = "self://templates/GOAL.md"
+
+[[materialize]]
+kind = "file"
+path = "{{derived_file}}"
+source = "self://templates/progress.toml"

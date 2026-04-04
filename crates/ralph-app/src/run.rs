@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{LastRunStatus, RunControl, TargetConfig, TargetEntrypoint, TargetSummary};
 use ralph_runner::{InteractiveSessionInvocation, RunnerAdapter};
+use tokio::sync::oneshot;
 
 use crate::{
     RalphApp, RunDelegate, RunEvent,
@@ -15,10 +16,6 @@ use crate::{
         FlowEvalContext, FlowNodeSpec, FlowPauseAction, FlowStatusSummary, clear_inflight,
         ensure_runtime, load_flow, load_prompt_text, resolve_default_entrypoint,
         resolve_prompt_entrypoint, resolve_target_entrypoints, select_transition, set_inflight,
-    },
-    workflow::{
-        PLAN_DRIVEN_BUILD_PROMPT, PLAN_DRIVEN_PLAN_PROMPT, TASK_DRIVEN_BUILD_PROMPT,
-        TASK_DRIVEN_REBASE_PROMPT, plan_driven_hashes, task_driven_hashes,
     },
 };
 
@@ -257,21 +254,22 @@ where
         let loaded_flow = load_flow(&self.project_dir, &target_summary.dir, entrypoint)?;
         let mut current_node_id = if let Some(action_id) = action_id {
             let status = self.flow_status_summary(&target_config, target_summary)?;
-            let pause = status
-                .and_then(|status| status.pause)
-                .ok_or_else(|| anyhow!("target '{}' is not waiting on a flow action", target))?;
-            pause
-                .actions
-                .iter()
-                .find(|action| action.id == action_id)
-                .map(|action| action.goto.clone())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "flow action '{}' is not available for '{}'",
-                        action_id,
-                        target
-                    )
-                })?
+            if let Some(pause) = status.and_then(|status| status.pause) {
+                pause
+                    .actions
+                    .iter()
+                    .find(|action| action.id == action_id)
+                    .map(|action| action.goto.clone())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "flow action '{}' is not available for '{}'",
+                            action_id,
+                            target
+                        )
+                    })?
+            } else {
+                loaded_flow.definition.start.clone()
+            }
         } else {
             loaded_flow.definition.start.clone()
         };
@@ -421,8 +419,13 @@ where
                     on_failed,
                     on_canceled,
                 } => {
-                    let prompt_text =
-                        load_prompt_text(&self.project_dir, &target_summary.dir, prompt, &params)?;
+                    let prompt_text = load_prompt_text(
+                        &self.project_dir,
+                        &target_summary.dir,
+                        prompt,
+                        Some(&loaded_flow.artifact_ref),
+                        &params,
+                    )?;
                     let prepared = self.prepare_inline_prompt_run(
                         &target_summary.dir,
                         &node.id,
@@ -467,12 +470,6 @@ where
                     }
                     target_config.last_prompt = Some(node.id.clone());
                     target_config.last_run_status = status;
-                    self.sync_legacy_workflow_state_after_prompt(
-                        &mut target_config,
-                        &target_summary.dir,
-                        &node.id,
-                        status,
-                    )?;
                     self.store.write_target_config(&target_config)?;
                     current_node_id = self.next_node_for_status(
                         &target_summary.dir,
@@ -493,13 +490,26 @@ where
                     on_completed,
                     on_failed,
                 } => {
-                    let prompt_text =
-                        load_prompt_text(&self.project_dir, &target_summary.dir, prompt, &params)?;
+                    let prompt_text = load_prompt_text(
+                        &self.project_dir,
+                        &target_summary.dir,
+                        prompt,
+                        Some(&loaded_flow.artifact_ref),
+                        &params,
+                    )?;
                     let config = self.interactive_runner_config_for(&control)?;
                     let goal_path = loaded_flow
                         .edit_path
                         .clone()
                         .unwrap_or_else(|| target_summary.dir.join("GOAL.md"));
+                    let (start_tx, start_rx) = oneshot::channel();
+                    delegate
+                        .on_event(RunEvent::InteractiveSessionStart {
+                            prompt_name: node.id.clone(),
+                            ready: start_tx,
+                        })
+                        .await?;
+                    let _ = start_rx.await;
                     let outcome = self.runner.run_interactive_session(
                         &config,
                         &InteractiveSessionInvocation {
@@ -509,7 +519,16 @@ where
                             target_dir: target_summary.dir.clone(),
                             goal_path,
                         },
-                    )?;
+                    );
+                    let (end_tx, end_rx) = oneshot::channel();
+                    delegate
+                        .on_event(RunEvent::InteractiveSessionEnd {
+                            prompt_name: node.id.clone(),
+                            ready: end_tx,
+                        })
+                        .await?;
+                    let _ = end_rx.await;
+                    let outcome = outcome?;
                     let status = if outcome.exit_code == Some(0) || outcome.exit_code.is_none() {
                         LastRunStatus::Completed
                     } else {
@@ -824,71 +843,6 @@ fn current_unix_timestamp_millis() -> u128 {
         .unwrap_or(0)
 }
 
-impl<R> RalphApp<R>
-where
-    R: RunnerAdapter,
-{
-    fn sync_legacy_workflow_state_after_prompt(
-        &self,
-        target_config: &mut TargetConfig,
-        target_dir: &Utf8Path,
-        node_id: &str,
-        status: LastRunStatus,
-    ) -> Result<()> {
-        if status != LastRunStatus::Completed {
-            return Ok(());
-        }
-
-        match node_id {
-            PLAN_DRIVEN_PLAN_PROMPT => {
-                let hashes = plan_driven_hashes(&self.store, target_dir)?;
-                let workflow = target_config
-                    .workflow
-                    .get_or_insert_with(ralph_core::PlanDrivenWorkflowState::default);
-                workflow.phase = ralph_core::PlanDrivenPhase::Build;
-                workflow.last_goal_hash = Some(hashes.goal_hash);
-                workflow.last_content_hash = Some(hashes.content_hash);
-                workflow.last_planned_at = Some(current_unix_timestamp());
-                target_config.inflight = None;
-            }
-            PLAN_DRIVEN_BUILD_PROMPT => {
-                let hashes = plan_driven_hashes(&self.store, target_dir)?;
-                let workflow = target_config
-                    .workflow
-                    .get_or_insert_with(ralph_core::PlanDrivenWorkflowState::default);
-                workflow.phase = ralph_core::PlanDrivenPhase::Paused;
-                workflow.last_content_hash = Some(hashes.content_hash);
-                workflow.last_built_at = Some(current_unix_timestamp());
-                target_config.inflight = None;
-            }
-            TASK_DRIVEN_REBASE_PROMPT => {
-                let hashes = task_driven_hashes(&self.store, target_dir)?;
-                let workflow = target_config
-                    .workflow
-                    .get_or_insert_with(ralph_core::PlanDrivenWorkflowState::default);
-                workflow.phase = ralph_core::PlanDrivenPhase::Build;
-                workflow.last_goal_hash = Some(hashes.goal_hash);
-                workflow.last_content_hash = Some(hashes.content_hash);
-                workflow.last_planned_at = Some(current_unix_timestamp());
-                target_config.inflight = None;
-            }
-            TASK_DRIVEN_BUILD_PROMPT => {
-                let hashes = task_driven_hashes(&self.store, target_dir)?;
-                let workflow = target_config
-                    .workflow
-                    .get_or_insert_with(ralph_core::PlanDrivenWorkflowState::default);
-                workflow.phase = ralph_core::PlanDrivenPhase::Paused;
-                workflow.last_content_hash = Some(hashes.content_hash);
-                workflow.last_built_at = Some(current_unix_timestamp());
-                target_config.inflight = None;
-            }
-            _ => {}
-        }
-
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -896,19 +850,20 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
-    use ralph_core::{
-        AppConfig, PlanDrivenPhase, RunControl, RunnerInvocation, RunnerResult, ScaffoldId,
+    use ralph_core::{AppConfig, RunControl, RunnerInvocation, RunnerResult, ScaffoldId};
+    use ralph_runner::{
+        InteractiveSessionInvocation, InteractiveSessionOutcome, RunnerAdapter, RunnerStreamEvent,
     };
-    use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
     use tokio::sync::mpsc::UnboundedSender;
 
-    use crate::{
-        RalphApp, RunDelegate, RunEvent,
-        workflow::{
-            PLAN_DRIVEN_BUILD_PROMPT, PLAN_DRIVEN_PAUSED_PROMPT, PLAN_DRIVEN_PLAN_PROMPT,
-            TASK_DRIVEN_BUILD_PROMPT, TASK_DRIVEN_PAUSED_PROMPT, TASK_DRIVEN_REBASE_PROMPT,
-        },
-    };
+    use crate::{RalphApp, RunDelegate, RunEvent};
+
+    const PLAN_DRIVEN_PLAN_PROMPT: &str = "plan_driven_plan";
+    const PLAN_DRIVEN_BUILD_PROMPT: &str = "plan_driven_build";
+    const PLAN_DRIVEN_PAUSED_PROMPT: &str = "plan_driven_paused";
+    const TASK_DRIVEN_REBASE_PROMPT: &str = "task_driven_rebase";
+    const TASK_DRIVEN_BUILD_PROMPT: &str = "task_driven_build";
+    const TASK_DRIVEN_PAUSED_PROMPT: &str = "task_driven_paused";
 
     #[derive(Clone)]
     struct ScriptedRunner {
@@ -924,6 +879,12 @@ mod tests {
     #[derive(Clone)]
     struct TaskDrivenRunner {
         seen_prompt_names: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct InteractiveFlowRunner {
+        seen_prompt_names: Arc<Mutex<Vec<String>>>,
+        interactive_sessions: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -1011,12 +972,83 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl RunnerAdapter for InteractiveFlowRunner {
+        async fn run(
+            &self,
+            _config: &ralph_core::RunnerConfig,
+            invocation: RunnerInvocation,
+            _control: &RunControl,
+            _stream: Option<UnboundedSender<RunnerStreamEvent>>,
+        ) -> Result<RunnerResult> {
+            self.seen_prompt_names
+                .lock()
+                .unwrap()
+                .push(invocation.prompt_name.clone());
+
+            if invocation.prompt_name == PLAN_DRIVEN_PLAN_PROMPT {
+                std::fs::write(
+                    invocation.target_dir.join("plan.toml"),
+                    "version = 1\n\n[[items]]\ncategory = \"functional\"\ndescription = \"Ship the feature\"\nsteps = [\"Implement it\"]\ncompleted = false\n",
+                )
+                .unwrap();
+            }
+
+            Ok(RunnerResult {
+                output: String::new(),
+                exit_code: 0,
+            })
+        }
+
+        fn run_interactive_session(
+            &self,
+            _config: &ralph_core::RunnerConfig,
+            invocation: &InteractiveSessionInvocation,
+        ) -> Result<InteractiveSessionOutcome> {
+            self.interactive_sessions
+                .lock()
+                .unwrap()
+                .push(invocation.session_name.clone());
+            std::fs::write(&invocation.goal_path, "# Goal\n\nRefined\n").unwrap();
+            Ok(InteractiveSessionOutcome { exit_code: Some(0) })
+        }
+    }
+
     #[derive(Default)]
     struct TestDelegate;
 
     #[async_trait]
     impl RunDelegate for TestDelegate {
         async fn on_event(&mut self, _event: RunEvent) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingDelegate {
+        events: Vec<String>,
+    }
+
+    #[async_trait]
+    impl RunDelegate for RecordingDelegate {
+        async fn on_event(&mut self, event: RunEvent) -> Result<()> {
+            match event {
+                RunEvent::IterationStarted { prompt_name, .. } => {
+                    self.events.push(format!("iteration:{prompt_name}"));
+                }
+                RunEvent::InteractiveSessionStart { prompt_name, ready } => {
+                    self.events.push(format!("interactive_start:{prompt_name}"));
+                    let _ = ready.send(());
+                }
+                RunEvent::InteractiveSessionEnd { prompt_name, ready } => {
+                    self.events.push(format!("interactive_end:{prompt_name}"));
+                    let _ = ready.send(());
+                }
+                RunEvent::Finished { summary, .. } => {
+                    self.events.push(format!("finished:{summary}"));
+                }
+                RunEvent::Note(_) | RunEvent::Output(_) => {}
+            }
             Ok(())
         }
     }
@@ -1046,29 +1078,18 @@ mod tests {
             summary.last_run_status,
             ralph_core::LastRunStatus::Completed
         );
-        assert_eq!(
-            app.store
-                .read_target_config("demo")
-                .unwrap()
-                .workflow
+        let config = app.store.read_target_config("demo").unwrap();
+        assert!(
+            config
+                .runtime
                 .as_ref()
-                .map(|workflow| workflow.phase),
-            Some(PlanDrivenPhase::Build)
+                .is_some_and(|runtime| runtime.vars.contains_key("goal_hash"))
         );
 
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
             Some(PLAN_DRIVEN_BUILD_PROMPT)
-        );
-        assert_eq!(
-            app.store
-                .read_target_config("demo")
-                .unwrap()
-                .workflow
-                .as_ref()
-                .map(|workflow| workflow.phase),
-            Some(PlanDrivenPhase::Paused)
         );
 
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
@@ -1132,16 +1153,6 @@ mod tests {
             summary.last_run_status,
             ralph_core::LastRunStatus::Completed
         );
-        assert_eq!(
-            app.store
-                .read_target_config("demo")
-                .unwrap()
-                .workflow
-                .as_ref()
-                .map(|workflow| workflow.phase),
-            Some(PlanDrivenPhase::Build)
-        );
-
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
@@ -1177,6 +1188,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_driven_explicit_rebase_action_runs_before_any_pause_state_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let app = RalphApp::new(
+            project_dir,
+            AppConfig::default(),
+            PlanDrivenRunner {
+                seen_prompt_names: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+        app.create_target("demo", Some(ScaffoldId::PlanDriven))
+            .unwrap();
+
+        let mut delegate = TestDelegate;
+        let summary = app
+            .run_target_with_options(
+                "demo",
+                None,
+                None,
+                Some("rebase"),
+                RunControl::new(),
+                &mut delegate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.last_prompt.as_deref(),
+            Some(PLAN_DRIVEN_PLAN_PROMPT)
+        );
+        assert_eq!(
+            summary.last_run_status,
+            ralph_core::LastRunStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn task_driven_explicit_rebase_action_runs_before_any_pause_state_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let app = RalphApp::new(
+            project_dir,
+            AppConfig::default(),
+            TaskDrivenRunner {
+                seen_prompt_names: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+        app.create_target("demo", Some(ScaffoldId::TaskDriven))
+            .unwrap();
+
+        let mut delegate = TestDelegate;
+        let summary = app
+            .run_target_with_options(
+                "demo",
+                None,
+                None,
+                Some("rebase"),
+                RunControl::new(),
+                &mut delegate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.last_prompt.as_deref(),
+            Some(TASK_DRIVEN_REBASE_PROMPT)
+        );
+        assert_eq!(
+            summary.last_run_status,
+            ralph_core::LastRunStatus::Completed
+        );
+    }
+
+    #[tokio::test]
     async fn task_driven_failures_persist_last_run_status() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
@@ -1204,5 +1289,62 @@ mod tests {
             Some(TASK_DRIVEN_REBASE_PROMPT)
         );
         assert_eq!(config.last_run_status, ralph_core::LastRunStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn interactive_flow_nodes_emit_terminal_handoff_events_and_continue() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let seen_prompt_names = Arc::new(Mutex::new(Vec::new()));
+        let interactive_sessions = Arc::new(Mutex::new(Vec::new()));
+        let app = RalphApp::new(
+            project_dir,
+            AppConfig::default(),
+            InteractiveFlowRunner {
+                seen_prompt_names: seen_prompt_names.clone(),
+                interactive_sessions: interactive_sessions.clone(),
+            },
+        );
+        app.create_target("demo", Some(ScaffoldId::PlanDriven))
+            .unwrap();
+
+        let mut delegate = RecordingDelegate::default();
+        let summary = app
+            .run_target_with_options(
+                "demo",
+                None,
+                None,
+                Some("interview"),
+                RunControl::new(),
+                &mut delegate,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            summary.last_prompt.as_deref(),
+            Some(PLAN_DRIVEN_PLAN_PROMPT)
+        );
+        assert_eq!(
+            *interactive_sessions.lock().unwrap(),
+            vec!["interview".to_owned()]
+        );
+        assert_eq!(
+            *seen_prompt_names.lock().unwrap(),
+            vec![
+                PLAN_DRIVEN_PLAN_PROMPT.to_owned(),
+                PLAN_DRIVEN_PLAN_PROMPT.to_owned()
+            ]
+        );
+        assert_eq!(
+            delegate.events,
+            vec![
+                "interactive_start:interview".to_owned(),
+                "interactive_end:interview".to_owned(),
+                format!("iteration:{PLAN_DRIVEN_PLAN_PROMPT}"),
+                format!("iteration:{PLAN_DRIVEN_PLAN_PROMPT}"),
+                "finished:Step 'plan_driven_plan' complete for demo".to_owned(),
+            ]
+        );
     }
 }

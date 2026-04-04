@@ -2,7 +2,7 @@
 
 `ralph` is a Rust CLI and terminal UI for running durable agent loops against target folders inside a repository.
 
-It keeps target state on disk, treats target folders as the source of truth, and supports both prompt-driven scaffolds and workflow-driven targets.
+It keeps target state on disk, treats target folders as the source of truth, and supports both target-local prompt loops and discovered workflow templates.
 
 ![Ralph TUI](tui.png)
 
@@ -10,6 +10,7 @@ Source:
 
 - [github.com/francescoalemanno/ralph-cli](https://github.com/francescoalemanno/ralph-cli)
 - [Custom workflow authoring guide](docs/custom-workflows.md)
+- [Fake workflow agent guide](docs/fake-agent.md)
 
 ## Lineage
 
@@ -36,7 +37,7 @@ Ralph manages repository-local targets under:
 .ralph/targets/<target-id>/
 ```
 
-Each target is just a folder. Legacy prompt-driven scaffolds discover runnable `*.md` files directly inside that folder, while workflow-driven scaffolds can expose a different user-facing surface.
+Each target is just a folder. Targets can expose target-local prompt entrypoints, graph-driven flow entrypoints, or both.
 
 Example:
 
@@ -126,7 +127,7 @@ Typical flow:
 
 1. Open the TUI.
 2. Press `N` to create a new target.
-3. Pick the `task-driven`, `plan-driven`, `single-prompt`, or `plan-build` scaffold.
+3. Pick a discovered workflow template in the `New Target` screen.
 4. Press `R` to smart-run the selected prompt or workflow.
 5. Press `E` to edit the active prompt or `GOAL.md`.
 6. For workflow targets, use `B` to build the current derived state, `G` to rebase it to the current `GOAL.md`, `X` to archive and rebuild it from scratch, or `I` to refine `GOAL.md` interactively.
@@ -146,7 +147,7 @@ The current CLI model is:
 ralph
 ralph <target>
 
-ralph new <target> [--scaffold single-prompt|plan-build|task-driven|plan-driven] [--edit] [--prompt <file>]
+ralph new <target> [--template <id>] [--scaffold single-prompt|plan-build|task-driven|plan-driven] [--edit] [--prompt <file>]
 ralph run <target> [--prompt <file>] [--entrypoint <id>] [--action <id>]
 ralph workflow-creator
 ralph ls
@@ -165,9 +166,9 @@ ralph doctor
 
 Daily workflow:
 
-- `new`: create a target folder and initialize scaffold files
+- `new`: create a target folder from a discovered workflow template
 - `run`: run one prompt loop or workflow for a target
-- `workflow-creator`: open the active interactive agent on the embedded custom workflow guide and author reusable user-scoped workflows under `~/.config/ralph/`
+- `workflow-creator`: open the active interactive agent on the embedded custom workflow guide and author reusable workflow bundles under `~/.config/ralph/workflows/`
 - `ls`: list known targets
 - `show`: inspect target files
 - `edit`: open the selected prompt or workflow input in your editor
@@ -178,22 +179,25 @@ Target discovery is directory-based:
 
 - every folder directly under `.ralph/targets/` is a target
 - the folder name is the target id
-- `target.toml` is optional metadata, not the source of truth
+- `target.toml` is required and defines the target’s runnable entrypoints
 
-Prompt discovery depends on the target mode:
+Runnable surfaces depend on the target entrypoints:
 
-- legacy targets treat every `.md` file directly inside the target folder as runnable
-- `plan_driven` targets do not expose runnable prompt files; they expose `GOAL.md`, derive `specs/*` and `plan.toml`, and then build against that plan
-- `task_driven` targets do not expose runnable prompt files; they expose `GOAL.md`, derive `progress.toml`, and then build against that backlog
+- flow entrypoints expose graph-driven workflows
+- prompt entrypoints expose single runnable prompts
+- if a valid `target.toml` declares no entrypoints, Ralph treats target-local `.md` files as prompt entrypoints
+- `plan_driven` targets expose `GOAL.md`, derive `specs/*` and `plan.toml`, and then build against that plan
+- `task_driven` targets expose `GOAL.md`, derive `progress.toml`, and then build against that backlog
 - non-runnable files in the target folder are ordinary companion files
 
 Target metadata in `target.toml` currently includes:
 
 - `id`
 - `scaffold`
-- `mode`
-- `workflow`
-- `inflight`
+- `template`
+- `default_entrypoint`
+- `entrypoints`
+- `runtime`
 - `created_at`
 - `max_iterations`
 - `last_prompt`
@@ -239,7 +243,7 @@ Plan-driven scaffold:
 - `target.toml`
 - `specs/`
 
-This scaffold uses `mode = "plan_driven"` in `target.toml`. The user edits only `GOAL.md`. Ralph plans once, then keeps subsequent runs on the build loop until you explicitly reset planning, and stores workflow state in `target.toml`. Target-local specs live under `{ralph-env:TARGET_DIR}/specs/*`, and the operational plan lives at `{ralph-env:TARGET_DIR}/plan.toml`.
+This scaffold defines a default flow entrypoint in `target.toml` that points at the embedded `builtin://flows/plan_driven.toml` graph. The user edits only `GOAL.md`. Ralph plans once, then keeps subsequent runs on the build loop until the graph routes elsewhere. Target-local specs live under `{ralph-env:TARGET_DIR}/specs/*`, and the operational plan lives at `{ralph-env:TARGET_DIR}/plan.toml`.
 `R` smart-runs the workflow: it plans when `plan.toml` is missing, builds when the plan is fresh, and stops for user choice when the plan is stale relative to `GOAL.md`. Use `B` to build the current plan anyway, `G` to rebase `specs/*` and `plan.toml` to the current goal, `X` to archive `plan.toml`/`specs/*`/`journal.txt` and rebuild from scratch, or `I` to refine `GOAL.md` interactively.
 
 Task-driven scaffold:
@@ -248,7 +252,7 @@ Task-driven scaffold:
 - `target.toml`
 - `progress.toml`
 
-This scaffold uses `mode = "task_driven"` in `target.toml`. The user edits only `GOAL.md`. Ralph runs a hidden iterative build loop against `{ralph-env:TARGET_DIR}/progress.toml`, updates `{ralph-env:TARGET_DIR}/journal.txt` over time, and considers the workflow complete when `progress.toml` has no remaining items with `completed = false`.
+This scaffold defines a default flow entrypoint in `target.toml` that points at the embedded `builtin://flows/task_driven.toml` graph. The user edits only `GOAL.md`. Ralph runs an iterative build loop against `{ralph-env:TARGET_DIR}/progress.toml`, updates `{ralph-env:TARGET_DIR}/journal.txt` over time, and considers the workflow complete when `progress.toml` has no remaining items with `completed = false`.
 `R` smart-runs the workflow: it bootstraps or rebases `progress.toml` when the backlog is missing, builds when the backlog is fresh and needs work, and stops for user choice when the backlog is stale relative to `GOAL.md`. Use `B` to build the current backlog, `G` to rebase `progress.toml` to the current goal while preserving still-valid completed items, `X` to archive `progress.toml`/`journal.txt` and rebuild the backlog from scratch, or `I` to refine `GOAL.md` interactively.
 
 ## Prompt Directives

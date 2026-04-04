@@ -19,12 +19,8 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 pub use editor::edit_file;
-use ralph_app::{
-    RalphApp, RunDelegate, RunEvent, WorkflowAction, WorkflowRunAdvice, WorkflowStatus,
-};
-use ralph_core::{
-    LastRunStatus, RunControl, ScaffoldId, TargetReview, TargetSummary, WorkflowMode,
-};
+use ralph_app::{FlowStatus, RalphApp, RunDelegate, RunEvent, WorkflowTemplateSummary};
+use ralph_core::{LastRunStatus, RunControl, TargetReview, TargetSummary};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::runtime::Handle;
 use ui::{normalize_terminal_text, resume_terminal, suspend_terminal};
@@ -88,8 +84,13 @@ enum Screen {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConfirmationAction {
-    DeleteTarget { target_id: String },
-    RebuildWorkflow { target_id: String },
+    DeleteTarget {
+        target_id: String,
+    },
+    FlowAction {
+        target_id: String,
+        action_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,7 +201,8 @@ struct TuiApp {
     selected_prompt: usize,
     screen: Screen,
     new_target_name: String,
-    new_scaffold: ScaffoldId,
+    workflow_templates: Vec<WorkflowTemplateSummary>,
+    selected_workflow_template: usize,
     message: String,
     running: Option<RunningState>,
     confirmation: Option<ConfirmationDialog>,
@@ -208,14 +210,64 @@ struct TuiApp {
 }
 
 impl TuiApp {
-    fn selected_target_uses_hidden_workflow(&self) -> bool {
+    fn selected_target_has_flow_entrypoints(&self) -> bool {
         self.selected_target()
-            .is_some_and(ralph_core::TargetSummary::uses_hidden_workflow)
+            .is_some_and(ralph_core::TargetSummary::has_flow_entrypoints)
     }
 
-    fn selected_workflow_status(&self) -> Option<WorkflowStatus> {
+    fn selected_flow_status(&self) -> Option<FlowStatus> {
         let target = self.selected_target()?;
-        self.app.workflow_status(&target.id).ok().flatten()
+        self.app.flow_status(&target.id).ok().flatten()
+    }
+
+    fn selected_pause_actions(&self) -> Vec<ralph_app::FlowActionStatus> {
+        self.selected_flow_status()
+            .and_then(|status| status.pause)
+            .map(|pause| pause.actions)
+            .unwrap_or_default()
+    }
+
+    fn try_start_selected_flow_action_for_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let KeyCode::Char(ch) = key.code else {
+            return Ok(false);
+        };
+        let Some(target_id) = self.selected_target().map(|target| target.id.clone()) else {
+            return Ok(false);
+        };
+        let pressed = ch.to_ascii_lowercase();
+
+        for action in self.selected_pause_actions() {
+            let Some(shortcut) = action.shortcut.as_deref() else {
+                continue;
+            };
+            let mut chars = shortcut.chars();
+            let Some(first) = chars.next() else {
+                continue;
+            };
+            if chars.next().is_some() {
+                continue;
+            }
+            if first.to_ascii_lowercase() == pressed {
+                if let (Some(title), Some(body)) = (
+                    action.confirm_title.as_deref(),
+                    action.confirm_message.as_deref(),
+                ) {
+                    self.confirmation = Some(ConfirmationDialog::new(
+                        title,
+                        body.replace("{target}", &target_id),
+                        ConfirmationAction::FlowAction {
+                            target_id: target_id.clone(),
+                            action_id: action.id.clone(),
+                        },
+                    ));
+                } else {
+                    self.start_named_flow_action(&target_id, &action.id)?;
+                }
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     fn new(app: RalphApp, handle: Handle, target: Option<String>) -> Self {
@@ -231,12 +283,14 @@ impl TuiApp {
             selected_prompt: 0,
             screen: Screen::Dashboard,
             new_target_name: String::new(),
-            new_scaffold: ScaffoldId::TaskDriven,
+            workflow_templates: Vec::new(),
+            selected_workflow_template: 0,
             message: String::new(),
             running: None,
             confirmation: None,
             tick_count: 0,
         };
+        this.reload_workflow_templates();
         this.reload_targets();
         if let Some(target) = target {
             if let Some(index) = this.targets.iter().position(|summary| summary.id == target) {
@@ -279,7 +333,7 @@ impl TuiApp {
             }
 
             while let Ok(event) = self.rx.try_recv() {
-                self.handle_ui_event(event);
+                self.handle_ui_event_in_terminal(event, terminal)?;
             }
         }
 
@@ -347,10 +401,10 @@ impl TuiApp {
             KeyCode::Char('n') => {
                 self.screen = Screen::NewTarget;
                 self.new_target_name.clear();
-                self.new_scaffold = ScaffoldId::TaskDriven;
+                self.reload_workflow_templates();
+                self.selected_workflow_template = 0;
             }
             KeyCode::Char('r') => self.start_run()?,
-            KeyCode::Char('b') => self.start_workflow_build()?,
             KeyCode::Char('e') => {
                 let prompt_path = match self.resolve_selected_edit_path() {
                     Ok(path) => path,
@@ -367,22 +421,15 @@ impl TuiApp {
                 self.refresh_selected_target_review();
                 self.message = format!("opened {}", prompt_path.file_name().unwrap_or("file"));
             }
-            KeyCode::Char('i') => {
-                self.start_goal_interview(terminal)?;
-            }
-            KeyCode::Char('g') => {
-                self.start_workflow_rebase()?;
-            }
-            KeyCode::Char('x') => {
-                self.confirm_workflow_rebuild()?;
-            }
             KeyCode::Char('d') => {
                 self.confirm_target_delete();
             }
             KeyCode::Char('a') => {
                 self.cycle_agent(None)?;
             }
-            _ => {}
+            _ => {
+                let _ = self.try_start_selected_flow_action_for_key(key)?;
+            }
         }
         Ok(())
     }
@@ -424,14 +471,8 @@ impl TuiApp {
             KeyCode::Esc => {
                 self.screen = Screen::Dashboard;
             }
-            KeyCode::Tab => {
-                self.new_scaffold = match self.new_scaffold {
-                    ScaffoldId::TaskDriven => ScaffoldId::PlanDriven,
-                    ScaffoldId::PlanDriven => ScaffoldId::SinglePrompt,
-                    ScaffoldId::SinglePrompt => ScaffoldId::PlanBuild,
-                    ScaffoldId::PlanBuild => ScaffoldId::TaskDriven,
-                };
-            }
+            KeyCode::Tab | KeyCode::Down | KeyCode::Right => self.cycle_workflow_template(1),
+            KeyCode::Up | KeyCode::Left => self.cycle_workflow_template(-1),
             KeyCode::Backspace => {
                 self.new_target_name.pop();
             }
@@ -440,10 +481,13 @@ impl TuiApp {
                     self.message = "target name cannot be empty".to_owned();
                     return Ok(());
                 }
-                let scaffold = self.new_scaffold;
+                let Some(template) = self.selected_workflow_template() else {
+                    self.message = "no workflow templates are available".to_owned();
+                    return Ok(());
+                };
                 let summary = self
                     .app
-                    .create_target(self.new_target_name.trim(), Some(scaffold))?;
+                    .create_target_from_template(self.new_target_name.trim(), &template.id)?;
                 self.reload_targets();
                 if let Some(index) = self.targets.iter().position(|item| item.id == summary.id) {
                     self.selected_target = index;
@@ -451,15 +495,7 @@ impl TuiApp {
                     self.refresh_selected_target_review();
                 }
                 self.screen = Screen::Dashboard;
-                let opened_path =
-                    if matches!(scaffold, ScaffoldId::TaskDriven | ScaffoldId::PlanDriven) {
-                        Some(self.app.resolve_target_edit_path(&summary.id, None)?)
-                    } else {
-                        summary
-                            .prompt_files
-                            .first()
-                            .map(|prompt| prompt.path.clone())
-                    };
+                let opened_path = Some(self.app.resolve_target_edit_path(&summary.id, None)?);
                 if let Some(opened_path) = opened_path {
                     let editor = self.app.config().editor_override.clone();
                     suspend_terminal(terminal)?;
@@ -580,6 +616,20 @@ impl TuiApp {
                         RunEvent::Note(note) => {
                             running.push_terminal_text(&format!("\n{note}\n"));
                         }
+                        RunEvent::InteractiveSessionStart { prompt_name, ready } => {
+                            let _ = ready.send(());
+                            running.push_terminal_text(&format!(
+                                "\nstarting interactive session '{}'\n",
+                                prompt_name
+                            ));
+                        }
+                        RunEvent::InteractiveSessionEnd { prompt_name, ready } => {
+                            let _ = ready.send(());
+                            running.push_terminal_text(&format!(
+                                "\ninteractive session '{}' finished\n",
+                                prompt_name
+                            ));
+                        }
                         RunEvent::Finished { status, summary } => {
                             running.finish(status);
                             running.push_terminal_text(&format!(
@@ -629,6 +679,63 @@ impl TuiApp {
         }
     }
 
+    fn handle_ui_event_in_terminal(
+        &mut self,
+        event: UiEvent,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
+        match event {
+            UiEvent::RunEvent(RunEvent::InteractiveSessionStart { prompt_name, ready }) => {
+                self.handle_interactive_session_handoff(prompt_name, ready, terminal)
+            }
+            other => {
+                self.handle_ui_event(other);
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_interactive_session_handoff(
+        &mut self,
+        prompt_name: String,
+        ready: tokio::sync::oneshot::Sender<()>,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
+        if let Some(running) = &mut self.running {
+            running.push_terminal_text(&format!(
+                "\nstarting interactive session '{}'\n",
+                prompt_name
+            ));
+        }
+
+        suspend_terminal(terminal)?;
+        let _ = ready.send(());
+
+        loop {
+            match self
+                .rx
+                .recv()
+                .map_err(|_| anyhow!("interactive session lost its UI channel"))?
+            {
+                UiEvent::Tick => {
+                    self.tick_count = self.tick_count.wrapping_add(1);
+                }
+                UiEvent::RunEvent(RunEvent::InteractiveSessionEnd { prompt_name, ready }) => {
+                    resume_terminal(terminal)?;
+                    let _ = ready.send(());
+                    if let Some(running) = &mut self.running {
+                        running.push_terminal_text(&format!(
+                            "\ninteractive session '{}' finished\n",
+                            prompt_name
+                        ));
+                    }
+                    return Ok(());
+                }
+                other => self.handle_ui_event(other),
+            }
+        }
+    }
+
     fn reload_targets(&mut self) {
         match self.app.list_targets() {
             Ok(targets) => {
@@ -655,6 +762,39 @@ impl TuiApp {
         }
     }
 
+    fn reload_workflow_templates(&mut self) {
+        match self.app.list_workflow_templates() {
+            Ok(templates) => {
+                self.workflow_templates = templates;
+                if self.workflow_templates.is_empty() {
+                    self.selected_workflow_template = 0;
+                } else {
+                    self.selected_workflow_template = self
+                        .selected_workflow_template
+                        .min(self.workflow_templates.len() - 1);
+                }
+            }
+            Err(error) => {
+                self.workflow_templates = Vec::new();
+                self.selected_workflow_template = 0;
+                self.message = error.to_string();
+            }
+        }
+    }
+
+    fn selected_workflow_template(&self) -> Option<&WorkflowTemplateSummary> {
+        self.workflow_templates.get(self.selected_workflow_template)
+    }
+
+    fn cycle_workflow_template(&mut self, delta: isize) {
+        if self.workflow_templates.is_empty() {
+            return;
+        }
+        let len = self.workflow_templates.len() as isize;
+        let current = self.selected_workflow_template as isize;
+        self.selected_workflow_template = (current + delta).rem_euclid(len) as usize;
+    }
+
     fn selected_target(&self) -> Option<&TargetSummary> {
         self.targets.get(self.selected_target)
     }
@@ -679,7 +819,7 @@ impl TuiApp {
             return Err(anyhow!("select a target first"));
         };
         let target_id = target.id.clone();
-        let prompt_name = if target.uses_hidden_workflow() {
+        let prompt_name = if target.has_flow_entrypoints() {
             None
         } else {
             self.selected_prompt().map(|prompt| prompt.name.clone())
@@ -697,35 +837,12 @@ impl TuiApp {
     }
 
     fn start_run(&mut self) -> Result<()> {
-        if self.selected_target_uses_hidden_workflow() {
-            let Some(target) = self.selected_target() else {
+        if self.selected_target_has_flow_entrypoints() {
+            let Some(target_id) = self.selected_target().map(|target| target.id.clone()) else {
                 self.message = "select a target first".to_owned();
                 return Ok(());
             };
-            let Some(status) = self.selected_workflow_status() else {
-                self.message = "failed to inspect workflow status".to_owned();
-                return Ok(());
-            };
-            let target_id = target.id.clone();
-            return match status.run_advice {
-                WorkflowRunAdvice::Build => {
-                    self.start_workflow_action_for(&target_id, WorkflowAction::Build, status)
-                }
-                WorkflowRunAdvice::Rebase => {
-                    self.start_workflow_action_for(&target_id, WorkflowAction::Rebase, status)
-                }
-                WorkflowRunAdvice::Choose => {
-                    self.message = match status.kind {
-                        ralph_app::WorkflowKind::PlanDriven => "stale plan detected; press B to build current plan, G to rebase it, X to rebuild from scratch, or I to refine GOAL".to_owned(),
-                        ralph_app::WorkflowKind::TaskDriven => "stale task backlog detected; press B to build current backlog, G to rebase it, X to rebuild from scratch, or I to refine GOAL".to_owned(),
-                    };
-                    Ok(())
-                }
-                WorkflowRunAdvice::NoWork => {
-                    self.message = "no workflow changes detected; press B to force the current derived state or edit GOAL/derived files".to_owned();
-                    Ok(())
-                }
-            };
+            return self.start_run_for(&target_id, None);
         }
 
         let Some((target_id, prompt_name)) = self.selected_target_and_prompt() else {
@@ -771,21 +888,16 @@ impl TuiApp {
         Ok(())
     }
 
-    fn start_workflow_action_for(
-        &mut self,
-        target_id: &str,
-        action: WorkflowAction,
-        status: WorkflowStatus,
-    ) -> Result<()> {
+    fn start_named_flow_action(&mut self, target_id: &str, action_id: &str) -> Result<()> {
         let tx = self.tx.clone();
         let app = self.app.clone();
         let control = RunControl::new();
         let run_control = control.clone();
         let target_id = target_id.to_owned();
-        let display_prompt = format!("{}_{}", status.kind.label(), action.label());
+        let action_id = action_id.to_owned();
         self.running = Some(RunningState::new(
             target_id.clone(),
-            display_prompt,
+            action_id.clone(),
             None,
             control,
         ));
@@ -794,121 +906,20 @@ impl TuiApp {
         self.handle.spawn(async move {
             let mut delegate = ChannelDelegate { tx: tx.clone() };
             let result = app
-                .run_workflow_action_with_control(&target_id, action, run_control, &mut delegate)
+                .run_target_with_options(
+                    &target_id,
+                    None,
+                    None,
+                    Some(&action_id),
+                    run_control,
+                    &mut delegate,
+                )
                 .await
                 .map_err(|error| error.to_string());
             let _ = tx.send(UiEvent::RunDone(result));
         });
 
         Ok(())
-    }
-
-    fn start_workflow_build(&mut self) -> Result<()> {
-        let Some(target_id) = self.selected_target().map(|target| target.id.clone()) else {
-            self.message = "select a target first".to_owned();
-            return Ok(());
-        };
-        let Some(status) = self.selected_workflow_status() else {
-            self.message = "workflow build is only available for workflow targets".to_owned();
-            return Ok(());
-        };
-        self.start_workflow_action_for(&target_id, WorkflowAction::Build, status)
-    }
-
-    fn start_workflow_rebase(&mut self) -> Result<()> {
-        let Some(target_id) = self.selected_target().map(|target| target.id.clone()) else {
-            self.message = "select a target first".to_owned();
-            return Ok(());
-        };
-        let Some(status) = self.selected_workflow_status() else {
-            self.message = "workflow rebase is only available for workflow targets".to_owned();
-            return Ok(());
-        };
-        self.start_workflow_action_for(&target_id, WorkflowAction::Rebase, status)
-    }
-
-    fn start_goal_interview(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> Result<()> {
-        let Some(target) = self.selected_target() else {
-            self.message = "select a target first".to_owned();
-            return Ok(());
-        };
-        if !target.uses_hidden_workflow() {
-            self.message = "AI goal refinement is only available for workflow targets".to_owned();
-            return Ok(());
-        }
-
-        let target_id = target.id.clone();
-        suspend_terminal(terminal)?;
-        let result = self.app.run_workflow_goal_interview(&target_id);
-        resume_terminal(terminal)?;
-
-        match result {
-            Ok(outcome) => {
-                self.reload_targets();
-                if let Some(index) = self.targets.iter().position(|item| item.id == target_id) {
-                    self.selected_target = index;
-                    self.refresh_selected_target_review();
-                }
-                self.message = match (outcome.goal_changed, outcome.exit_code) {
-                    (true, Some(0)) => {
-                        "interactive goal session finished; GOAL.md updated".to_owned()
-                    }
-                    (false, Some(0)) => {
-                        "interactive goal session finished; GOAL.md unchanged".to_owned()
-                    }
-                    (true, Some(code)) => {
-                        format!("interactive goal session exited with code {code}; GOAL.md changed")
-                    }
-                    (false, Some(code)) => format!(
-                        "interactive goal session exited with code {code}; GOAL.md unchanged"
-                    ),
-                    (true, None) => {
-                        "interactive goal session ended by signal; GOAL.md changed".to_owned()
-                    }
-                    (false, None) => {
-                        "interactive goal session ended by signal; GOAL.md unchanged".to_owned()
-                    }
-                };
-                Ok(())
-            }
-            Err(error) => {
-                self.message = error.to_string();
-                Ok(())
-            }
-        }
-    }
-
-    fn start_workflow_rebuild_from_scratch(&mut self) -> Result<()> {
-        let Some(target) = self.selected_target() else {
-            self.message = "select a target first".to_owned();
-            return Ok(());
-        };
-        let target_id = target.id.clone();
-        let Some(status) = self.selected_workflow_status() else {
-            self.message = "scratch rebuild is only available for workflow targets".to_owned();
-            return Ok(());
-        };
-        match target.mode {
-            Some(WorkflowMode::PlanDriven) => {
-                self.app.rebuild_plan_driven_from_scratch(&target_id)?
-            }
-            Some(WorkflowMode::TaskDriven) => {
-                self.app.rebuild_task_driven_from_scratch(&target_id)?
-            }
-            None => {
-                self.message = "scratch rebuild is only available for workflow targets".to_owned();
-                return Ok(());
-            }
-        }
-        self.reload_targets();
-        if let Some(index) = self.targets.iter().position(|item| item.id == target_id) {
-            self.selected_target = index;
-            self.refresh_selected_target_review();
-        }
-        self.start_workflow_action_for(&target_id, WorkflowAction::Rebase, status)
     }
 
     fn confirm_target_delete(&mut self) {
@@ -929,29 +940,6 @@ impl TuiApp {
         ));
     }
 
-    fn confirm_workflow_rebuild(&mut self) -> Result<()> {
-        let Some(target) = self.selected_target() else {
-            self.message = "select a target first".to_owned();
-            return Ok(());
-        };
-        if !target.uses_hidden_workflow() {
-            self.message = "scratch rebuild is only available for workflow targets".to_owned();
-            return Ok(());
-        }
-
-        self.confirmation = Some(ConfirmationDialog::new(
-            "Rebuild From Scratch",
-            format!(
-                "Archive the current derived workflow artifacts for `{}` and rebuild from GOAL.md? This replaces the active plan or backlog.",
-                target.id
-            ),
-            ConfirmationAction::RebuildWorkflow {
-                target_id: target.id.clone(),
-            },
-        ));
-        Ok(())
-    }
-
     fn execute_confirmation(&mut self, action: ConfirmationAction) -> Result<()> {
         match action {
             ConfirmationAction::DeleteTarget { target_id } => {
@@ -960,11 +948,14 @@ impl TuiApp {
                 self.message = format!("deleted {target_id}");
                 Ok(())
             }
-            ConfirmationAction::RebuildWorkflow { target_id } => {
+            ConfirmationAction::FlowAction {
+                target_id,
+                action_id,
+            } => {
                 if let Some(index) = self.targets.iter().position(|item| item.id == target_id) {
                     self.selected_target = index;
                 }
-                self.start_workflow_rebuild_from_scratch()
+                self.start_named_flow_action(&target_id, &action_id)
             }
         }
     }
@@ -1041,6 +1032,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent};
     use ralph_app::RalphApp;
     use ralph_core::{LastRunStatus, ScaffoldId};
+    use ratatui::{Terminal, backend::CrosstermBackend};
     use std::sync::OnceLock;
     use tempfile::TempDir;
     use tokio::runtime::Runtime;
@@ -1067,6 +1059,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         (temp, path)
+    }
+
+    fn test_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
+        let backend = CrosstermBackend::new(std::io::stdout());
+        Terminal::new(backend).map_err(Into::into)
     }
 
     #[test]
@@ -1134,19 +1131,47 @@ mod tests {
     }
 
     #[test]
-    fn workflow_targets_are_detected_from_mode_even_without_scaffold() -> Result<()> {
+    fn workflow_targets_are_detected_from_flow_entrypoints_even_without_scaffold() -> Result<()> {
         let (_temp, project_dir) = temp_project_dir();
         let app = RalphApp::load(project_dir.clone())?;
         app.create_target("demo", Some(ScaffoldId::PlanDriven))?;
         std::fs::write(
             project_dir.join(".ralph/targets/demo/target.toml"),
-            "id = \"demo\"\nmode = \"plan_driven\"\nlast_run_status = \"never_run\"\n\n[workflow]\nphase = \"plan\"\n",
+            "id = \"demo\"\nlast_run_status = \"never_run\"\ndefault_entrypoint = \"main\"\n\n[[entrypoints]]\nid = \"main\"\nkind = \"flow\"\nflow = \"builtin://flows/plan_driven.toml\"\nedit_path = \"GOAL.md\"\n",
         )?;
 
         let runtime = Runtime::new()?;
         let tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
 
-        assert!(tui.selected_target_uses_hidden_workflow());
+        assert!(tui.selected_target_has_flow_entrypoints());
+        Ok(())
+    }
+
+    #[test]
+    fn new_target_screen_loads_project_workflow_templates() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let workflow_dir = project_dir.join(".ralph/workflows/release_loop");
+        std::fs::create_dir_all(workflow_dir.join("templates"))?;
+        std::fs::write(
+            workflow_dir.join("workflow.toml"),
+            "version = 1\nid = \"release_loop\"\nname = \"Release Loop\"\ndefault_entrypoint = \"main\"\n\n[[entrypoints]]\nid = \"main\"\nkind = \"prompt\"\npath = \"prompt_main.md\"\nedit_path = \"prompt_main.md\"\n\n[[materialize]]\nkind = \"file\"\npath = \"prompt_main.md\"\nsource = \"self://templates/prompt_main.md\"\n",
+        )?;
+        std::fs::write(
+            workflow_dir.join("templates/prompt_main.md"),
+            "# Prompt\n\nShip it.\n",
+        )?;
+
+        let app = RalphApp::load(project_dir)?;
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), None);
+        tui.screen = super::Screen::NewTarget;
+        tui.reload_workflow_templates();
+
+        assert!(
+            tui.workflow_templates
+                .iter()
+                .any(|template| template.id == "release_loop")
+        );
         Ok(())
     }
 
@@ -1163,6 +1188,24 @@ mod tests {
         let edit_path = tui.resolve_selected_edit_path()?;
 
         assert_eq!(edit_path, summary.prompt_files[1].path);
+        Ok(())
+    }
+
+    #[test]
+    fn smart_run_on_new_workflow_target_starts_from_flow_entrypoint() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir)?;
+        app.create_target("demo", Some(ScaffoldId::TaskDriven))?;
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+
+        tui.start_run()?;
+
+        let running = tui.running.as_ref().expect("running state");
+        assert_eq!(running.prompt_name, "workflow_auto");
+        assert_eq!(running.requested_prompt.as_deref(), None);
+        assert!(tui.running.is_some());
         Ok(())
     }
 
@@ -1313,11 +1356,17 @@ mod tests {
         app.create_target("demo", Some(ScaffoldId::PlanDriven))?;
         let target_dir = project_dir.join(".ralph/targets/demo");
         std::fs::write(target_dir.join("plan.toml"), "version = 1\n")?;
+        let target_config = target_dir.join("target.toml");
+        let mut raw = std::fs::read_to_string(&target_config)?;
+        raw.push_str(
+            "\n[runtime]\nactive_entrypoint = \"main\"\ncurrent_node = \"plan_driven_paused\"\n",
+        );
+        std::fs::write(&target_config, raw)?;
 
         let runtime = Runtime::new()?;
         let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
 
-        tui.confirm_workflow_rebuild()?;
+        tui.handle_dashboard_key(KeyEvent::from(KeyCode::Char('x')), &mut test_terminal()?)?;
         assert!(tui.confirmation.is_some());
         tui.handle_confirmation_key(KeyEvent::from(KeyCode::Enter))?;
         assert!(tui.confirmation.is_none());

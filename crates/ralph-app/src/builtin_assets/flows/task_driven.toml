@@ -6,6 +6,22 @@ id = "dispatch"
 kind = "decision"
 
 [[nodes.rules]]
+when = { kind = "selected_action", action = "interview" }
+goto = "interview"
+
+[[nodes.rules]]
+when = { kind = "selected_action", action = "rebuild" }
+goto = "rebuild"
+
+[[nodes.rules]]
+when = { kind = "selected_action", action = "rebase" }
+goto = "task_driven_rebase"
+
+[[nodes.rules]]
+when = { kind = "selected_action", action = "build" }
+goto = "task_driven_build"
+
+[[nodes.rules]]
 when = { kind = "missing", path = "{{derived_file}}" }
 goto = "task_driven_rebase"
 
@@ -119,6 +135,8 @@ goto = "task_driven_rebase"
 id = "rebuild"
 label = "Rebuild from scratch"
 shortcut = "X"
+confirm_title = "Rebuild From Scratch"
+confirm_message = "Archive the current derived workflow artifacts for `{target}` and rebuild from GOAL.md? This replaces the active backlog."
 goto = "rebuild"
 
 [[nodes.actions]]

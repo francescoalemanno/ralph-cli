@@ -1,0 +1,10 @@
+version = 1
+
+[[items]]
+description = "Planning phase"
+steps = [
+    "Revise progress.toml into a clear ordered list of concrete tasks derived from your studies",
+    "Do not start other items",
+    "Stop after updating progress.toml"
+]
+completed = false

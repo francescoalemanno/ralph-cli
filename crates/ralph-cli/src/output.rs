@@ -28,6 +28,7 @@ struct TargetListRow {
     prompts: Vec<String>,
     flow_entrypoints: Vec<String>,
     scaffold: Option<String>,
+    template: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -187,6 +188,7 @@ fn target_row(summary: TargetSummary) -> TargetListRow {
         scaffold: summary
             .scaffold
             .map(|scaffold| scaffold.as_str().to_owned()),
+        template: summary.template,
     }
 }
 
@@ -202,9 +204,14 @@ fn render_targets_text(rows: &[TargetListRow]) -> String {
                 row.last_run_status,
                 row.prompts.join(", "),
                 row.flow_entrypoints.join(", "),
-                row.scaffold
+                row.template
                     .as_ref()
-                    .map(|scaffold| format!(" scaffold={scaffold}"))
+                    .map(|template| format!(" template={template}"))
+                    .or_else(|| {
+                        row.scaffold
+                            .as_ref()
+                            .map(|scaffold| format!(" scaffold={scaffold}"))
+                    })
                     .unwrap_or_default()
             )
         })

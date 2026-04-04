@@ -55,13 +55,6 @@ impl ScaffoldId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkflowMode {
-    TaskDriven,
-    PlanDriven,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum EntrypointKind {
     Prompt,
     Flow,
@@ -139,54 +132,19 @@ pub struct FlowRuntimeInflight {
     pub started_at: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanDrivenPhase {
-    #[default]
-    Plan,
-    Build,
-    Paused,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct PlanDrivenWorkflowState {
-    #[serde(default)]
-    pub phase: PlanDrivenPhase,
-    #[serde(default)]
-    pub last_goal_hash: Option<String>,
-    #[serde(default)]
-    pub last_content_hash: Option<String>,
-    #[serde(default)]
-    pub last_planned_at: Option<u64>,
-    #[serde(default)]
-    pub last_built_at: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanDrivenInflight {
-    pub phase: PlanDrivenPhase,
-    pub goal_hash: String,
-    pub content_hash: String,
-    pub started_at: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetConfig {
     pub id: String,
     #[serde(default)]
     pub scaffold: Option<ScaffoldId>,
     #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
     pub default_entrypoint: Option<String>,
     #[serde(default)]
     pub entrypoints: Vec<TargetEntrypoint>,
     #[serde(default)]
     pub runtime: Option<FlowRuntimeState>,
-    #[serde(default)]
-    pub mode: Option<WorkflowMode>,
-    #[serde(default)]
-    pub workflow: Option<PlanDrivenWorkflowState>,
-    #[serde(default)]
-    pub inflight: Option<PlanDrivenInflight>,
     #[serde(default)]
     pub created_at: Option<u64>,
     #[serde(default)]
@@ -198,14 +156,10 @@ pub struct TargetConfig {
 }
 
 impl TargetConfig {
-    pub fn uses_hidden_workflow(&self) -> bool {
+    pub fn has_flow_entrypoints(&self) -> bool {
         self.entrypoints
             .iter()
             .any(|entrypoint| entrypoint.kind() == EntrypointKind::Flow)
-            || matches!(
-                self.mode,
-                Some(WorkflowMode::TaskDriven | WorkflowMode::PlanDriven)
-            )
     }
 }
 
@@ -236,22 +190,19 @@ pub struct TargetSummary {
     pub files: Vec<TargetFile>,
     pub scaffold: Option<ScaffoldId>,
     #[serde(default)]
+    pub template: Option<String>,
+    #[serde(default)]
     pub default_entrypoint: Option<String>,
     #[serde(default)]
     pub flow_entrypoints: Vec<String>,
-    pub mode: Option<WorkflowMode>,
     pub created_at: Option<u64>,
     pub last_prompt: Option<String>,
     pub last_run_status: LastRunStatus,
 }
 
 impl TargetSummary {
-    pub fn uses_hidden_workflow(&self) -> bool {
+    pub fn has_flow_entrypoints(&self) -> bool {
         !self.flow_entrypoints.is_empty()
-            || matches!(
-                self.mode,
-                Some(WorkflowMode::TaskDriven | WorkflowMode::PlanDriven)
-            )
     }
 }
 
@@ -346,7 +297,9 @@ impl RunControl {
 
 #[cfg(test)]
 mod tests {
-    use super::{LastRunStatus, RunControl, ScaffoldId, TargetConfig, TargetSummary, WorkflowMode};
+    use std::collections::BTreeMap;
+
+    use super::{LastRunStatus, RunControl, ScaffoldId, TargetConfig, TargetSummary};
 
     #[test]
     fn cancellation_escalates_and_saturates() {
@@ -381,16 +334,34 @@ mod tests {
     }
 
     #[test]
-    fn workflow_visibility_comes_from_mode() {
+    fn flow_entrypoint_visibility_comes_from_flow_entrypoints() {
         let config = TargetConfig {
             id: "demo".to_owned(),
             scaffold: None,
+            template: None,
             default_entrypoint: None,
             entrypoints: Vec::new(),
             runtime: None,
-            mode: Some(WorkflowMode::PlanDriven),
-            workflow: None,
-            inflight: None,
+            created_at: None,
+            max_iterations: None,
+            last_prompt: None,
+            last_run_status: LastRunStatus::NeverRun,
+        };
+        assert!(!config.has_flow_entrypoints());
+
+        let config = TargetConfig {
+            id: "demo".to_owned(),
+            scaffold: None,
+            template: Some("demo".to_owned()),
+            default_entrypoint: Some("main".to_owned()),
+            entrypoints: vec![super::TargetEntrypoint::Flow {
+                id: "main".to_owned(),
+                flow: "builtin://flows/demo.toml".to_owned(),
+                params: BTreeMap::new(),
+                hidden: false,
+                edit_path: Some("GOAL.md".to_owned()),
+            }],
+            runtime: None,
             created_at: None,
             max_iterations: None,
             last_prompt: None,
@@ -402,15 +373,15 @@ mod tests {
             prompt_files: Vec::new(),
             files: Vec::new(),
             scaffold: None,
-            default_entrypoint: None,
-            flow_entrypoints: Vec::new(),
-            mode: Some(WorkflowMode::TaskDriven),
+            template: Some("demo".to_owned()),
+            default_entrypoint: Some("main".to_owned()),
+            flow_entrypoints: vec!["main".to_owned()],
             created_at: None,
             last_prompt: None,
             last_run_status: LastRunStatus::NeverRun,
         };
 
-        assert!(config.uses_hidden_workflow());
-        assert!(summary.uses_hidden_workflow());
+        assert!(config.has_flow_entrypoints());
+        assert!(summary.has_flow_entrypoints());
     }
 }

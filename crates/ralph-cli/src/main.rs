@@ -1,13 +1,11 @@
 mod cli;
+mod fake_agent;
 mod output;
 
 use std::{env, fs, process::ExitCode};
 
 use crate::{
-    cli::{
-        AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, InitArgs, OutputArg,
-        ScaffoldArg,
-    },
+    cli::{AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, InitArgs, OutputArg},
     output::{
         AgentCurrentRow, agent_list_rows, print_agent_current, print_agent_list, print_bare_file,
         print_json_or_text, print_prompt_file_row, print_target_list, print_target_review,
@@ -56,21 +54,25 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
             let app = RalphApp::load(project_dir)?;
             match resolve_target_mode(args.target.as_deref(), args.prompt.as_deref())? {
                 TargetMode::Target(target) => {
-                    let summary = app.create_target(target, Some(args.scaffold.into()))?;
+                    let builtin_template: ScaffoldId = args.scaffold.into();
+                    let template_id = args
+                        .template
+                        .clone()
+                        .unwrap_or_else(|| builtin_template.as_str().to_owned());
+                    let summary = app.create_target_from_template(target, &template_id)?;
                     if args.edit {
-                        let prompt = match args.prompt.as_deref() {
-                            Some(name) => Some(name),
-                            None if args.scaffold == ScaffoldArg::PlanBuild => Some("0_plan.md"),
-                            None if args.scaffold == ScaffoldArg::TaskDriven => Some("GOAL.md"),
-                            None if args.scaffold == ScaffoldArg::PlanDriven => Some("GOAL.md"),
-                            None => None,
-                        };
-                        let prompt_path = app.resolve_target_edit_path(target, prompt)?;
+                        let prompt_path =
+                            app.resolve_target_edit_path(target, args.prompt.as_deref())?;
                         edit_file(&prompt_path, app.config().editor_override.as_deref())?;
                     }
                     print_target_summary(output, &summary)
                 }
                 TargetMode::BarePrompt(prompt_path) => {
+                    if args.template.is_some() {
+                        return Err(anyhow!(
+                            "bare prompt files do not support --template; use --scaffold"
+                        ));
+                    }
                     let scaffold: ScaffoldId = args.scaffold.into();
                     if matches!(scaffold, ScaffoldId::PlanDriven | ScaffoldId::TaskDriven) {
                         return Err(anyhow!(
@@ -119,6 +121,7 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
                 }
             }
         }
+        Commands::FakeAgent(args) => fake_agent::run(args.command),
         Commands::WorkflowCreator => {
             let app = RalphApp::load(project_dir)?;
             app.run_workflow_creator()

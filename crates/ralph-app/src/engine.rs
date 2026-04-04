@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
-    AppConfig, FlowRuntimeInflight, FlowRuntimeState, LastRunStatus, ScaffoldId, TargetConfig,
-    TargetEntrypoint, TargetSummary, WorkflowMode,
+    AppConfig, FlowRuntimeInflight, FlowRuntimeState, LastRunStatus, TargetConfig,
+    TargetEntrypoint, TargetSummary,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -13,7 +13,7 @@ pub(crate) const DEFAULT_FLOW_ENTRYPOINT_ID: &str = "main";
 
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedFlow {
-    pub(crate) id: String,
+    pub(crate) artifact_ref: String,
     pub(crate) definition: FlowDefinition,
     pub(crate) edit_path: Option<Utf8PathBuf>,
 }
@@ -127,6 +127,10 @@ pub(crate) struct FlowPauseAction {
     pub(crate) label: String,
     #[serde(default)]
     pub(crate) shortcut: Option<String>,
+    #[serde(default)]
+    pub(crate) confirm_title: Option<String>,
+    #[serde(default)]
+    pub(crate) confirm_message: Option<String>,
     pub(crate) goto: String,
 }
 
@@ -168,6 +172,7 @@ pub(crate) struct FlowPauseState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FlowStatusSummary {
+    pub(crate) entrypoint_id: String,
     pub(crate) current_node: Option<String>,
     pub(crate) pause: Option<FlowPauseState>,
     pub(crate) flow_ref: String,
@@ -188,20 +193,16 @@ pub(crate) fn resolve_target_entrypoints(
         return target_config.entrypoints.clone();
     }
 
-    match target_config.mode {
-        Some(WorkflowMode::PlanDriven) => vec![legacy_flow_entrypoint(WorkflowMode::PlanDriven)],
-        Some(WorkflowMode::TaskDriven) => vec![legacy_flow_entrypoint(WorkflowMode::TaskDriven)],
-        None => target_summary
-            .prompt_files
-            .iter()
-            .map(|prompt| TargetEntrypoint::Prompt {
-                id: prompt.name.clone(),
-                path: prompt.name.clone(),
-                hidden: false,
-                edit_path: Some(prompt.name.clone()),
-            })
-            .collect(),
-    }
+    target_summary
+        .prompt_files
+        .iter()
+        .map(|prompt| TargetEntrypoint::Prompt {
+            id: prompt.name.clone(),
+            path: prompt.name.clone(),
+            hidden: false,
+            edit_path: Some(prompt.name.clone()),
+        })
+        .collect()
 }
 
 pub(crate) fn resolve_default_entrypoint<'a>(
@@ -241,7 +242,7 @@ pub(crate) fn load_flow(
     target_dir: &Utf8Path,
     entrypoint: &TargetEntrypoint,
 ) -> Result<LoadedFlow> {
-    let (id, flow_ref, params, edit_path) = match entrypoint {
+    let (_id, flow_ref, params, edit_path) = match entrypoint {
         TargetEntrypoint::Flow {
             id,
             flow,
@@ -257,14 +258,14 @@ pub(crate) fn load_flow(
         }
     };
 
-    let raw = load_text_artifact(project_dir, target_dir, &flow_ref)
+    let raw = load_text_artifact(project_dir, target_dir, &flow_ref, None)
         .with_context(|| format!("failed to load flow '{flow_ref}'"))?;
     let rendered = render_params(&raw, &params);
     let definition: FlowDefinition = toml::from_str(&rendered)
         .with_context(|| format!("failed to parse flow artifact '{flow_ref}'"))?;
     definition.validate()?;
     Ok(LoadedFlow {
-        id,
+        artifact_ref: resolve_artifact_reference(None, &flow_ref)?,
         definition,
         edit_path: edit_path.map(|path| resolve_artifact_path(project_dir, target_dir, &path)),
     })
@@ -274,9 +275,10 @@ pub(crate) fn load_prompt_text(
     project_dir: &Utf8Path,
     target_dir: &Utf8Path,
     reference: &str,
+    base_ref: Option<&str>,
     params: &BTreeMap<String, String>,
 ) -> Result<String> {
-    let raw = load_text_artifact(project_dir, target_dir, reference)
+    let raw = load_text_artifact(project_dir, target_dir, reference, base_ref)
         .with_context(|| format!("failed to load prompt '{reference}'"))?;
     Ok(render_params(&raw, params))
 }
@@ -400,6 +402,7 @@ pub(crate) fn load_flow_status(
         });
 
     Ok(Some(FlowStatusSummary {
+        entrypoint_id: entrypoint.id().to_owned(),
         current_node: current_node_id,
         pause,
         flow_ref: flow.clone(),
@@ -468,49 +471,43 @@ pub(crate) fn read_contains_open_items(path: &Utf8Path) -> Result<Option<bool>> 
     }
 }
 
-pub(crate) fn run_legacy_scaffold_flow(scaffold: ScaffoldId) -> Option<String> {
-    match scaffold {
-        ScaffoldId::PlanDriven => Some("builtin://flows/plan_driven.toml".to_owned()),
-        ScaffoldId::TaskDriven => Some("builtin://flows/task_driven.toml".to_owned()),
-        _ => None,
+pub(crate) fn resolve_artifact_reference(
+    base_ref: Option<&str>,
+    reference: &str,
+) -> Result<String> {
+    if let Some(rest) = reference.strip_prefix("self://") {
+        let Some(base_ref) = base_ref else {
+            return Err(anyhow!(
+                "self:// references require a bundle-scoped base artifact"
+            ));
+        };
+        let Some(root) = bundle_root_reference(base_ref) else {
+            return Err(anyhow!(
+                "could not resolve workflow bundle root from '{base_ref}'"
+            ));
+        };
+        return Ok(format!("{root}{rest}"));
     }
+
+    Ok(reference.to_owned())
 }
 
-fn legacy_flow_entrypoint(mode: WorkflowMode) -> TargetEntrypoint {
-    match mode {
-        WorkflowMode::PlanDriven => TargetEntrypoint::Flow {
-            id: DEFAULT_FLOW_ENTRYPOINT_ID.to_owned(),
-            flow: "builtin://flows/plan_driven.toml".to_owned(),
-            params: BTreeMap::from([
-                ("goal_file".to_owned(), "GOAL.md".to_owned()),
-                ("derived_file".to_owned(), "plan.toml".to_owned()),
-                ("specs_dir".to_owned(), "specs".to_owned()),
-                ("journal_file".to_owned(), "journal.txt".to_owned()),
-                ("archive_prefix".to_owned(), "goal_rebuild".to_owned()),
-            ]),
-            hidden: false,
-            edit_path: Some("GOAL.md".to_owned()),
-        },
-        WorkflowMode::TaskDriven => TargetEntrypoint::Flow {
-            id: DEFAULT_FLOW_ENTRYPOINT_ID.to_owned(),
-            flow: "builtin://flows/task_driven.toml".to_owned(),
-            params: BTreeMap::from([
-                ("goal_file".to_owned(), "GOAL.md".to_owned()),
-                ("derived_file".to_owned(), "progress.toml".to_owned()),
-                ("journal_file".to_owned(), "journal.txt".to_owned()),
-                ("archive_prefix".to_owned(), "task_rebuild".to_owned()),
-            ]),
-            hidden: false,
-            edit_path: Some("GOAL.md".to_owned()),
-        },
+fn bundle_root_reference(reference: &str) -> Option<String> {
+    for marker in ["/workflow.toml", "/flows/", "/prompts/", "/templates/"] {
+        if let Some((prefix, _)) = reference.split_once(marker) {
+            return Some(format!("{prefix}/"));
+        }
     }
+    None
 }
 
-fn load_text_artifact(
+pub(crate) fn load_text_artifact(
     project_dir: &Utf8Path,
     target_dir: &Utf8Path,
     reference: &str,
+    base_ref: Option<&str>,
 ) -> Result<String> {
+    let reference = resolve_artifact_reference(base_ref, reference)?;
     if let Some(rest) = reference.strip_prefix("builtin://") {
         return builtin_asset(rest)
             .map(str::to_owned)
@@ -533,7 +530,7 @@ fn load_text_artifact(
     std::fs::read_to_string(&path).with_context(|| format!("failed to read {}", path))
 }
 
-fn render_params(raw: &str, params: &BTreeMap<String, String>) -> String {
+pub(crate) fn render_params(raw: &str, params: &BTreeMap<String, String>) -> String {
     let mut rendered = raw.to_owned();
     for (key, value) in params {
         rendered = rendered.replace(&format!("{{{{{key}}}}}"), value);
@@ -543,6 +540,36 @@ fn render_params(raw: &str, params: &BTreeMap<String, String>) -> String {
 
 fn builtin_asset(reference: &str) -> Option<&'static str> {
     match reference {
+        "workflows/single_prompt/workflow.toml" => Some(include_str!(
+            "builtin_assets/workflows/single_prompt/workflow.toml"
+        )),
+        "workflows/single_prompt/templates/prompt_main.md" => Some(include_str!(
+            "builtin_assets/workflows/single_prompt/templates/prompt_main.md"
+        )),
+        "workflows/plan_build/workflow.toml" => Some(include_str!(
+            "builtin_assets/workflows/plan_build/workflow.toml"
+        )),
+        "workflows/plan_build/templates/0_plan.md" => Some(include_str!(
+            "builtin_assets/workflows/plan_build/templates/0_plan.md"
+        )),
+        "workflows/plan_build/templates/1_build.md" => Some(include_str!(
+            "builtin_assets/workflows/plan_build/templates/1_build.md"
+        )),
+        "workflows/plan_driven/workflow.toml" => Some(include_str!(
+            "builtin_assets/workflows/plan_driven/workflow.toml"
+        )),
+        "workflows/plan_driven/templates/GOAL.md" => Some(include_str!(
+            "builtin_assets/workflows/plan_driven/templates/GOAL.md"
+        )),
+        "workflows/task_driven/workflow.toml" => Some(include_str!(
+            "builtin_assets/workflows/task_driven/workflow.toml"
+        )),
+        "workflows/task_driven/templates/GOAL.md" => Some(include_str!(
+            "builtin_assets/workflows/task_driven/templates/GOAL.md"
+        )),
+        "workflows/task_driven/templates/progress.toml" => Some(include_str!(
+            "builtin_assets/workflows/task_driven/templates/progress.toml"
+        )),
         "flows/plan_driven.toml" => Some(include_str!("builtin_assets/flows/plan_driven.toml")),
         "flows/task_driven.toml" => Some(include_str!("builtin_assets/flows/task_driven.toml")),
         "prompts/plan_driven/rebase.md" => {
@@ -585,12 +612,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8Path::from_path(temp.path()).unwrap();
         let target_dir = project_dir;
-        let flow = load_text_artifact(project_dir, target_dir, "builtin://flows/plan_driven.toml")?;
+        let flow = load_text_artifact(
+            project_dir,
+            target_dir,
+            "builtin://flows/plan_driven.toml",
+            None,
+        )?;
         assert!(flow.contains("kind = \"decision\""));
         let prompt = load_prompt_text(
             project_dir,
             target_dir,
             "builtin://prompts/task_driven/build.md",
+            None,
             &BTreeMap::new(),
         )?;
         assert!(prompt.contains("{{derived_file}}"));
