@@ -231,7 +231,7 @@ impl TuiApp {
             selected_prompt: 0,
             screen: Screen::Dashboard,
             new_target_name: String::new(),
-            new_scaffold: ScaffoldId::TaskBased,
+            new_scaffold: ScaffoldId::TaskDriven,
             message: String::new(),
             running: None,
             confirmation: None,
@@ -347,7 +347,7 @@ impl TuiApp {
             KeyCode::Char('n') => {
                 self.screen = Screen::NewTarget;
                 self.new_target_name.clear();
-                self.new_scaffold = ScaffoldId::TaskBased;
+                self.new_scaffold = ScaffoldId::TaskDriven;
             }
             KeyCode::Char('r') => self.start_run()?,
             KeyCode::Char('b') => self.start_workflow_build()?,
@@ -426,10 +426,10 @@ impl TuiApp {
             }
             KeyCode::Tab => {
                 self.new_scaffold = match self.new_scaffold {
-                    ScaffoldId::TaskBased => ScaffoldId::GoalDriven,
-                    ScaffoldId::GoalDriven => ScaffoldId::SinglePrompt,
+                    ScaffoldId::TaskDriven => ScaffoldId::PlanDriven,
+                    ScaffoldId::PlanDriven => ScaffoldId::SinglePrompt,
                     ScaffoldId::SinglePrompt => ScaffoldId::PlanBuild,
-                    ScaffoldId::PlanBuild => ScaffoldId::TaskBased,
+                    ScaffoldId::PlanBuild => ScaffoldId::TaskDriven,
                 };
             }
             KeyCode::Backspace => {
@@ -452,7 +452,7 @@ impl TuiApp {
                 }
                 self.screen = Screen::Dashboard;
                 let opened_path =
-                    if matches!(scaffold, ScaffoldId::TaskBased | ScaffoldId::GoalDriven) {
+                    if matches!(scaffold, ScaffoldId::TaskDriven | ScaffoldId::PlanDriven) {
                         Some(self.app.resolve_target_edit_path(&summary.id, None)?)
                     } else {
                         summary
@@ -716,8 +716,8 @@ impl TuiApp {
                 }
                 WorkflowRunAdvice::Choose => {
                     self.message = match status.kind {
-                        ralph_app::WorkflowKind::GoalDriven => "stale plan detected; press B to build current plan, G to rebase it, X to rebuild from scratch, or I to refine GOAL".to_owned(),
-                        ralph_app::WorkflowKind::TaskBased => "stale task backlog detected; press B to build current backlog, G to rebase it, X to rebuild from scratch, or I to refine GOAL".to_owned(),
+                        ralph_app::WorkflowKind::PlanDriven => "stale plan detected; press B to build current plan, G to rebase it, X to rebuild from scratch, or I to refine GOAL".to_owned(),
+                        ralph_app::WorkflowKind::TaskDriven => "stale task backlog detected; press B to build current backlog, G to rebase it, X to rebuild from scratch, or I to refine GOAL".to_owned(),
                     };
                     Ok(())
                 }
@@ -892,11 +892,11 @@ impl TuiApp {
             return Ok(());
         };
         match target.mode {
-            Some(WorkflowMode::GoalDriven) => {
-                self.app.rebuild_goal_driven_from_scratch(&target_id)?
+            Some(WorkflowMode::PlanDriven) => {
+                self.app.rebuild_plan_driven_from_scratch(&target_id)?
             }
-            Some(WorkflowMode::TaskBased) => {
-                self.app.rebuild_task_based_from_scratch(&target_id)?
+            Some(WorkflowMode::TaskDriven) => {
+                self.app.rebuild_task_driven_from_scratch(&target_id)?
             }
             None => {
                 self.message = "scratch rebuild is only available for workflow targets".to_owned();
@@ -1137,10 +1137,10 @@ mod tests {
     fn workflow_targets_are_detected_from_mode_even_without_scaffold() -> Result<()> {
         let (_temp, project_dir) = temp_project_dir();
         let app = RalphApp::load(project_dir.clone())?;
-        app.create_target("demo", Some(ScaffoldId::GoalDriven))?;
+        app.create_target("demo", Some(ScaffoldId::PlanDriven))?;
         std::fs::write(
             project_dir.join(".ralph/targets/demo/target.toml"),
-            "id = \"demo\"\nmode = \"goal_driven\"\nlast_run_status = \"never_run\"\n\n[workflow]\nphase = \"plan\"\n",
+            "id = \"demo\"\nmode = \"plan_driven\"\nlast_run_status = \"never_run\"\n\n[workflow]\nphase = \"plan\"\n",
         )?;
 
         let runtime = Runtime::new()?;
@@ -1310,7 +1310,7 @@ mod tests {
     fn workflow_rebuild_requires_explicit_yes_confirmation() -> Result<()> {
         let (_temp, project_dir) = temp_project_dir();
         let app = RalphApp::load(project_dir.clone())?;
-        app.create_target("demo", Some(ScaffoldId::GoalDriven))?;
+        app.create_target("demo", Some(ScaffoldId::PlanDriven))?;
         let target_dir = project_dir.join(".ralph/targets/demo");
         std::fs::write(target_dir.join("plan.toml"), "version = 1\n")?;
 

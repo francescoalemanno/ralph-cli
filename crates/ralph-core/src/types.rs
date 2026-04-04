@@ -35,8 +35,8 @@ pub enum ScaffoldId {
     #[default]
     SinglePrompt,
     PlanBuild,
-    TaskBased,
-    GoalDriven,
+    TaskDriven,
+    PlanDriven,
 }
 
 impl ScaffoldId {
@@ -44,8 +44,8 @@ impl ScaffoldId {
         match self {
             Self::SinglePrompt => "single_prompt",
             Self::PlanBuild => "plan_build",
-            Self::TaskBased => "task_based",
-            Self::GoalDriven => "goal_driven",
+            Self::TaskDriven => "task_driven",
+            Self::PlanDriven => "plan_driven",
         }
     }
 }
@@ -53,13 +53,13 @@ impl ScaffoldId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowMode {
-    TaskBased,
-    GoalDriven,
+    TaskDriven,
+    PlanDriven,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum GoalDrivenPhase {
+pub enum PlanDrivenPhase {
     #[default]
     Plan,
     Build,
@@ -67,9 +67,9 @@ pub enum GoalDrivenPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct GoalDrivenWorkflowState {
+pub struct PlanDrivenWorkflowState {
     #[serde(default)]
-    pub phase: GoalDrivenPhase,
+    pub phase: PlanDrivenPhase,
     #[serde(default)]
     pub last_goal_hash: Option<String>,
     #[serde(default)]
@@ -81,8 +81,8 @@ pub struct GoalDrivenWorkflowState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GoalDrivenInflight {
-    pub phase: GoalDrivenPhase,
+pub struct PlanDrivenInflight {
+    pub phase: PlanDrivenPhase,
     pub goal_hash: String,
     pub content_hash: String,
     pub started_at: u64,
@@ -96,9 +96,9 @@ pub struct TargetConfig {
     #[serde(default)]
     pub mode: Option<WorkflowMode>,
     #[serde(default)]
-    pub workflow: Option<GoalDrivenWorkflowState>,
+    pub workflow: Option<PlanDrivenWorkflowState>,
     #[serde(default)]
-    pub inflight: Option<GoalDrivenInflight>,
+    pub inflight: Option<PlanDrivenInflight>,
     #[serde(default)]
     pub created_at: Option<u64>,
     #[serde(default)]
@@ -113,7 +113,7 @@ impl TargetConfig {
     pub fn uses_hidden_workflow(&self) -> bool {
         matches!(
             self.mode,
-            Some(WorkflowMode::TaskBased | WorkflowMode::GoalDriven)
+            Some(WorkflowMode::TaskDriven | WorkflowMode::PlanDriven)
         )
     }
 }
@@ -154,7 +154,7 @@ impl TargetSummary {
     pub fn uses_hidden_workflow(&self) -> bool {
         matches!(
             self.mode,
-            Some(WorkflowMode::TaskBased | WorkflowMode::GoalDriven)
+            Some(WorkflowMode::TaskDriven | WorkflowMode::PlanDriven)
         )
     }
 }
@@ -280,8 +280,8 @@ mod tests {
         assert_eq!(LastRunStatus::Completed.label(), "completed");
         assert_eq!(ScaffoldId::SinglePrompt.as_str(), "single_prompt");
         assert_eq!(ScaffoldId::PlanBuild.as_str(), "plan_build");
-        assert_eq!(ScaffoldId::TaskBased.as_str(), "task_based");
-        assert_eq!(ScaffoldId::GoalDriven.as_str(), "goal_driven");
+        assert_eq!(ScaffoldId::TaskDriven.as_str(), "task_driven");
+        assert_eq!(ScaffoldId::PlanDriven.as_str(), "plan_driven");
     }
 
     #[test]
@@ -289,7 +289,7 @@ mod tests {
         let config = TargetConfig {
             id: "demo".to_owned(),
             scaffold: None,
-            mode: Some(WorkflowMode::GoalDriven),
+            mode: Some(WorkflowMode::PlanDriven),
             workflow: None,
             inflight: None,
             created_at: None,
@@ -303,7 +303,7 @@ mod tests {
             prompt_files: Vec::new(),
             files: Vec::new(),
             scaffold: None,
-            mode: Some(WorkflowMode::TaskBased),
+            mode: Some(WorkflowMode::TaskDriven),
             created_at: None,
             last_prompt: None,
             last_run_status: LastRunStatus::NeverRun,

@@ -14,16 +14,16 @@ pub(crate) fn materialize_target_scaffold(
             write_scaffold_file(target_dir, "0_plan.md", &plan_build_plan_prompt())?;
             write_scaffold_file(target_dir, "1_build.md", &plan_build_build_prompt())?;
         }
-        ScaffoldId::TaskBased => {
-            write_scaffold_file(target_dir, "GOAL.md", &goal_driven_goal_template())?;
+        ScaffoldId::TaskDriven => {
+            write_scaffold_file(target_dir, "GOAL.md", &plan_driven_goal_template())?;
             write_scaffold_file(
                 target_dir,
                 "progress.toml",
-                &task_based_progress_seed_template(),
+                &task_driven_progress_seed_template(),
             )?;
         }
-        ScaffoldId::GoalDriven => {
-            write_scaffold_file(target_dir, "GOAL.md", &goal_driven_goal_template())?;
+        ScaffoldId::PlanDriven => {
+            write_scaffold_file(target_dir, "GOAL.md", &plan_driven_goal_template())?;
             fs::create_dir_all(target_dir.join("specs"))
                 .with_context(|| format!("failed to create {}", target_dir.join("specs")))?;
         }
@@ -38,8 +38,8 @@ pub(crate) fn materialize_target_scaffold(
 pub fn bare_prompt_template(scaffold: ScaffoldId) -> String {
     match scaffold {
         ScaffoldId::PlanBuild => plan_build_plan_prompt(),
-        ScaffoldId::TaskBased => goal_driven_goal_template(),
-        ScaffoldId::GoalDriven => goal_driven_goal_template(),
+        ScaffoldId::TaskDriven => plan_driven_goal_template(),
+        ScaffoldId::PlanDriven => plan_driven_goal_template(),
         ScaffoldId::SinglePrompt => single_prompt_template(),
     }
 }
@@ -103,12 +103,12 @@ fn single_prompt_template() -> String {
         .to_owned()
 }
 
-fn goal_driven_goal_template() -> String {
+fn plan_driven_goal_template() -> String {
     "# Goal\n\nCapture the desired outcome here.\n\n- Requests\n- Constraints\n- Observations\n- Acceptance notes\n"
         .to_owned()
 }
 
-fn task_based_progress_seed_template() -> String {
+fn task_driven_progress_seed_template() -> String {
     r#"version = 1
 
 [[items]]
@@ -130,19 +130,19 @@ mod tests {
 
     #[test]
     fn workflow_scaffolds_expose_goal_template_for_bare_prompts() {
-        let task_based = bare_prompt_template(ScaffoldId::TaskBased);
-        let goal_driven = bare_prompt_template(ScaffoldId::GoalDriven);
+        let task_driven = bare_prompt_template(ScaffoldId::TaskDriven);
+        let plan_driven = bare_prompt_template(ScaffoldId::PlanDriven);
 
-        assert!(task_based.starts_with("# Goal"));
-        assert_eq!(task_based, goal_driven);
+        assert!(task_driven.starts_with("# Goal"));
+        assert_eq!(task_driven, plan_driven);
     }
 
     #[test]
-    fn goal_driven_scaffold_creates_goal_file_and_specs_dir() {
+    fn plan_driven_scaffold_creates_goal_file_and_specs_dir() {
         let temp = tempfile::tempdir().unwrap();
         let target_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
 
-        materialize_target_scaffold(&target_dir, ScaffoldId::GoalDriven).unwrap();
+        materialize_target_scaffold(&target_dir, ScaffoldId::PlanDriven).unwrap();
 
         assert!(target_dir.join("GOAL.md").is_file());
         assert!(target_dir.join("specs").is_dir());

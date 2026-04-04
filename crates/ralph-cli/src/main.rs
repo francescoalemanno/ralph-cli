@@ -61,8 +61,8 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
                         let prompt = match args.prompt.as_deref() {
                             Some(name) => Some(name),
                             None if args.scaffold == ScaffoldArg::PlanBuild => Some("0_plan.md"),
-                            None if args.scaffold == ScaffoldArg::TaskBased => Some("GOAL.md"),
-                            None if args.scaffold == ScaffoldArg::GoalDriven => Some("GOAL.md"),
+                            None if args.scaffold == ScaffoldArg::TaskDriven => Some("GOAL.md"),
+                            None if args.scaffold == ScaffoldArg::PlanDriven => Some("GOAL.md"),
                             None => None,
                         };
                         let prompt_path = app.resolve_target_edit_path(target, prompt)?;
@@ -72,7 +72,7 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
                 }
                 TargetMode::BarePrompt(prompt_path) => {
                     let scaffold: ScaffoldId = args.scaffold.into();
-                    if matches!(scaffold, ScaffoldId::GoalDriven | ScaffoldId::TaskBased) {
+                    if matches!(scaffold, ScaffoldId::PlanDriven | ScaffoldId::TaskDriven) {
                         return Err(anyhow!(
                             "workflow targets require a TARGET; bare prompt files are not supported"
                         ));

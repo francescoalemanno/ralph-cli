@@ -25,8 +25,8 @@ pub(crate) enum OutputArg {
 pub(crate) enum ScaffoldArg {
     SinglePrompt,
     PlanBuild,
-    TaskBased,
-    GoalDriven,
+    TaskDriven,
+    PlanDriven,
 }
 
 impl From<ScaffoldArg> for ScaffoldId {
@@ -34,8 +34,8 @@ impl From<ScaffoldArg> for ScaffoldId {
         match value {
             ScaffoldArg::SinglePrompt => ScaffoldId::SinglePrompt,
             ScaffoldArg::PlanBuild => ScaffoldId::PlanBuild,
-            ScaffoldArg::TaskBased => ScaffoldId::TaskBased,
-            ScaffoldArg::GoalDriven => ScaffoldId::GoalDriven,
+            ScaffoldArg::TaskDriven => ScaffoldId::TaskDriven,
+            ScaffoldArg::PlanDriven => ScaffoldId::PlanDriven,
         }
     }
 }

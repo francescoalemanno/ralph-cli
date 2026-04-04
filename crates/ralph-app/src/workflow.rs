@@ -5,34 +5,34 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
-use ralph_core::{GoalDrivenPhase, TargetConfig, TargetStore};
+use ralph_core::{PlanDrivenPhase, TargetConfig, TargetStore};
 use sha2::{Digest, Sha256};
 
-pub(crate) const GOAL_DRIVEN_GOAL_FILE: &str = "GOAL.md";
-pub(crate) const GOAL_DRIVEN_PLAN_FILE: &str = "plan.toml";
-pub(crate) const GOAL_DRIVEN_SPECS_DIR: &str = "specs";
-pub(crate) const GOAL_DRIVEN_PLAN_PROMPT: &str = "goal_driven_plan";
-pub(crate) const GOAL_DRIVEN_BUILD_PROMPT: &str = "goal_driven_build";
-pub(crate) const GOAL_DRIVEN_PAUSED_PROMPT: &str = "goal_driven_paused";
-pub(crate) const TASK_BASED_PROGRESS_FILE: &str = "progress.toml";
+pub(crate) const PLAN_DRIVEN_GOAL_FILE: &str = "GOAL.md";
+pub(crate) const PLAN_DRIVEN_PLAN_FILE: &str = "plan.toml";
+pub(crate) const PLAN_DRIVEN_SPECS_DIR: &str = "specs";
+pub(crate) const PLAN_DRIVEN_PLAN_PROMPT: &str = "plan_driven_plan";
+pub(crate) const PLAN_DRIVEN_BUILD_PROMPT: &str = "plan_driven_build";
+pub(crate) const PLAN_DRIVEN_PAUSED_PROMPT: &str = "plan_driven_paused";
+pub(crate) const TASK_DRIVEN_PROGRESS_FILE: &str = "progress.toml";
 pub(crate) const WORKFLOW_JOURNAL_FILE: &str = "journal.txt";
-pub(crate) const TASK_BASED_REBASE_PROMPT: &str = "task_based_rebase";
-pub(crate) const TASK_BASED_BUILD_PROMPT: &str = "task_based_build";
-pub(crate) const TASK_BASED_PAUSED_PROMPT: &str = "task_based_paused";
+pub(crate) const TASK_DRIVEN_REBASE_PROMPT: &str = "task_driven_rebase";
+pub(crate) const TASK_DRIVEN_BUILD_PROMPT: &str = "task_driven_build";
+pub(crate) const TASK_DRIVEN_PAUSED_PROMPT: &str = "task_driven_paused";
 
 const RALPH_ENV_TARGET_DIR: &str = "{ralph-env:TARGET_DIR}";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowKind {
-    GoalDriven,
-    TaskBased,
+    PlanDriven,
+    TaskDriven,
 }
 
 impl WorkflowKind {
     pub fn label(self) -> &'static str {
         match self {
-            Self::GoalDriven => "goal_driven",
-            Self::TaskBased => "task_based",
+            Self::PlanDriven => "plan_driven",
+            Self::TaskDriven => "task_driven",
         }
     }
 }
@@ -96,32 +96,32 @@ pub struct WorkflowStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GoalDrivenAction {
+pub(crate) enum PlanDrivenAction {
     Plan,
     Build,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TaskBasedAction {
+pub(crate) enum TaskDrivenAction {
     Rebase,
     Build,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GoalDrivenHashes {
+pub(crate) struct PlanDrivenHashes {
     pub(crate) goal_hash: String,
     pub(crate) content_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TaskBasedHashes {
+pub(crate) struct TaskDrivenHashes {
     pub(crate) goal_hash: String,
     pub(crate) content_hash: String,
 }
 
-pub(crate) fn select_task_based_build_needed(
+pub(crate) fn select_task_driven_build_needed(
     config: &TargetConfig,
-    hashes: &TaskBasedHashes,
+    hashes: &TaskDrivenHashes,
 ) -> bool {
     if config.inflight.is_some() {
         return true;
@@ -129,36 +129,36 @@ pub(crate) fn select_task_based_build_needed(
 
     let workflow = config.workflow.clone().unwrap_or_default();
     match workflow.phase {
-        GoalDrivenPhase::Paused => {
+        PlanDrivenPhase::Paused => {
             workflow.last_content_hash.as_deref() != Some(hashes.content_hash.as_str())
         }
-        GoalDrivenPhase::Plan | GoalDrivenPhase::Build => true,
+        PlanDrivenPhase::Plan | PlanDrivenPhase::Build => true,
     }
 }
 
-pub(crate) fn goal_driven_hashes(
+pub(crate) fn plan_driven_hashes(
     store: &TargetStore,
     target_dir: &Utf8Path,
-) -> Result<GoalDrivenHashes> {
-    let goal_path = target_dir.join(GOAL_DRIVEN_GOAL_FILE);
+) -> Result<PlanDrivenHashes> {
+    let goal_path = target_dir.join(PLAN_DRIVEN_GOAL_FILE);
     let goal_contents = store
         .read_file(&goal_path)
         .with_context(|| format!("missing required goal file {}", goal_path))?;
     let goal_hash = hash_bytes(goal_contents.as_bytes());
 
     let mut hasher = Sha256::new();
-    hash_named_contents(&mut hasher, GOAL_DRIVEN_GOAL_FILE, goal_contents.as_bytes());
+    hash_named_contents(&mut hasher, PLAN_DRIVEN_GOAL_FILE, goal_contents.as_bytes());
 
-    let plan_path = target_dir.join(GOAL_DRIVEN_PLAN_FILE);
+    let plan_path = target_dir.join(PLAN_DRIVEN_PLAN_FILE);
     if plan_path.exists() {
         hash_named_contents(
             &mut hasher,
-            GOAL_DRIVEN_PLAN_FILE,
+            PLAN_DRIVEN_PLAN_FILE,
             store.read_file(&plan_path)?.as_bytes(),
         );
     }
 
-    let specs_dir = target_dir.join(GOAL_DRIVEN_SPECS_DIR);
+    let specs_dir = target_dir.join(PLAN_DRIVEN_SPECS_DIR);
     if specs_dir.exists() {
         let mut paths = walk_files(&specs_dir)?;
         paths.sort();
@@ -174,58 +174,58 @@ pub(crate) fn goal_driven_hashes(
         }
     }
 
-    Ok(GoalDrivenHashes {
+    Ok(PlanDrivenHashes {
         goal_hash,
         content_hash: format!("sha256:{:x}", hasher.finalize()),
     })
 }
 
-pub(crate) fn task_based_hashes(
+pub(crate) fn task_driven_hashes(
     store: &TargetStore,
     target_dir: &Utf8Path,
-) -> Result<TaskBasedHashes> {
-    let goal_path = target_dir.join(GOAL_DRIVEN_GOAL_FILE);
+) -> Result<TaskDrivenHashes> {
+    let goal_path = target_dir.join(PLAN_DRIVEN_GOAL_FILE);
     let goal_contents = store
         .read_file(&goal_path)
         .with_context(|| format!("missing required goal file {}", goal_path))?;
     let goal_hash = hash_bytes(goal_contents.as_bytes());
 
     let mut hasher = Sha256::new();
-    hash_named_contents(&mut hasher, GOAL_DRIVEN_GOAL_FILE, goal_contents.as_bytes());
+    hash_named_contents(&mut hasher, PLAN_DRIVEN_GOAL_FILE, goal_contents.as_bytes());
 
-    let progress_path = target_dir.join(TASK_BASED_PROGRESS_FILE);
+    let progress_path = target_dir.join(TASK_DRIVEN_PROGRESS_FILE);
     if progress_path.exists() {
         hash_named_contents(
             &mut hasher,
-            TASK_BASED_PROGRESS_FILE,
+            TASK_DRIVEN_PROGRESS_FILE,
             store.read_file(&progress_path)?.as_bytes(),
         );
     }
 
-    Ok(TaskBasedHashes {
+    Ok(TaskDrivenHashes {
         goal_hash,
         content_hash: format!("sha256:{:x}", hasher.finalize()),
     })
 }
 
-pub(crate) fn goal_driven_workflow_status(
+pub(crate) fn plan_driven_workflow_status(
     config: &TargetConfig,
-    hashes: &GoalDrivenHashes,
+    hashes: &PlanDrivenHashes,
     target_dir: &Utf8Path,
 ) -> WorkflowStatus {
     if let Some(inflight) = &config.inflight {
         return WorkflowStatus {
-            kind: WorkflowKind::GoalDriven,
+            kind: WorkflowKind::PlanDriven,
             derived_state: WorkflowDerivedState::Fresh,
             run_advice: match inflight.phase {
-                GoalDrivenPhase::Plan => WorkflowRunAdvice::Rebase,
-                GoalDrivenPhase::Build | GoalDrivenPhase::Paused => WorkflowRunAdvice::Build,
+                PlanDrivenPhase::Plan => WorkflowRunAdvice::Rebase,
+                PlanDrivenPhase::Build | PlanDrivenPhase::Paused => WorkflowRunAdvice::Build,
             },
         };
     }
 
     let workflow = config.workflow.clone().unwrap_or_default();
-    let has_plan = target_dir.join(GOAL_DRIVEN_PLAN_FILE).exists();
+    let has_plan = target_dir.join(PLAN_DRIVEN_PLAN_FILE).exists();
     let derived_state = if !has_plan || workflow.last_planned_at.is_none() {
         WorkflowDerivedState::Missing
     } else if workflow.last_goal_hash.as_deref() != Some(hashes.goal_hash.as_str()) {
@@ -241,30 +241,30 @@ pub(crate) fn goal_driven_workflow_status(
     };
 
     WorkflowStatus {
-        kind: WorkflowKind::GoalDriven,
+        kind: WorkflowKind::PlanDriven,
         derived_state,
         run_advice,
     }
 }
 
-pub(crate) fn task_based_workflow_status(
+pub(crate) fn task_driven_workflow_status(
     config: &TargetConfig,
-    hashes: &TaskBasedHashes,
+    hashes: &TaskDrivenHashes,
     target_dir: &Utf8Path,
 ) -> WorkflowStatus {
     if let Some(inflight) = &config.inflight {
         return WorkflowStatus {
-            kind: WorkflowKind::TaskBased,
+            kind: WorkflowKind::TaskDriven,
             derived_state: WorkflowDerivedState::Fresh,
             run_advice: match inflight.phase {
-                GoalDrivenPhase::Plan => WorkflowRunAdvice::Rebase,
-                GoalDrivenPhase::Build | GoalDrivenPhase::Paused => WorkflowRunAdvice::Build,
+                PlanDrivenPhase::Plan => WorkflowRunAdvice::Rebase,
+                PlanDrivenPhase::Build | PlanDrivenPhase::Paused => WorkflowRunAdvice::Build,
             },
         };
     }
 
     let workflow = config.workflow.clone().unwrap_or_default();
-    let has_progress = target_dir.join(TASK_BASED_PROGRESS_FILE).exists();
+    let has_progress = target_dir.join(TASK_DRIVEN_PROGRESS_FILE).exists();
     let derived_state = if !has_progress || workflow.last_goal_hash.is_none() {
         WorkflowDerivedState::Missing
     } else if workflow.last_goal_hash.as_deref() != Some(hashes.goal_hash.as_str()) {
@@ -277,7 +277,7 @@ pub(crate) fn task_based_workflow_status(
         WorkflowDerivedState::Missing => WorkflowRunAdvice::Rebase,
         WorkflowDerivedState::Stale => WorkflowRunAdvice::Choose,
         WorkflowDerivedState::Fresh => {
-            if select_task_based_build_needed(config, hashes) {
+            if select_task_driven_build_needed(config, hashes) {
                 WorkflowRunAdvice::Build
             } else {
                 WorkflowRunAdvice::NoWork
@@ -286,13 +286,13 @@ pub(crate) fn task_based_workflow_status(
     };
 
     WorkflowStatus {
-        kind: WorkflowKind::TaskBased,
+        kind: WorkflowKind::TaskDriven,
         derived_state,
         run_advice,
     }
 }
 
-pub(crate) fn goal_driven_plan_prompt() -> String {
+pub(crate) fn plan_driven_plan_prompt() -> String {
     format!(
         r#"1. Study these inputs before planning:
    a. Study `{target_dir}/GOAL.md`.
@@ -343,7 +343,7 @@ completed = false
     )
 }
 
-pub(crate) fn goal_driven_build_prompt() -> String {
+pub(crate) fn plan_driven_build_prompt() -> String {
     format!(
         r#"1. Study these inputs before building:
    a. Study `{target_dir}/GOAL.md`.
@@ -377,7 +377,7 @@ completed = false
     )
 }
 
-pub(crate) fn task_based_rebase_prompt() -> String {
+pub(crate) fn task_driven_rebase_prompt() -> String {
     format!(
         r#"1. Study these inputs before rebasing the task backlog:
    a. Study `{target_dir}/GOAL.md` as the authoritative intent.
@@ -410,7 +410,7 @@ completed = false
     )
 }
 
-pub(crate) fn task_based_build_prompt() -> String {
+pub(crate) fn task_driven_build_prompt() -> String {
     format!(
         r#"1. Study these inputs before building:
    a. Study `{target_dir}/GOAL.md` as the CEO input.
@@ -509,10 +509,10 @@ mod tests {
     use camino::{Utf8Path, Utf8PathBuf};
     use ralph_core::TargetStore;
     use ralph_core::{
-        GoalDrivenPhase, GoalDrivenWorkflowState, LastRunStatus, TargetConfig, WorkflowMode,
+        LastRunStatus, PlanDrivenPhase, PlanDrivenWorkflowState, TargetConfig, WorkflowMode,
     };
 
-    use super::{goal_driven_hashes, goal_driven_workflow_status, workflow_goal_interview_prompt};
+    use super::{plan_driven_hashes, plan_driven_workflow_status, workflow_goal_interview_prompt};
 
     #[test]
     fn goal_interview_prompt_mentions_goal_file_and_confirmation_gate() {
@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn goal_driven_status_marks_goal_change_as_stale_after_planning() {
+    fn plan_driven_status_marks_goal_change_as_stale_after_planning() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let store = TargetStore::new(project_dir.clone());
@@ -536,12 +536,12 @@ mod tests {
         let config = TargetConfig {
             id: "demo".to_owned(),
             scaffold: None,
-            mode: Some(WorkflowMode::GoalDriven),
-            workflow: Some(GoalDrivenWorkflowState {
-                phase: GoalDrivenPhase::Paused,
+            mode: Some(WorkflowMode::PlanDriven),
+            workflow: Some(PlanDrivenWorkflowState {
+                phase: PlanDrivenPhase::Paused,
                 last_goal_hash: Some("sha256:old".to_owned()),
                 last_planned_at: Some(1),
-                ..GoalDrivenWorkflowState::default()
+                ..PlanDrivenWorkflowState::default()
             }),
             inflight: None,
             created_at: None,
@@ -549,8 +549,8 @@ mod tests {
             last_prompt: None,
             last_run_status: LastRunStatus::NeverRun,
         };
-        let hashes = goal_driven_hashes(&store, &target_dir).unwrap();
-        let status = goal_driven_workflow_status(&config, &hashes, &target_dir);
+        let hashes = plan_driven_hashes(&store, &target_dir).unwrap();
+        let status = plan_driven_workflow_status(&config, &hashes, &target_dir);
 
         assert_eq!(status.derived_state, WorkflowDerivedState::Stale);
         assert_eq!(status.run_advice, WorkflowRunAdvice::Choose);
