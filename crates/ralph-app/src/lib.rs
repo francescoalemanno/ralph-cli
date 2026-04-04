@@ -1,4 +1,5 @@
 mod console;
+mod engine;
 mod interactive;
 mod prompt;
 mod prompt_run;
@@ -159,7 +160,34 @@ impl<R> RalphApp<R> {
         requested_file: Option<&str>,
     ) -> Result<Utf8PathBuf> {
         let config = self.store.read_target_config(target)?;
+        let target_summary = self.store.load_target(target)?;
         let target_dir = self.store.target_paths(target)?.dir;
+
+        if !config.entrypoints.is_empty() {
+            let entrypoints = crate::engine::resolve_target_entrypoints(&config, &target_summary);
+            if let Some(entrypoint) =
+                crate::engine::resolve_default_entrypoint(&config, &entrypoints)
+                && let Some(edit_path) = entrypoint.edit_path()
+            {
+                let resolved =
+                    crate::engine::resolve_artifact_path(&self.project_dir, &target_dir, edit_path);
+                return match requested_file {
+                    None => Ok(resolved),
+                    Some(name)
+                        if name == edit_path
+                            || name == resolved.file_name().unwrap_or_default() =>
+                    {
+                        Ok(resolved)
+                    }
+                    Some(name) => Err(anyhow!(
+                        "entrypoint '{}' exposes '{}' for editing, got '{}'",
+                        entrypoint.id(),
+                        edit_path,
+                        name
+                    )),
+                };
+            }
+        }
 
         if config.uses_hidden_workflow() {
             return match requested_file {

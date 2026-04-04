@@ -9,6 +9,7 @@ It keeps target state on disk, treats target folders as the source of truth, and
 Source:
 
 - [github.com/francescoalemanno/ralph-cli](https://github.com/francescoalemanno/ralph-cli)
+- [Custom workflow authoring guide](docs/custom-workflows.md)
 
 ## Lineage
 
@@ -146,7 +147,8 @@ ralph
 ralph <target>
 
 ralph new <target> [--scaffold single-prompt|plan-build|task-driven|plan-driven] [--edit] [--prompt <file>]
-ralph run <target> [--prompt <file>]
+ralph run <target> [--prompt <file>] [--entrypoint <id>] [--action <id>]
+ralph workflow-creator
 ralph ls
 ralph show <target> [--file <name>]
 ralph edit <target> [--prompt <file>]
@@ -165,6 +167,7 @@ Daily workflow:
 
 - `new`: create a target folder and initialize scaffold files
 - `run`: run one prompt loop or workflow for a target
+- `workflow-creator`: open the active interactive agent on the embedded custom workflow guide and author reusable user-scoped workflows under `~/.config/ralph/`
 - `ls`: list known targets
 - `show`: inspect target files
 - `edit`: open the selected prompt or workflow input in your editor

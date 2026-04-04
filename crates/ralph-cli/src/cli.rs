@@ -94,6 +94,8 @@ pub(crate) enum Commands {
     New(NewArgs),
     #[command(about = "Run a target workflow or selected prompt loop")]
     Run(RunArgs),
+    #[command(about = "Launch the interactive workflow creator against the user config")]
+    WorkflowCreator,
     #[command(about = "List targets", visible_alias = "status")]
     Ls,
     #[command(about = "Show target files")]
@@ -128,6 +130,10 @@ pub(crate) struct RunArgs {
     pub(crate) target: Option<String>,
     #[arg(long, value_name = "FILE")]
     pub(crate) prompt: Option<String>,
+    #[arg(long, value_name = "ID")]
+    pub(crate) entrypoint: Option<String>,
+    #[arg(long, value_name = "ID")]
+    pub(crate) action: Option<String>,
     #[command(flatten)]
     pub(crate) runtime: RuntimeArgs,
 }

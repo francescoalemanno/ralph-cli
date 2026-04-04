@@ -536,6 +536,9 @@ mod tests {
         let config = TargetConfig {
             id: "demo".to_owned(),
             scaffold: None,
+            default_entrypoint: None,
+            entrypoints: Vec::new(),
+            runtime: None,
             mode: Some(WorkflowMode::PlanDriven),
             workflow: Some(PlanDrivenWorkflowState {
                 phase: PlanDrivenPhase::Paused,

@@ -818,6 +818,7 @@ dependencies = [
  "similar",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]

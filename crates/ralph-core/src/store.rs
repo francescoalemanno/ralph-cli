@@ -7,9 +7,9 @@ use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::{
-    LastRunStatus, PlanDrivenWorkflowState, PromptFile, ScaffoldId, TargetConfig, TargetFile,
-    TargetFileContents, TargetPaths, TargetReview, TargetSummary, WorkflowMode, atomic_write,
-    scaffold::materialize_target_scaffold,
+    EntrypointKind, LastRunStatus, PlanDrivenWorkflowState, PromptFile, ScaffoldId, TargetConfig,
+    TargetEntrypoint, TargetFile, TargetFileContents, TargetPaths, TargetReview, TargetSummary,
+    WorkflowMode, atomic_write, scaffold::materialize_target_scaffold,
 };
 
 pub(crate) const ARTIFACT_DIR_NAME: &str = ".ralph";
@@ -25,6 +25,9 @@ impl TargetStore {
         TargetConfig {
             id: target_id.to_owned(),
             scaffold: None,
+            default_entrypoint: None,
+            entrypoints: Vec::new(),
+            runtime: None,
             mode: None,
             workflow: None,
             inflight: None,
@@ -44,6 +47,9 @@ impl TargetStore {
         TargetConfig {
             id: target_id.to_owned(),
             scaffold,
+            default_entrypoint: default_entrypoint_for_scaffold(scaffold),
+            entrypoints: default_entrypoints_for_scaffold(scaffold),
+            runtime: None,
             mode,
             workflow: mode.map(workflow_state_for_mode),
             inflight: None,
@@ -148,11 +154,13 @@ impl TargetStore {
             .collect::<Vec<_>>();
 
         Ok(TargetSummary {
-            id: config.id,
+            id: config.id.clone(),
             dir: paths.dir,
             prompt_files,
             files,
             scaffold: config.scaffold,
+            default_entrypoint: resolved_default_entrypoint(&config),
+            flow_entrypoints: resolved_flow_entrypoints(&config),
             mode: config.mode,
             created_at: config.created_at,
             last_prompt: config.last_prompt,
@@ -308,10 +316,90 @@ fn current_unix_timestamp() -> u64 {
 }
 
 fn is_target_prompt_file(config: &TargetConfig, name: &str) -> bool {
+    if config.entrypoints.iter().any(
+        |entrypoint| matches!(entrypoint, TargetEntrypoint::Prompt { path, .. } if path == name),
+    ) {
+        return true;
+    }
+
+    if config.uses_hidden_workflow() && config.entrypoints.is_empty() {
+        return false;
+    }
+
     match config.mode {
         Some(WorkflowMode::TaskDriven) => false,
         Some(WorkflowMode::PlanDriven) => false,
         None => is_prompt_file_name(name),
+    }
+}
+
+fn default_entrypoint_for_scaffold(scaffold: Option<ScaffoldId>) -> Option<String> {
+    match scaffold {
+        Some(ScaffoldId::TaskDriven | ScaffoldId::PlanDriven) => Some("main".to_owned()),
+        _ => None,
+    }
+}
+
+fn default_entrypoints_for_scaffold(scaffold: Option<ScaffoldId>) -> Vec<TargetEntrypoint> {
+    match scaffold {
+        Some(ScaffoldId::PlanDriven) => vec![TargetEntrypoint::Flow {
+            id: "main".to_owned(),
+            flow: "builtin://flows/plan_driven.toml".to_owned(),
+            params: std::collections::BTreeMap::from([
+                ("goal_file".to_owned(), "GOAL.md".to_owned()),
+                ("derived_file".to_owned(), "plan.toml".to_owned()),
+                ("specs_dir".to_owned(), "specs".to_owned()),
+                ("journal_file".to_owned(), "journal.txt".to_owned()),
+                ("archive_prefix".to_owned(), "goal_rebuild".to_owned()),
+            ]),
+            hidden: false,
+            edit_path: Some("GOAL.md".to_owned()),
+        }],
+        Some(ScaffoldId::TaskDriven) => vec![TargetEntrypoint::Flow {
+            id: "main".to_owned(),
+            flow: "builtin://flows/task_driven.toml".to_owned(),
+            params: std::collections::BTreeMap::from([
+                ("goal_file".to_owned(), "GOAL.md".to_owned()),
+                ("derived_file".to_owned(), "progress.toml".to_owned()),
+                ("journal_file".to_owned(), "journal.txt".to_owned()),
+                ("archive_prefix".to_owned(), "task_rebuild".to_owned()),
+            ]),
+            hidden: false,
+            edit_path: Some("GOAL.md".to_owned()),
+        }],
+        _ => Vec::new(),
+    }
+}
+
+fn resolved_default_entrypoint(config: &TargetConfig) -> Option<String> {
+    if let Some(default_entrypoint) = &config.default_entrypoint {
+        return Some(default_entrypoint.clone());
+    }
+
+    if let Some(entrypoint) = config.entrypoints.first() {
+        return Some(entrypoint.id().to_owned());
+    }
+
+    if config.mode.is_some() {
+        return Some("main".to_owned());
+    }
+
+    None
+}
+
+fn resolved_flow_entrypoints(config: &TargetConfig) -> Vec<String> {
+    if !config.entrypoints.is_empty() {
+        return config
+            .entrypoints
+            .iter()
+            .filter(|entrypoint| entrypoint.kind() == EntrypointKind::Flow && !entrypoint.hidden())
+            .map(|entrypoint| entrypoint.id().to_owned())
+            .collect();
+    }
+
+    match config.mode {
+        Some(WorkflowMode::TaskDriven | WorkflowMode::PlanDriven) => vec!["main".to_owned()],
+        None => Vec::new(),
     }
 }
 

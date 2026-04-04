@@ -26,6 +26,7 @@ pub enum RunnerStreamEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractiveSessionInvocation {
+    pub session_name: String,
     pub initial_prompt: String,
     pub project_dir: Utf8PathBuf,
     pub target_dir: Utf8PathBuf,
@@ -65,7 +66,7 @@ impl TemplateContext {
             project_dir: invocation.project_dir.clone(),
             target_dir: invocation.target_dir.clone(),
             prompt_path: invocation.goal_path.clone(),
-            prompt_name: "workflow_goal_interview".to_owned(),
+            prompt_name: invocation.session_name.clone(),
             goal_path: Some(invocation.goal_path.clone()),
         }
     }
@@ -80,6 +81,16 @@ pub trait RunnerAdapter: Send + Sync {
         control: &RunControl,
         stream: Option<UnboundedSender<RunnerStreamEvent>>,
     ) -> Result<RunnerResult>;
+
+    fn run_interactive_session(
+        &self,
+        _config: &RunnerConfig,
+        _invocation: &InteractiveSessionInvocation,
+    ) -> Result<InteractiveSessionOutcome> {
+        Err(anyhow!(
+            "interactive sessions are not supported by this runner"
+        ))
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -207,6 +218,14 @@ impl RunnerAdapter for CommandRunner {
             output: output_buffer,
             exit_code,
         })
+    }
+
+    fn run_interactive_session(
+        &self,
+        config: &RunnerConfig,
+        invocation: &InteractiveSessionInvocation,
+    ) -> Result<InteractiveSessionOutcome> {
+        CommandRunner::run_interactive_session(self, config, invocation)
     }
 }
 
@@ -646,6 +665,7 @@ mod tests {
     #[test]
     fn interactive_context_exposes_goal_path() {
         let context = TemplateContext::from_interactive(&InteractiveSessionInvocation {
+            session_name: "workflow_goal_interview".to_owned(),
             initial_prompt: "hello".to_owned(),
             project_dir: Utf8PathBuf::from("/tmp/project"),
             target_dir: Utf8PathBuf::from("/tmp/project/.ralph/targets/demo"),

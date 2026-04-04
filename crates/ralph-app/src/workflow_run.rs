@@ -40,18 +40,85 @@ where
 {
     pub fn workflow_status(&self, target: &str) -> Result<Option<WorkflowStatus>> {
         let target_config = self.store.read_target_config(target)?;
+        let target_summary = self.store.load_target(target)?;
         let target_dir = self.store.target_paths(target)?.dir;
         match target_config.mode {
-            Some(WorkflowMode::PlanDriven) => Ok(Some(plan_driven_workflow_status(
-                &target_config,
-                &plan_driven_hashes(&self.store, &target_dir)?,
-                &target_dir,
-            ))),
-            Some(WorkflowMode::TaskDriven) => Ok(Some(task_driven_workflow_status(
-                &target_config,
-                &task_driven_hashes(&self.store, &target_dir)?,
-                &target_dir,
-            ))),
+            Some(WorkflowMode::PlanDriven) => {
+                if let Some(runtime) = &target_config.runtime {
+                    let hashes = plan_driven_hashes(&self.store, &target_dir)?;
+                    let derived_state = if !target_dir.join("plan.toml").exists()
+                        || !runtime.vars.contains_key("goal_hash")
+                    {
+                        crate::WorkflowDerivedState::Missing
+                    } else if runtime.vars.get("goal_hash") != Some(&hashes.goal_hash) {
+                        crate::WorkflowDerivedState::Stale
+                    } else {
+                        crate::WorkflowDerivedState::Fresh
+                    };
+                    let run_advice = match derived_state {
+                        crate::WorkflowDerivedState::Missing => WorkflowRunAdvice::Rebase,
+                        crate::WorkflowDerivedState::Stale => WorkflowRunAdvice::Choose,
+                        crate::WorkflowDerivedState::Fresh => {
+                            if runtime.vars.get("derived_hash")
+                                != crate::engine::hash_optional_file(&target_dir.join("plan.toml"))?
+                                    .as_ref()
+                            {
+                                WorkflowRunAdvice::Build
+                            } else {
+                                WorkflowRunAdvice::Build
+                            }
+                        }
+                    };
+                    return Ok(Some(WorkflowStatus {
+                        kind: crate::WorkflowKind::PlanDriven,
+                        derived_state,
+                        run_advice,
+                    }));
+                }
+                Ok(Some(plan_driven_workflow_status(
+                    &target_config,
+                    &plan_driven_hashes(&self.store, &target_dir)?,
+                    &target_dir,
+                )))
+            }
+            Some(WorkflowMode::TaskDriven) => {
+                if let Some(runtime) = &target_config.runtime {
+                    let hashes = task_driven_hashes(&self.store, &target_dir)?;
+                    let derived_state = if !target_dir.join(TASK_DRIVEN_PROGRESS_FILE).exists()
+                        || !runtime.vars.contains_key("goal_hash")
+                    {
+                        crate::WorkflowDerivedState::Missing
+                    } else if runtime.vars.get("goal_hash") != Some(&hashes.goal_hash) {
+                        crate::WorkflowDerivedState::Stale
+                    } else {
+                        crate::WorkflowDerivedState::Fresh
+                    };
+                    let current_progress_hash = crate::engine::hash_optional_file(
+                        &target_dir.join(TASK_DRIVEN_PROGRESS_FILE),
+                    )?;
+                    let run_advice = match derived_state {
+                        crate::WorkflowDerivedState::Missing => WorkflowRunAdvice::Rebase,
+                        crate::WorkflowDerivedState::Stale => WorkflowRunAdvice::Choose,
+                        crate::WorkflowDerivedState::Fresh => {
+                            if runtime.vars.get("derived_hash") != current_progress_hash.as_ref() {
+                                WorkflowRunAdvice::Build
+                            } else {
+                                WorkflowRunAdvice::NoWork
+                            }
+                        }
+                    };
+                    return Ok(Some(WorkflowStatus {
+                        kind: crate::WorkflowKind::TaskDriven,
+                        derived_state,
+                        run_advice,
+                    }));
+                }
+                Ok(Some(task_driven_workflow_status(
+                    &target_config,
+                    &task_driven_hashes(&self.store, &target_dir)?,
+                    &target_dir,
+                )))
+            }
             None => Ok(None),
         }
     }
@@ -66,40 +133,12 @@ where
     where
         D: RunDelegate,
     {
-        let target_config = self.store.read_target_config(target)?;
-        match target_config.mode {
-            Some(WorkflowMode::PlanDriven) => {
-                self.run_plan_driven_target_with_control(
-                    target,
-                    None,
-                    target_config,
-                    control,
-                    delegate,
-                    match action {
-                        WorkflowAction::Build => WorkflowRunMode::Build,
-                        WorkflowAction::Rebase => WorkflowRunMode::Rebase,
-                    },
-                )
-                .await
-            }
-            Some(WorkflowMode::TaskDriven) => {
-                self.run_task_driven_target_with_control(
-                    target,
-                    None,
-                    target_config,
-                    control,
-                    delegate,
-                    match action {
-                        WorkflowAction::Build => WorkflowRunMode::Build,
-                        WorkflowAction::Rebase => WorkflowRunMode::Rebase,
-                    },
-                )
-                .await
-            }
-            None => Err(anyhow!(
-                "target '{target}' does not use a hidden workflow and has no workflow actions"
-            )),
-        }
+        let action_id = match action {
+            WorkflowAction::Build => "build",
+            WorkflowAction::Rebase => "rebase",
+        };
+        self.run_target_with_options(target, None, None, Some(action_id), control, delegate)
+            .await
     }
 
     pub(crate) async fn run_plan_driven_target_with_control<D>(

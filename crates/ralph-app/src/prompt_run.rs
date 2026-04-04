@@ -21,6 +21,10 @@ impl<R> RalphApp<R>
 where
     R: RunnerAdapter,
 {
+    pub(crate) fn prepared_prompt_name<'a>(&self, prepared: &'a PreparedPromptRun) -> &'a str {
+        &prepared.prompt_name
+    }
+
     pub(crate) fn prepare_prompt_run(
         &self,
         prompt_path: &Utf8Path,
@@ -218,6 +222,20 @@ where
             .agent_definition(&agent_id)
             .ok_or_else(|| anyhow!("agent '{}' is not defined", agent_id))?;
         Ok(agent.non_interactive.clone())
+    }
+
+    pub(crate) fn interactive_runner_config_for(
+        &self,
+        control: &RunControl,
+    ) -> Result<RunnerConfig> {
+        let agent_id = control
+            .agent_id()
+            .unwrap_or_else(|| self.config.agent_id().to_owned());
+        let agent = self
+            .config
+            .agent_definition(&agent_id)
+            .ok_or_else(|| anyhow!("agent '{}' is not defined", agent_id))?;
+        Ok(agent.interactive.clone())
     }
 
     async fn execute_runner<D>(

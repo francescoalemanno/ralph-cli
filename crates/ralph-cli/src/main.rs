@@ -97,7 +97,14 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
             match resolve_target_mode(args.target.as_deref(), args.prompt.as_deref())? {
                 TargetMode::Target(target) => {
                     let summary = app
-                        .run_target(target, args.prompt.as_deref(), &mut delegate)
+                        .run_target_with_options(
+                            target,
+                            args.prompt.as_deref(),
+                            args.entrypoint.as_deref(),
+                            args.action.as_deref(),
+                            ralph_core::RunControl::new(),
+                            &mut delegate,
+                        )
                         .await?;
                     print_target_summary(output, &summary)
                 }
@@ -111,6 +118,10 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
                     )
                 }
             }
+        }
+        Commands::WorkflowCreator => {
+            let app = RalphApp::load(project_dir)?;
+            app.run_workflow_creator()
         }
         Commands::Ls => {
             let app = RalphApp::load(project_dir)?;

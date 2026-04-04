@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU8, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
 use camino::Utf8PathBuf;
@@ -57,6 +60,85 @@ pub enum WorkflowMode {
     PlanDriven,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntrypointKind {
+    Prompt,
+    Flow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TargetEntrypoint {
+    Prompt {
+        id: String,
+        path: String,
+        #[serde(default)]
+        hidden: bool,
+        #[serde(default)]
+        edit_path: Option<String>,
+    },
+    Flow {
+        id: String,
+        flow: String,
+        #[serde(default)]
+        params: BTreeMap<String, String>,
+        #[serde(default)]
+        hidden: bool,
+        #[serde(default)]
+        edit_path: Option<String>,
+    },
+}
+
+impl TargetEntrypoint {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Prompt { id, .. } | Self::Flow { id, .. } => id,
+        }
+    }
+
+    pub fn kind(&self) -> EntrypointKind {
+        match self {
+            Self::Prompt { .. } => EntrypointKind::Prompt,
+            Self::Flow { .. } => EntrypointKind::Flow,
+        }
+    }
+
+    pub fn hidden(&self) -> bool {
+        match self {
+            Self::Prompt { hidden, .. } | Self::Flow { hidden, .. } => *hidden,
+        }
+    }
+
+    pub fn edit_path(&self) -> Option<&str> {
+        match self {
+            Self::Prompt { edit_path, .. } | Self::Flow { edit_path, .. } => edit_path.as_deref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FlowRuntimeState {
+    #[serde(default)]
+    pub active_entrypoint: Option<String>,
+    #[serde(default)]
+    pub current_node: Option<String>,
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+    #[serde(default)]
+    pub last_signal: Option<String>,
+    #[serde(default)]
+    pub last_note: Option<String>,
+    #[serde(default)]
+    pub inflight: Option<FlowRuntimeInflight>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowRuntimeInflight {
+    pub node_id: String,
+    pub started_at: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanDrivenPhase {
@@ -94,6 +176,12 @@ pub struct TargetConfig {
     #[serde(default)]
     pub scaffold: Option<ScaffoldId>,
     #[serde(default)]
+    pub default_entrypoint: Option<String>,
+    #[serde(default)]
+    pub entrypoints: Vec<TargetEntrypoint>,
+    #[serde(default)]
+    pub runtime: Option<FlowRuntimeState>,
+    #[serde(default)]
     pub mode: Option<WorkflowMode>,
     #[serde(default)]
     pub workflow: Option<PlanDrivenWorkflowState>,
@@ -111,10 +199,13 @@ pub struct TargetConfig {
 
 impl TargetConfig {
     pub fn uses_hidden_workflow(&self) -> bool {
-        matches!(
-            self.mode,
-            Some(WorkflowMode::TaskDriven | WorkflowMode::PlanDriven)
-        )
+        self.entrypoints
+            .iter()
+            .any(|entrypoint| entrypoint.kind() == EntrypointKind::Flow)
+            || matches!(
+                self.mode,
+                Some(WorkflowMode::TaskDriven | WorkflowMode::PlanDriven)
+            )
     }
 }
 
@@ -144,6 +235,10 @@ pub struct TargetSummary {
     pub prompt_files: Vec<PromptFile>,
     pub files: Vec<TargetFile>,
     pub scaffold: Option<ScaffoldId>,
+    #[serde(default)]
+    pub default_entrypoint: Option<String>,
+    #[serde(default)]
+    pub flow_entrypoints: Vec<String>,
     pub mode: Option<WorkflowMode>,
     pub created_at: Option<u64>,
     pub last_prompt: Option<String>,
@@ -152,10 +247,11 @@ pub struct TargetSummary {
 
 impl TargetSummary {
     pub fn uses_hidden_workflow(&self) -> bool {
-        matches!(
-            self.mode,
-            Some(WorkflowMode::TaskDriven | WorkflowMode::PlanDriven)
-        )
+        !self.flow_entrypoints.is_empty()
+            || matches!(
+                self.mode,
+                Some(WorkflowMode::TaskDriven | WorkflowMode::PlanDriven)
+            )
     }
 }
 
@@ -289,6 +385,9 @@ mod tests {
         let config = TargetConfig {
             id: "demo".to_owned(),
             scaffold: None,
+            default_entrypoint: None,
+            entrypoints: Vec::new(),
+            runtime: None,
             mode: Some(WorkflowMode::PlanDriven),
             workflow: None,
             inflight: None,
@@ -303,6 +402,8 @@ mod tests {
             prompt_files: Vec::new(),
             files: Vec::new(),
             scaffold: None,
+            default_entrypoint: None,
+            flow_entrypoints: Vec::new(),
             mode: Some(WorkflowMode::TaskDriven),
             created_at: None,
             last_prompt: None,
