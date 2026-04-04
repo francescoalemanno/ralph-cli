@@ -14,7 +14,7 @@ use ralph_core::{
     TargetSummary,
 };
 use ralph_runner::CommandRunner;
-use workflow::GOAL_DRIVEN_GOAL_FILE;
+use workflow::PLAN_DRIVEN_GOAL_FILE;
 
 pub use console::ConsoleDelegate;
 pub use workflow::{
@@ -163,9 +163,9 @@ impl<R> RalphApp<R> {
 
         if config.uses_hidden_workflow() {
             return match requested_file {
-                None | Some(GOAL_DRIVEN_GOAL_FILE) => Ok(target_dir.join(GOAL_DRIVEN_GOAL_FILE)),
+                None | Some(PLAN_DRIVEN_GOAL_FILE) => Ok(target_dir.join(PLAN_DRIVEN_GOAL_FILE)),
                 Some(name) => Err(anyhow!(
-                    "workflow targets only expose {GOAL_DRIVEN_GOAL_FILE} for editing, got '{name}'"
+                    "workflow targets only expose {PLAN_DRIVEN_GOAL_FILE} for editing, got '{name}'"
                 )),
             };
         }

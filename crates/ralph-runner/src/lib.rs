@@ -623,8 +623,8 @@ mod tests {
         assert_eq!(super::invocation_mode("prompt_main.md"), "prompt_main");
         assert_eq!(super::invocation_mode("0_plan.md"), "0_plan");
         assert_eq!(
-            super::invocation_mode("goal_driven_build"),
-            "goal_driven_build"
+            super::invocation_mode("plan_driven_build"),
+            "plan_driven_build"
         );
     }
 

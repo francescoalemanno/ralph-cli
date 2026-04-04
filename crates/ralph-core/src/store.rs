@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::{
-    GoalDrivenWorkflowState, LastRunStatus, PromptFile, ScaffoldId, TargetConfig, TargetFile,
+    LastRunStatus, PlanDrivenWorkflowState, PromptFile, ScaffoldId, TargetConfig, TargetFile,
     TargetFileContents, TargetPaths, TargetReview, TargetSummary, WorkflowMode, atomic_write,
     scaffold::materialize_target_scaffold,
 };
@@ -37,8 +37,8 @@ impl TargetStore {
 
     fn new_target_config(&self, target_id: &str, scaffold: Option<ScaffoldId>) -> TargetConfig {
         let mode = match scaffold {
-            Some(ScaffoldId::TaskBased) => Some(WorkflowMode::TaskBased),
-            Some(ScaffoldId::GoalDriven) => Some(WorkflowMode::GoalDriven),
+            Some(ScaffoldId::TaskDriven) => Some(WorkflowMode::TaskDriven),
+            Some(ScaffoldId::PlanDriven) => Some(WorkflowMode::PlanDriven),
             _ => None,
         };
         TargetConfig {
@@ -309,26 +309,26 @@ fn current_unix_timestamp() -> u64 {
 
 fn is_target_prompt_file(config: &TargetConfig, name: &str) -> bool {
     match config.mode {
-        Some(WorkflowMode::TaskBased) => false,
-        Some(WorkflowMode::GoalDriven) => false,
+        Some(WorkflowMode::TaskDriven) => false,
+        Some(WorkflowMode::PlanDriven) => false,
         None => is_prompt_file_name(name),
     }
 }
 
-fn workflow_state_for_mode(mode: WorkflowMode) -> GoalDrivenWorkflowState {
-    GoalDrivenWorkflowState {
+fn workflow_state_for_mode(mode: WorkflowMode) -> PlanDrivenWorkflowState {
+    PlanDrivenWorkflowState {
         phase: match mode {
-            WorkflowMode::TaskBased => crate::GoalDrivenPhase::Build,
-            WorkflowMode::GoalDriven => crate::GoalDrivenPhase::Plan,
+            WorkflowMode::TaskDriven => crate::PlanDrivenPhase::Build,
+            WorkflowMode::PlanDriven => crate::PlanDrivenPhase::Plan,
         },
-        ..GoalDrivenWorkflowState::default()
+        ..PlanDrivenWorkflowState::default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{TargetStore, is_prompt_file_name};
-    use crate::{GoalDrivenPhase, LastRunStatus, ScaffoldId, WorkflowMode};
+    use crate::{LastRunStatus, PlanDrivenPhase, ScaffoldId, WorkflowMode};
 
     #[test]
     fn prompt_file_discovery_accepts_any_target_local_md_file() {
@@ -397,18 +397,18 @@ mod tests {
     }
 
     #[test]
-    fn goal_driven_scaffold_creates_goal_file_and_state() {
+    fn plan_driven_scaffold_creates_goal_file_and_state() {
         let temp = tempfile::tempdir().unwrap();
         let store = TargetStore::new(
             camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
         );
 
         let summary = store
-            .create_target("demo", Some(ScaffoldId::GoalDriven))
+            .create_target("demo", Some(ScaffoldId::PlanDriven))
             .unwrap();
 
         assert!(summary.prompt_files.is_empty());
-        assert_eq!(summary.mode, Some(WorkflowMode::GoalDriven));
+        assert_eq!(summary.mode, Some(WorkflowMode::PlanDriven));
         assert!(summary.files.iter().any(|file| file.name == "GOAL.md"));
         assert!(summary.files.iter().all(|file| !file.is_prompt));
         assert!(
@@ -421,26 +421,26 @@ mod tests {
         );
 
         let config = store.read_target_config("demo").unwrap();
-        assert_eq!(config.mode, Some(WorkflowMode::GoalDriven));
+        assert_eq!(config.mode, Some(WorkflowMode::PlanDriven));
         assert_eq!(
             config.workflow.as_ref().map(|workflow| workflow.phase),
-            Some(GoalDrivenPhase::Plan)
+            Some(PlanDrivenPhase::Plan)
         );
     }
 
     #[test]
-    fn task_based_scaffold_creates_goal_and_progress_files() {
+    fn task_driven_scaffold_creates_goal_and_progress_files() {
         let temp = tempfile::tempdir().unwrap();
         let store = TargetStore::new(
             camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
         );
 
         let summary = store
-            .create_target("demo", Some(ScaffoldId::TaskBased))
+            .create_target("demo", Some(ScaffoldId::TaskDriven))
             .unwrap();
 
         assert!(summary.prompt_files.is_empty());
-        assert_eq!(summary.mode, Some(WorkflowMode::TaskBased));
+        assert_eq!(summary.mode, Some(WorkflowMode::TaskDriven));
         assert!(summary.files.iter().any(|file| file.name == "GOAL.md"));
         assert!(
             summary
@@ -451,10 +451,10 @@ mod tests {
         assert!(summary.files.iter().all(|file| !file.is_prompt));
 
         let config = store.read_target_config("demo").unwrap();
-        assert_eq!(config.mode, Some(WorkflowMode::TaskBased));
+        assert_eq!(config.mode, Some(WorkflowMode::TaskDriven));
         assert_eq!(
             config.workflow.as_ref().map(|workflow| workflow.phase),
-            Some(GoalDrivenPhase::Build)
+            Some(PlanDrivenPhase::Build)
         );
         let progress = std::fs::read_to_string(
             store

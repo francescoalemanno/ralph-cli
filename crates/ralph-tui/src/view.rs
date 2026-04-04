@@ -590,7 +590,7 @@ impl TuiApp {
         let widget = Paragraph::new(text)
             .block(self.panel_block().title(self.title_line(
                 "New Target",
-                "Task-based, goal-driven, single-prompt, or plan-build scaffold",
+                "Task-driven, plan-driven, single-prompt, or plan-build scaffold",
             )))
             .style(
                 Style::default()
@@ -1072,8 +1072,8 @@ mod tests {
         let (_temp, project_dir) = temp_project_dir();
         let app = RalphApp::load(project_dir)?;
         app.create_target("prompt", Some(ScaffoldId::SinglePrompt))?;
-        app.create_target("tasks", Some(ScaffoldId::TaskBased))?;
-        app.create_target("workflow", Some(ScaffoldId::GoalDriven))?;
+        app.create_target("tasks", Some(ScaffoldId::TaskDriven))?;
+        app.create_target("workflow", Some(ScaffoldId::PlanDriven))?;
 
         let runtime = Runtime::new()?;
         let prompt_tui = TuiApp::new(

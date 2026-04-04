@@ -4,14 +4,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use ralph_core::{GoalDrivenPhase, GoalDrivenWorkflowState, LastRunStatus, WorkflowMode};
+use ralph_core::{LastRunStatus, PlanDrivenPhase, PlanDrivenWorkflowState, WorkflowMode};
 use ralph_runner::{CommandRunner, InteractiveSessionInvocation};
 
 use crate::{
     RalphApp,
     workflow::{
-        GOAL_DRIVEN_GOAL_FILE, GOAL_DRIVEN_PLAN_FILE, GOAL_DRIVEN_SPECS_DIR,
-        TASK_BASED_PROGRESS_FILE, WORKFLOW_JOURNAL_FILE, workflow_goal_interview_prompt,
+        PLAN_DRIVEN_GOAL_FILE, PLAN_DRIVEN_PLAN_FILE, PLAN_DRIVEN_SPECS_DIR,
+        TASK_DRIVEN_PROGRESS_FILE, WORKFLOW_JOURNAL_FILE, workflow_goal_interview_prompt,
     },
 };
 
@@ -22,31 +22,31 @@ pub struct GoalInterviewOutcome {
 }
 
 impl<R> RalphApp<R> {
-    pub fn rebuild_goal_driven_from_scratch(&self, target: &str) -> Result<()> {
+    pub fn rebuild_plan_driven_from_scratch(&self, target: &str) -> Result<()> {
         let mut target_config = self.store.read_target_config(target)?;
-        if target_config.mode != Some(WorkflowMode::GoalDriven) {
+        if target_config.mode != Some(WorkflowMode::PlanDriven) {
             return Err(anyhow!(
-                "scratch rebuild is only available for goal-driven targets"
+                "scratch rebuild is only available for plan-driven targets"
             ));
         }
 
         let target_dir = self.store.target_paths(target)?.dir;
         archive_workflow_artifacts(
             &target_dir,
-            &[GOAL_DRIVEN_PLAN_FILE, WORKFLOW_JOURNAL_FILE],
-            &[GOAL_DRIVEN_SPECS_DIR],
+            &[PLAN_DRIVEN_PLAN_FILE, WORKFLOW_JOURNAL_FILE],
+            &[PLAN_DRIVEN_SPECS_DIR],
             "goal_rebuild",
         )?;
-        fs::create_dir_all(target_dir.join(GOAL_DRIVEN_SPECS_DIR)).with_context(|| {
+        fs::create_dir_all(target_dir.join(PLAN_DRIVEN_SPECS_DIR)).with_context(|| {
             format!(
                 "failed to recreate {}",
-                target_dir.join(GOAL_DRIVEN_SPECS_DIR)
+                target_dir.join(PLAN_DRIVEN_SPECS_DIR)
             )
         })?;
 
-        target_config.workflow = Some(GoalDrivenWorkflowState {
-            phase: GoalDrivenPhase::Plan,
-            ..GoalDrivenWorkflowState::default()
+        target_config.workflow = Some(PlanDrivenWorkflowState {
+            phase: PlanDrivenPhase::Plan,
+            ..PlanDrivenWorkflowState::default()
         });
         target_config.inflight = None;
         target_config.last_prompt = None;
@@ -54,25 +54,25 @@ impl<R> RalphApp<R> {
         self.store.write_target_config(&target_config)
     }
 
-    pub fn rebuild_task_based_from_scratch(&self, target: &str) -> Result<()> {
+    pub fn rebuild_task_driven_from_scratch(&self, target: &str) -> Result<()> {
         let mut target_config = self.store.read_target_config(target)?;
-        if target_config.mode != Some(WorkflowMode::TaskBased) {
+        if target_config.mode != Some(WorkflowMode::TaskDriven) {
             return Err(anyhow!(
-                "scratch rebuild is only available for task-based targets"
+                "scratch rebuild is only available for task-driven targets"
             ));
         }
 
         let target_dir = self.store.target_paths(target)?.dir;
         archive_workflow_artifacts(
             &target_dir,
-            &[TASK_BASED_PROGRESS_FILE, WORKFLOW_JOURNAL_FILE],
+            &[TASK_DRIVEN_PROGRESS_FILE, WORKFLOW_JOURNAL_FILE],
             &[],
             "task_rebuild",
         )?;
 
-        target_config.workflow = Some(GoalDrivenWorkflowState {
-            phase: GoalDrivenPhase::Plan,
-            ..GoalDrivenWorkflowState::default()
+        target_config.workflow = Some(PlanDrivenWorkflowState {
+            phase: PlanDrivenPhase::Plan,
+            ..PlanDrivenWorkflowState::default()
         });
         target_config.inflight = None;
         target_config.last_prompt = None;
@@ -91,7 +91,7 @@ impl RalphApp<CommandRunner> {
         }
 
         let target_dir = self.store.target_paths(target)?.dir;
-        let goal_path = target_dir.join(GOAL_DRIVEN_GOAL_FILE);
+        let goal_path = target_dir.join(PLAN_DRIVEN_GOAL_FILE);
         let before = self
             .store
             .read_file(&goal_path)
@@ -166,17 +166,17 @@ fn archive_stamp() -> u128 {
 mod tests {
     use anyhow::Result;
     use camino::Utf8PathBuf;
-    use ralph_core::{AppConfig, GoalDrivenPhase, ScaffoldId};
+    use ralph_core::{AppConfig, PlanDrivenPhase, ScaffoldId};
     use ralph_runner::CommandRunner;
 
     use crate::RalphApp;
 
     #[test]
-    fn rebuild_goal_driven_from_scratch_archives_plan_artifacts() -> Result<()> {
+    fn rebuild_plan_driven_from_scratch_archives_plan_artifacts() -> Result<()> {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let app = RalphApp::new(project_dir.clone(), AppConfig::default(), CommandRunner);
-        app.create_target("demo", Some(ScaffoldId::GoalDriven))?;
+        app.create_target("demo", Some(ScaffoldId::PlanDriven))?;
 
         let target_dir = project_dir.join(".ralph/targets/demo");
         std::fs::write(target_dir.join("plan.toml"), "version = 1\n")?;
@@ -184,7 +184,7 @@ mod tests {
         std::fs::create_dir_all(target_dir.join("specs/nested"))?;
         std::fs::write(target_dir.join("specs/nested/api.md"), "# API\n")?;
 
-        app.rebuild_goal_driven_from_scratch("demo")?;
+        app.rebuild_plan_driven_from_scratch("demo")?;
 
         assert!(!target_dir.join("plan.toml").exists());
         assert!(!target_dir.join("journal.txt").exists());
@@ -197,23 +197,23 @@ mod tests {
                 .workflow
                 .as_ref()
                 .map(|workflow| workflow.phase),
-            Some(GoalDrivenPhase::Plan)
+            Some(PlanDrivenPhase::Plan)
         );
         Ok(())
     }
 
     #[test]
-    fn rebuild_task_based_from_scratch_archives_progress_artifacts() -> Result<()> {
+    fn rebuild_task_driven_from_scratch_archives_progress_artifacts() -> Result<()> {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let app = RalphApp::new(project_dir.clone(), AppConfig::default(), CommandRunner);
-        app.create_target("demo", Some(ScaffoldId::TaskBased))?;
+        app.create_target("demo", Some(ScaffoldId::TaskDriven))?;
 
         let target_dir = project_dir.join(".ralph/targets/demo");
         std::fs::write(target_dir.join("progress.toml"), "version = 1\n")?;
         std::fs::write(target_dir.join("journal.txt"), "notes\n")?;
 
-        app.rebuild_task_based_from_scratch("demo")?;
+        app.rebuild_task_driven_from_scratch("demo")?;
 
         assert!(!target_dir.join("progress.toml").exists());
         assert!(!target_dir.join("journal.txt").exists());
@@ -224,7 +224,7 @@ mod tests {
                 .workflow
                 .as_ref()
                 .map(|workflow| workflow.phase),
-            Some(GoalDrivenPhase::Plan)
+            Some(PlanDrivenPhase::Plan)
         );
         Ok(())
     }

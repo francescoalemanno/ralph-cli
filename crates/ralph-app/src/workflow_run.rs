@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use camino::Utf8Path;
 use ralph_core::{
-    GoalDrivenInflight, GoalDrivenPhase, GoalDrivenWorkflowState, LastRunStatus, RunControl,
+    LastRunStatus, PlanDrivenInflight, PlanDrivenPhase, PlanDrivenWorkflowState, RunControl,
     TargetConfig, TargetSummary, WorkflowMode,
 };
 use ralph_runner::RunnerAdapter;
@@ -9,12 +9,12 @@ use ralph_runner::RunnerAdapter;
 use crate::{
     RalphApp, RunDelegate, RunEvent, WorkflowAction, WorkflowRunAdvice, WorkflowStatus,
     workflow::{
-        GOAL_DRIVEN_BUILD_PROMPT, GOAL_DRIVEN_GOAL_FILE, GOAL_DRIVEN_PAUSED_PROMPT,
-        GOAL_DRIVEN_PLAN_PROMPT, GoalDrivenAction, TASK_BASED_BUILD_PROMPT,
-        TASK_BASED_PAUSED_PROMPT, TASK_BASED_PROGRESS_FILE, TASK_BASED_REBASE_PROMPT,
-        TaskBasedAction, current_unix_timestamp, goal_driven_build_prompt, goal_driven_hashes,
-        goal_driven_plan_prompt, goal_driven_workflow_status, task_based_build_prompt,
-        task_based_hashes, task_based_rebase_prompt, task_based_workflow_status,
+        PLAN_DRIVEN_BUILD_PROMPT, PLAN_DRIVEN_GOAL_FILE, PLAN_DRIVEN_PAUSED_PROMPT,
+        PLAN_DRIVEN_PLAN_PROMPT, PlanDrivenAction, TASK_DRIVEN_BUILD_PROMPT,
+        TASK_DRIVEN_PAUSED_PROMPT, TASK_DRIVEN_PROGRESS_FILE, TASK_DRIVEN_REBASE_PROMPT,
+        TaskDrivenAction, current_unix_timestamp, plan_driven_build_prompt, plan_driven_hashes,
+        plan_driven_plan_prompt, plan_driven_workflow_status, task_driven_build_prompt,
+        task_driven_hashes, task_driven_rebase_prompt, task_driven_workflow_status,
     },
 };
 
@@ -31,7 +31,7 @@ struct WorkflowRunRequest {
     prompt_text: String,
     completed_summary: String,
     max_iterations_summary: String,
-    inflight_phase: GoalDrivenPhase,
+    inflight_phase: PlanDrivenPhase,
 }
 
 impl<R> RalphApp<R>
@@ -42,14 +42,14 @@ where
         let target_config = self.store.read_target_config(target)?;
         let target_dir = self.store.target_paths(target)?.dir;
         match target_config.mode {
-            Some(WorkflowMode::GoalDriven) => Ok(Some(goal_driven_workflow_status(
+            Some(WorkflowMode::PlanDriven) => Ok(Some(plan_driven_workflow_status(
                 &target_config,
-                &goal_driven_hashes(&self.store, &target_dir)?,
+                &plan_driven_hashes(&self.store, &target_dir)?,
                 &target_dir,
             ))),
-            Some(WorkflowMode::TaskBased) => Ok(Some(task_based_workflow_status(
+            Some(WorkflowMode::TaskDriven) => Ok(Some(task_driven_workflow_status(
                 &target_config,
-                &task_based_hashes(&self.store, &target_dir)?,
+                &task_driven_hashes(&self.store, &target_dir)?,
                 &target_dir,
             ))),
             None => Ok(None),
@@ -68,8 +68,8 @@ where
     {
         let target_config = self.store.read_target_config(target)?;
         match target_config.mode {
-            Some(WorkflowMode::GoalDriven) => {
-                self.run_goal_driven_target_with_control(
+            Some(WorkflowMode::PlanDriven) => {
+                self.run_plan_driven_target_with_control(
                     target,
                     None,
                     target_config,
@@ -82,8 +82,8 @@ where
                 )
                 .await
             }
-            Some(WorkflowMode::TaskBased) => {
-                self.run_task_based_target_with_control(
+            Some(WorkflowMode::TaskDriven) => {
+                self.run_task_driven_target_with_control(
                     target,
                     None,
                     target_config,
@@ -102,7 +102,7 @@ where
         }
     }
 
-    pub(crate) async fn run_goal_driven_target_with_control<D>(
+    pub(crate) async fn run_plan_driven_target_with_control<D>(
         &self,
         target: &str,
         prompt_name: Option<&str>,
@@ -116,23 +116,23 @@ where
     {
         if let Some(prompt_name) = prompt_name {
             return Err(anyhow!(
-                "goal_driven targets select plan/build internally; remove --prompt ('{prompt_name}')"
+                "plan-driven targets select plan/build internally; remove --prompt ('{prompt_name}')"
             ));
         }
 
         let target_dir = self.store.target_paths(target)?.dir;
-        let hashes = goal_driven_hashes(&self.store, &target_dir)?;
-        let workflow_status = goal_driven_workflow_status(&target_config, &hashes, &target_dir);
+        let hashes = plan_driven_hashes(&self.store, &target_dir)?;
+        let workflow_status = plan_driven_workflow_status(&target_config, &hashes, &target_dir);
         let action = match mode {
             WorkflowRunMode::Smart => match workflow_status.run_advice {
-                WorkflowRunAdvice::Rebase => GoalDrivenAction::Plan,
-                WorkflowRunAdvice::Build => GoalDrivenAction::Build,
+                WorkflowRunAdvice::Rebase => PlanDrivenAction::Plan,
+                WorkflowRunAdvice::Build => PlanDrivenAction::Build,
                 WorkflowRunAdvice::Choose => {
                     return self
                         .finish_paused_workflow_target(
                             target,
                             &mut target_config,
-                            GOAL_DRIVEN_PAUSED_PROMPT,
+                            PLAN_DRIVEN_PAUSED_PROMPT,
                             format!(
                                 "{target} has a stale plan derived from an older GOAL; choose B to build the current plan, G to rebase the plan, X to rebuild from scratch, or I to refine GOAL."
                             ),
@@ -148,7 +148,7 @@ where
                         .finish_paused_workflow_target(
                             target,
                             &mut target_config,
-                            GOAL_DRIVEN_PAUSED_PROMPT,
+                            PLAN_DRIVEN_PAUSED_PROMPT,
                             format!(
                                 "{target} has no current plan; use G to create or rebase the plan, or X to rebuild from scratch."
                             ),
@@ -156,25 +156,25 @@ where
                         )
                         .await;
                 }
-                GoalDrivenAction::Build
+                PlanDrivenAction::Build
             }
-            WorkflowRunMode::Rebase => GoalDrivenAction::Plan,
+            WorkflowRunMode::Rebase => PlanDrivenAction::Plan,
         };
 
         let request = match action {
-            GoalDrivenAction::Plan => WorkflowRunRequest {
-                prompt_name: GOAL_DRIVEN_PLAN_PROMPT.to_owned(),
-                prompt_text: goal_driven_plan_prompt(),
+            PlanDrivenAction::Plan => WorkflowRunRequest {
+                prompt_name: PLAN_DRIVEN_PLAN_PROMPT.to_owned(),
+                prompt_text: plan_driven_plan_prompt(),
                 completed_summary: format!("Planning complete for {}", target),
                 max_iterations_summary: format!("Reached max iterations while planning {}", target),
-                inflight_phase: GoalDrivenPhase::Plan,
+                inflight_phase: PlanDrivenPhase::Plan,
             },
-            GoalDrivenAction::Build => WorkflowRunRequest {
-                prompt_name: GOAL_DRIVEN_BUILD_PROMPT.to_owned(),
-                prompt_text: goal_driven_build_prompt(),
+            PlanDrivenAction::Build => WorkflowRunRequest {
+                prompt_name: PLAN_DRIVEN_BUILD_PROMPT.to_owned(),
+                prompt_text: plan_driven_build_prompt(),
                 completed_summary: format!("Build complete for {}", target),
                 max_iterations_summary: format!("Reached max iterations while building {}", target),
-                inflight_phase: GoalDrivenPhase::Build,
+                inflight_phase: PlanDrivenPhase::Build,
             },
         };
 
@@ -196,19 +196,19 @@ where
             .await?;
 
         if status == LastRunStatus::Completed {
-            let after_hashes = goal_driven_hashes(&self.store, &target_dir)?;
+            let after_hashes = plan_driven_hashes(&self.store, &target_dir)?;
             let workflow = target_config
                 .workflow
-                .get_or_insert_with(GoalDrivenWorkflowState::default);
+                .get_or_insert_with(PlanDrivenWorkflowState::default);
             workflow.last_content_hash = Some(after_hashes.content_hash);
             match action {
-                GoalDrivenAction::Plan => {
-                    workflow.phase = GoalDrivenPhase::Build;
+                PlanDrivenAction::Plan => {
+                    workflow.phase = PlanDrivenPhase::Build;
                     workflow.last_goal_hash = Some(after_hashes.goal_hash);
                     workflow.last_planned_at = Some(current_unix_timestamp());
                 }
-                GoalDrivenAction::Build => {
-                    workflow.phase = GoalDrivenPhase::Paused;
+                PlanDrivenAction::Build => {
+                    workflow.phase = PlanDrivenPhase::Paused;
                     workflow.last_built_at = Some(current_unix_timestamp());
                 }
             }
@@ -219,7 +219,7 @@ where
         self.store.load_target(target)
     }
 
-    pub(crate) async fn run_task_based_target_with_control<D>(
+    pub(crate) async fn run_task_driven_target_with_control<D>(
         &self,
         target: &str,
         prompt_name: Option<&str>,
@@ -233,23 +233,23 @@ where
     {
         if let Some(prompt_name) = prompt_name {
             return Err(anyhow!(
-                "task_based targets select the workflow action internally; remove --prompt ('{prompt_name}')"
+                "task-driven targets select the workflow action internally; remove --prompt ('{prompt_name}')"
             ));
         }
 
         let target_dir = self.store.target_paths(target)?.dir;
-        let hashes = task_based_hashes(&self.store, &target_dir)?;
-        let workflow_status = task_based_workflow_status(&target_config, &hashes, &target_dir);
+        let hashes = task_driven_hashes(&self.store, &target_dir)?;
+        let workflow_status = task_driven_workflow_status(&target_config, &hashes, &target_dir);
         let action = match mode {
             WorkflowRunMode::Smart => match workflow_status.run_advice {
-                WorkflowRunAdvice::Rebase => TaskBasedAction::Rebase,
-                WorkflowRunAdvice::Build => TaskBasedAction::Build,
+                WorkflowRunAdvice::Rebase => TaskDrivenAction::Rebase,
+                WorkflowRunAdvice::Build => TaskDrivenAction::Build,
                 WorkflowRunAdvice::Choose => {
                     return self
                         .finish_paused_workflow_target(
                             target,
                             &mut target_config,
-                            TASK_BASED_PAUSED_PROMPT,
+                            TASK_DRIVEN_PAUSED_PROMPT,
                             format!(
                                 "{target} has a stale task backlog derived from an older GOAL; choose B to build the current backlog, G to rebase the backlog, X to rebuild from scratch, or I to refine GOAL."
                             ),
@@ -262,9 +262,9 @@ where
                         .finish_paused_workflow_target(
                             target,
                             &mut target_config,
-                            TASK_BASED_PAUSED_PROMPT,
+                            TASK_DRIVEN_PAUSED_PROMPT,
                             format!(
-                                "{target} is paused; edit {GOAL_DRIVEN_GOAL_FILE} or {TASK_BASED_PROGRESS_FILE} to resume work, or press B to continue the current backlog."
+                                "{target} is paused; edit {PLAN_DRIVEN_GOAL_FILE} or {TASK_DRIVEN_PROGRESS_FILE} to resume work, or press B to continue the current backlog."
                             ),
                             delegate,
                         )
@@ -277,7 +277,7 @@ where
                         .finish_paused_workflow_target(
                             target,
                             &mut target_config,
-                            TASK_BASED_PAUSED_PROMPT,
+                            TASK_DRIVEN_PAUSED_PROMPT,
                             format!(
                                 "{target} has no current task backlog; use G to create or rebase the backlog, or X to rebuild from scratch."
                             ),
@@ -285,28 +285,28 @@ where
                         )
                         .await;
                 }
-                TaskBasedAction::Build
+                TaskDrivenAction::Build
             }
-            WorkflowRunMode::Rebase => TaskBasedAction::Rebase,
+            WorkflowRunMode::Rebase => TaskDrivenAction::Rebase,
         };
 
         let request = match action {
-            TaskBasedAction::Rebase => WorkflowRunRequest {
-                prompt_name: TASK_BASED_REBASE_PROMPT.to_owned(),
-                prompt_text: task_based_rebase_prompt(),
+            TaskDrivenAction::Rebase => WorkflowRunRequest {
+                prompt_name: TASK_DRIVEN_REBASE_PROMPT.to_owned(),
+                prompt_text: task_driven_rebase_prompt(),
                 completed_summary: format!("Backlog rebase complete for {}", target),
                 max_iterations_summary: format!(
                     "Reached max iterations while rebasing task backlog {}",
                     target
                 ),
-                inflight_phase: GoalDrivenPhase::Plan,
+                inflight_phase: PlanDrivenPhase::Plan,
             },
-            TaskBasedAction::Build => WorkflowRunRequest {
-                prompt_name: TASK_BASED_BUILD_PROMPT.to_owned(),
-                prompt_text: task_based_build_prompt(),
+            TaskDrivenAction::Build => WorkflowRunRequest {
+                prompt_name: TASK_DRIVEN_BUILD_PROMPT.to_owned(),
+                prompt_text: task_driven_build_prompt(),
                 completed_summary: format!("Build complete for {}", target),
                 max_iterations_summary: format!("Reached max iterations while building {}", target),
-                inflight_phase: GoalDrivenPhase::Build,
+                inflight_phase: PlanDrivenPhase::Build,
             },
         };
 
@@ -328,19 +328,19 @@ where
             .await?;
 
         if status == LastRunStatus::Completed {
-            let after_hashes = task_based_hashes(&self.store, &target_dir)?;
+            let after_hashes = task_driven_hashes(&self.store, &target_dir)?;
             let workflow = target_config
                 .workflow
-                .get_or_insert_with(GoalDrivenWorkflowState::default);
+                .get_or_insert_with(PlanDrivenWorkflowState::default);
             workflow.last_content_hash = Some(after_hashes.content_hash);
             match action {
-                TaskBasedAction::Rebase => {
-                    workflow.phase = GoalDrivenPhase::Build;
+                TaskDrivenAction::Rebase => {
+                    workflow.phase = PlanDrivenPhase::Build;
                     workflow.last_goal_hash = Some(after_hashes.goal_hash);
                     workflow.last_planned_at = Some(current_unix_timestamp());
                 }
-                TaskBasedAction::Build => {
-                    workflow.phase = GoalDrivenPhase::Paused;
+                TaskDrivenAction::Build => {
+                    workflow.phase = PlanDrivenPhase::Paused;
                     workflow.last_built_at = Some(current_unix_timestamp());
                 }
             }
@@ -354,11 +354,11 @@ where
     fn mark_workflow_inflight(
         &self,
         target_config: &mut TargetConfig,
-        phase: GoalDrivenPhase,
+        phase: PlanDrivenPhase,
         goal_hash: &str,
         content_hash: &str,
     ) -> Result<()> {
-        target_config.inflight = Some(GoalDrivenInflight {
+        target_config.inflight = Some(PlanDrivenInflight {
             phase,
             goal_hash: goal_hash.to_owned(),
             content_hash: content_hash.to_owned(),

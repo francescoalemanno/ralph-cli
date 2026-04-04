@@ -46,9 +46,9 @@ where
     {
         let target_config = self.store.read_target_config(target)?;
         match target_config.mode {
-            Some(WorkflowMode::GoalDriven) => {
+            Some(WorkflowMode::PlanDriven) => {
                 return self
-                    .run_goal_driven_target_with_control(
+                    .run_plan_driven_target_with_control(
                         target,
                         prompt_name,
                         target_config,
@@ -58,9 +58,9 @@ where
                     )
                     .await;
             }
-            Some(WorkflowMode::TaskBased) => {
+            Some(WorkflowMode::TaskDriven) => {
                 return self
-                    .run_task_based_target_with_control(
+                    .run_task_driven_target_with_control(
                         target,
                         prompt_name,
                         target_config,
@@ -137,7 +137,7 @@ mod tests {
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
     use ralph_core::{
-        AppConfig, GoalDrivenPhase, RunControl, RunnerInvocation, RunnerResult, ScaffoldId,
+        AppConfig, PlanDrivenPhase, RunControl, RunnerInvocation, RunnerResult, ScaffoldId,
     };
     use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
     use tokio::sync::mpsc::UnboundedSender;
@@ -145,8 +145,8 @@ mod tests {
     use crate::{
         RalphApp, RunDelegate, RunEvent,
         workflow::{
-            GOAL_DRIVEN_BUILD_PROMPT, GOAL_DRIVEN_PAUSED_PROMPT, GOAL_DRIVEN_PLAN_PROMPT,
-            TASK_BASED_BUILD_PROMPT, TASK_BASED_PAUSED_PROMPT, TASK_BASED_REBASE_PROMPT,
+            PLAN_DRIVEN_BUILD_PROMPT, PLAN_DRIVEN_PAUSED_PROMPT, PLAN_DRIVEN_PLAN_PROMPT,
+            TASK_DRIVEN_BUILD_PROMPT, TASK_DRIVEN_PAUSED_PROMPT, TASK_DRIVEN_REBASE_PROMPT,
         },
     };
 
@@ -157,12 +157,12 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct GoalDrivenRunner {
+    struct PlanDrivenRunner {
         seen_prompt_names: Arc<Mutex<Vec<String>>>,
     }
 
     #[derive(Clone)]
-    struct TaskBasedRunner {
+    struct TaskDrivenRunner {
         seen_prompt_names: Arc<Mutex<Vec<String>>>,
     }
 
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl RunnerAdapter for GoalDrivenRunner {
+    impl RunnerAdapter for PlanDrivenRunner {
         async fn run(
             &self,
             _config: &ralph_core::RunnerConfig,
@@ -201,13 +201,13 @@ mod tests {
 
             let plan_path = invocation.target_dir.join("plan.toml");
             let contents = match invocation.prompt_name.as_str() {
-                GOAL_DRIVEN_PLAN_PROMPT => {
+                PLAN_DRIVEN_PLAN_PROMPT => {
                     "version = 1\n\n[[items]]\ncategory = \"functional\"\ndescription = \"Ship the feature\"\nsteps = [\"Implement it\", \"Verify it\"]\ncompleted = false\n".to_owned()
                 }
-                GOAL_DRIVEN_BUILD_PROMPT => {
+                PLAN_DRIVEN_BUILD_PROMPT => {
                     "version = 1\n\n[[items]]\ncategory = \"functional\"\ndescription = \"Ship the feature\"\nsteps = [\"Implement it\", \"Verify it\"]\ncompleted = true\n".to_owned()
                 }
-                other => panic!("unexpected goal-driven prompt {other}"),
+                other => panic!("unexpected plan-driven prompt {other}"),
             };
             std::fs::write(plan_path, contents).unwrap();
 
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl RunnerAdapter for TaskBasedRunner {
+    impl RunnerAdapter for TaskDrivenRunner {
         async fn run(
             &self,
             _config: &ralph_core::RunnerConfig,
@@ -234,13 +234,13 @@ mod tests {
 
             let progress_path = invocation.target_dir.join("progress.toml");
             let contents = match invocation.prompt_name.as_str() {
-                TASK_BASED_REBASE_PROMPT => {
+                TASK_DRIVEN_REBASE_PROMPT => {
                     "version = 1\n\n[[items]]\ndescription = \"Ship the feature\"\nsteps = [\"Implement it\", \"Verify it\"]\ncompleted = false\n".to_owned()
                 }
-                TASK_BASED_BUILD_PROMPT => {
+                TASK_DRIVEN_BUILD_PROMPT => {
                     "version = 1\n\n[[items]]\ndescription = \"Ship the feature\"\nsteps = [\"Implement it\", \"Verify it\"]\ncompleted = true\n".to_owned()
                 }
-                other => panic!("unexpected task-based prompt {other}"),
+                other => panic!("unexpected task-driven prompt {other}"),
             };
             std::fs::write(progress_path, contents).unwrap();
 
@@ -262,25 +262,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goal_driven_targets_plan_then_build_and_keep_building_even_if_goal_changes() {
+    async fn plan_driven_targets_plan_then_build_and_keep_building_even_if_goal_changes() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let seen_prompt_names = Arc::new(Mutex::new(Vec::new()));
         let app = RalphApp::new(
             project_dir.clone(),
             AppConfig::default(),
-            GoalDrivenRunner {
+            PlanDrivenRunner {
                 seen_prompt_names: seen_prompt_names.clone(),
             },
         );
-        app.create_target("demo", Some(ScaffoldId::GoalDriven))
+        app.create_target("demo", Some(ScaffoldId::PlanDriven))
             .unwrap();
 
         let mut delegate = TestDelegate;
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
-            Some(GOAL_DRIVEN_PLAN_PROMPT)
+            Some(PLAN_DRIVEN_PLAN_PROMPT)
         );
         assert_eq!(
             summary.last_run_status,
@@ -293,13 +293,13 @@ mod tests {
                 .workflow
                 .as_ref()
                 .map(|workflow| workflow.phase),
-            Some(GoalDrivenPhase::Build)
+            Some(PlanDrivenPhase::Build)
         );
 
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
-            Some(GOAL_DRIVEN_BUILD_PROMPT)
+            Some(PLAN_DRIVEN_BUILD_PROMPT)
         );
         assert_eq!(
             app.store
@@ -308,21 +308,21 @@ mod tests {
                 .workflow
                 .as_ref()
                 .map(|workflow| workflow.phase),
-            Some(GoalDrivenPhase::Paused)
+            Some(PlanDrivenPhase::Paused)
         );
 
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
-            Some(GOAL_DRIVEN_BUILD_PROMPT)
+            Some(PLAN_DRIVEN_BUILD_PROMPT)
         );
         assert_eq!(
             *seen_prompt_names.lock().unwrap(),
             vec![
-                GOAL_DRIVEN_PLAN_PROMPT.to_owned(),
-                GOAL_DRIVEN_PLAN_PROMPT.to_owned(),
-                GOAL_DRIVEN_BUILD_PROMPT.to_owned(),
-                GOAL_DRIVEN_BUILD_PROMPT.to_owned()
+                PLAN_DRIVEN_PLAN_PROMPT.to_owned(),
+                PLAN_DRIVEN_PLAN_PROMPT.to_owned(),
+                PLAN_DRIVEN_BUILD_PROMPT.to_owned(),
+                PLAN_DRIVEN_BUILD_PROMPT.to_owned()
             ]
         );
 
@@ -334,39 +334,39 @@ mod tests {
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
-            Some(GOAL_DRIVEN_PAUSED_PROMPT)
+            Some(PLAN_DRIVEN_PAUSED_PROMPT)
         );
         assert_eq!(
             *seen_prompt_names.lock().unwrap(),
             vec![
-                GOAL_DRIVEN_PLAN_PROMPT.to_owned(),
-                GOAL_DRIVEN_PLAN_PROMPT.to_owned(),
-                GOAL_DRIVEN_BUILD_PROMPT.to_owned(),
-                GOAL_DRIVEN_BUILD_PROMPT.to_owned()
+                PLAN_DRIVEN_PLAN_PROMPT.to_owned(),
+                PLAN_DRIVEN_PLAN_PROMPT.to_owned(),
+                PLAN_DRIVEN_BUILD_PROMPT.to_owned(),
+                PLAN_DRIVEN_BUILD_PROMPT.to_owned()
             ]
         );
     }
 
     #[tokio::test]
-    async fn task_based_targets_rebase_then_build_then_require_choice_on_goal_change() {
+    async fn task_driven_targets_rebase_then_build_then_require_choice_on_goal_change() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let seen_prompt_names = Arc::new(Mutex::new(Vec::new()));
         let app = RalphApp::new(
             project_dir.clone(),
             AppConfig::default(),
-            TaskBasedRunner {
+            TaskDrivenRunner {
                 seen_prompt_names: seen_prompt_names.clone(),
             },
         );
-        app.create_target("demo", Some(ScaffoldId::TaskBased))
+        app.create_target("demo", Some(ScaffoldId::TaskDriven))
             .unwrap();
 
         let mut delegate = TestDelegate;
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
-            Some(TASK_BASED_REBASE_PROMPT)
+            Some(TASK_DRIVEN_REBASE_PROMPT)
         );
         assert_eq!(
             summary.last_run_status,
@@ -379,20 +379,20 @@ mod tests {
                 .workflow
                 .as_ref()
                 .map(|workflow| workflow.phase),
-            Some(GoalDrivenPhase::Build)
+            Some(PlanDrivenPhase::Build)
         );
 
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
-            Some(TASK_BASED_BUILD_PROMPT)
+            Some(TASK_DRIVEN_BUILD_PROMPT)
         );
         assert_eq!(
             *seen_prompt_names.lock().unwrap(),
             vec![
-                TASK_BASED_REBASE_PROMPT.to_owned(),
-                TASK_BASED_REBASE_PROMPT.to_owned(),
-                TASK_BASED_BUILD_PROMPT.to_owned()
+                TASK_DRIVEN_REBASE_PROMPT.to_owned(),
+                TASK_DRIVEN_REBASE_PROMPT.to_owned(),
+                TASK_DRIVEN_BUILD_PROMPT.to_owned()
             ]
         );
 
@@ -404,20 +404,20 @@ mod tests {
         let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
         assert_eq!(
             summary.last_prompt.as_deref(),
-            Some(TASK_BASED_PAUSED_PROMPT)
+            Some(TASK_DRIVEN_PAUSED_PROMPT)
         );
         assert_eq!(
             *seen_prompt_names.lock().unwrap(),
             vec![
-                TASK_BASED_REBASE_PROMPT.to_owned(),
-                TASK_BASED_REBASE_PROMPT.to_owned(),
-                TASK_BASED_BUILD_PROMPT.to_owned(),
+                TASK_DRIVEN_REBASE_PROMPT.to_owned(),
+                TASK_DRIVEN_REBASE_PROMPT.to_owned(),
+                TASK_DRIVEN_BUILD_PROMPT.to_owned(),
             ]
         );
     }
 
     #[tokio::test]
-    async fn task_based_failures_persist_last_run_status() {
+    async fn task_driven_failures_persist_last_run_status() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let app = RalphApp::new(
@@ -428,7 +428,7 @@ mod tests {
                 exit_code: 1,
             },
         );
-        app.create_target("demo", Some(ScaffoldId::TaskBased))
+        app.create_target("demo", Some(ScaffoldId::TaskDriven))
             .unwrap();
 
         let mut delegate = TestDelegate;
@@ -441,7 +441,7 @@ mod tests {
         let config = app.store.read_target_config("demo").unwrap();
         assert_eq!(
             config.last_prompt.as_deref(),
-            Some(TASK_BASED_REBASE_PROMPT)
+            Some(TASK_DRIVEN_REBASE_PROMPT)
         );
         assert_eq!(config.last_run_status, ralph_core::LastRunStatus::Failed);
     }
