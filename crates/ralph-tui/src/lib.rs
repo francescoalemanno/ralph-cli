@@ -482,17 +482,23 @@ impl TuiApp {
                 self.new_target_name.pop();
             }
             KeyCode::Enter => {
-                if self.new_target_name.trim().is_empty() {
+                let target_name = self.new_target_name.trim().to_owned();
+                if target_name.is_empty() {
                     self.message = "target name cannot be empty".to_owned();
                     return Ok(());
                 }
-                let Some(template) = self.selected_workflow_template() else {
+                let Some(template_id) = self.selected_workflow_template().map(|template| template.id.clone()) else {
                     self.message = "no workflow templates are available".to_owned();
                     return Ok(());
                 };
-                let summary = self
-                    .app
-                    .create_target_from_template(self.new_target_name.trim(), &template.id)?;
+                let summary = match self.app.create_target_from_template(&target_name, &template_id)
+                {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        self.message = error.to_string();
+                        return Ok(());
+                    }
+                };
                 self.reload_targets();
                 if let Some(index) = self.targets.iter().position(|item| item.id == summary.id) {
                     self.selected_target = index;
@@ -1177,6 +1183,24 @@ mod tests {
                 .iter()
                 .any(|template| template.id == "release_loop")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_target_creation_shows_message_instead_of_crashing() -> Result<()> {
+        let (_temp, project_dir) = temp_project_dir();
+        let app = RalphApp::load(project_dir.clone())?;
+        app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
+
+        let runtime = Runtime::new()?;
+        let mut tui = TuiApp::new(app, runtime.handle().clone(), None);
+        tui.screen = super::Screen::NewTarget;
+        tui.new_target_name = "demo".to_owned();
+
+        tui.handle_new_target_key(KeyEvent::from(KeyCode::Enter), &mut test_terminal()?)?;
+
+        assert!(matches!(tui.screen, super::Screen::NewTarget));
+        assert!(tui.message.contains("target 'demo' already exists"));
         Ok(())
     }
 
