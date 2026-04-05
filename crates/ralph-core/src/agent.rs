@@ -92,7 +92,7 @@ impl CodingAgent {
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::from([(
                         "OPENCODE_CONFIG_CONTENT".to_owned(),
-                        r#"{"$schema":"https://opencode.ai/config.json","permission":"allow"}"#
+                        r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#
                             .to_owned(),
                     )]),
                 },
@@ -109,7 +109,7 @@ impl CodingAgent {
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::from([(
                         "OPENCODE_CONFIG_CONTENT".to_owned(),
-                        r#"{"$schema":"https://opencode.ai/config.json","permission":"allow"}"#
+                        r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#
                             .to_owned(),
                     )]),
                 },

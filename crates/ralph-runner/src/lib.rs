@@ -774,7 +774,7 @@ mod tests {
                 .env
                 .get("OPENCODE_CONFIG_CONTENT")
                 .map(String::as_str),
-            Some(r#"{"$schema":"https://opencode.ai/config.json","permission":"allow"}"#)
+            Some(r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#)
         );
         assert_eq!(
             opencode
@@ -782,7 +782,7 @@ mod tests {
                 .env
                 .get("OPENCODE_CONFIG_CONTENT")
                 .map(String::as_str),
-            Some(r#"{"$schema":"https://opencode.ai/config.json","permission":"allow"}"#)
+            Some(r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#)
         );
     }
 
