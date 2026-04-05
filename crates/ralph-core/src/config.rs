@@ -103,11 +103,6 @@ impl AppConfig {
         self.agents.iter().find(|agent| agent.id == agent_id)
     }
 
-    pub fn selected_agent(&self) -> Result<&AgentConfig> {
-        self.agent_definition(self.agent_id())
-            .ok_or_else(|| anyhow!("selected agent '{}' is not defined", self.agent_id()))
-    }
-
     pub fn all_agents(&self) -> &[AgentConfig] {
         &self.agents
     }

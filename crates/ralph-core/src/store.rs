@@ -180,10 +180,6 @@ impl TargetStore {
     }
 
     pub fn read_target_config(&self, target_id: &str) -> Result<TargetConfig> {
-        self.read_target_config_internal(target_id)
-    }
-
-    fn read_target_config_internal(&self, target_id: &str) -> Result<TargetConfig> {
         let paths = self.target_paths(target_id)?;
         let raw = fs::read_to_string(&paths.config_path)
             .with_context(|| format!("failed to read target config {}", paths.config_path))?;
