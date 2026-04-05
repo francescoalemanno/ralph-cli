@@ -26,6 +26,9 @@ pub enum CodingAgent {
     Opencode,
     #[default]
     Codex,
+    Claude,
+    Droid,
+    Gemini,
     Raijin,
 }
 
@@ -40,6 +43,9 @@ impl CodingAgent {
         match self {
             Self::Opencode => "opencode",
             Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Droid => "droid",
+            Self::Gemini => "gemini",
             Self::Raijin => "raijin",
         }
     }
@@ -48,6 +54,9 @@ impl CodingAgent {
         match self {
             Self::Opencode => "OpenCode",
             Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+            Self::Droid => "Droid",
+            Self::Gemini => "Gemini CLI",
             Self::Raijin => "Raijin",
         }
     }
@@ -56,6 +65,9 @@ impl CodingAgent {
         match self {
             Self::Opencode => "opencode",
             Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Droid => "droid",
+            Self::Gemini => "gemini",
             Self::Raijin => "raijin",
         }
     }
@@ -129,6 +141,65 @@ impl CodingAgent {
                     env: BTreeMap::new(),
                 },
             },
+            Self::Claude => AgentConfig {
+                id: self.id().to_owned(),
+                name: self.label().to_owned(),
+                builtin: true,
+                non_interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("claude".to_owned()),
+                    args: vec![
+                        "--dangerously-skip-permissions".to_owned(),
+                        "--allow-dangerously-skip-permissions".to_owned(),
+                        "-p".to_owned(),
+                        "{prompt}".to_owned(),
+                    ],
+                    command: None,
+                    prompt_input: PromptInput::Argv,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::new(),
+                },
+                interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("claude".to_owned()),
+                    args: vec![
+                        "--dangerously-skip-permissions".to_owned(),
+                        "--allow-dangerously-skip-permissions".to_owned(),
+                        "{prompt}".to_owned(),
+                    ],
+                    command: None,
+                    prompt_input: PromptInput::Argv,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::new(),
+                },
+            },
+            Self::Droid => AgentConfig {
+                id: self.id().to_owned(),
+                name: self.label().to_owned(),
+                builtin: true,
+                non_interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("droid".to_owned()),
+                    args: vec![
+                        "exec".to_owned(),
+                        "--skip-permissions-unsafe".to_owned(),
+                        "{prompt}".to_owned(),
+                    ],
+                    command: None,
+                    prompt_input: PromptInput::Argv,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::new(),
+                },
+                interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("droid".to_owned()),
+                    args: vec!["{prompt}".to_owned()],
+                    command: None,
+                    prompt_input: PromptInput::Argv,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::new(),
+                },
+            },
             Self::Raijin => AgentConfig {
                 id: self.id().to_owned(),
                 name: self.label().to_owned(),
@@ -152,11 +223,41 @@ impl CodingAgent {
                     env: BTreeMap::new(),
                 },
             },
+            Self::Gemini => AgentConfig {
+                id: self.id().to_owned(),
+                name: self.label().to_owned(),
+                builtin: true,
+                non_interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("gemini".to_owned()),
+                    args: vec!["-y".to_owned(), "-p".to_owned(), "{prompt}".to_owned()],
+                    command: None,
+                    prompt_input: PromptInput::Argv,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::new(),
+                },
+                interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("gemini".to_owned()),
+                    args: vec!["-y".to_owned(), "-i".to_owned(), "{prompt}".to_owned()],
+                    command: None,
+                    prompt_input: PromptInput::Argv,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::new(),
+                },
+            },
         }
     }
 
-    fn all() -> [Self; 3] {
-        [Self::Opencode, Self::Codex, Self::Raijin]
+    fn all() -> [Self; 6] {
+        [
+            Self::Opencode,
+            Self::Codex,
+            Self::Claude,
+            Self::Droid,
+            Self::Gemini,
+            Self::Raijin,
+        ]
     }
 }
 
@@ -299,7 +400,10 @@ mod tests {
             .into_iter()
             .map(|agent| agent.id)
             .collect::<Vec<_>>();
-        assert_eq!(builtin_ids, vec!["opencode", "codex", "raijin"]);
+        assert_eq!(
+            builtin_ids,
+            vec!["opencode", "codex", "claude", "droid", "gemini", "raijin"]
+        );
     }
 
     #[test]
@@ -358,6 +462,51 @@ mod tests {
         assert_eq!(raijin.non_interactive.args, vec!["-ephemeral", "{prompt}"]);
         assert_eq!(raijin.interactive.prompt_input, PromptInput::Argv);
         assert_eq!(raijin.interactive.args, vec!["-new", "{prompt}"]);
+    }
+
+    #[test]
+    fn gemini_builtin_commands_match_expected_shapes() {
+        let gemini = CodingAgent::Gemini.definition();
+        assert_eq!(gemini.non_interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(gemini.non_interactive.args, vec!["-y", "-p", "{prompt}"]);
+        assert_eq!(gemini.interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(gemini.interactive.args, vec!["-y", "-i", "{prompt}"]);
+    }
+
+    #[test]
+    fn claude_builtin_commands_match_expected_shapes() {
+        let claude = CodingAgent::Claude.definition();
+        assert_eq!(claude.non_interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(
+            claude.non_interactive.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--allow-dangerously-skip-permissions",
+                "-p",
+                "{prompt}",
+            ]
+        );
+        assert_eq!(claude.interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(
+            claude.interactive.args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--allow-dangerously-skip-permissions",
+                "{prompt}",
+            ]
+        );
+    }
+
+    #[test]
+    fn droid_builtin_commands_match_expected_shapes() {
+        let droid = CodingAgent::Droid.definition();
+        assert_eq!(droid.non_interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(
+            droid.non_interactive.args,
+            vec!["exec", "--skip-permissions-unsafe", "{prompt}"]
+        );
+        assert_eq!(droid.interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(droid.interactive.args, vec!["{prompt}"]);
     }
 
     #[test]

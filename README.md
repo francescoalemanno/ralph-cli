@@ -156,7 +156,7 @@ ralph edit <target> [--prompt <file>]
 
 ralph agent list
 ralph agent current
-ralph agent set <opencode|codex|raijin> [--scope project|user]
+ralph agent set <opencode|codex|claude|droid|gemini|raijin> [--scope project|user]
 
 ralph config show [--scope effective|project|user]
 ralph config path
@@ -328,16 +328,22 @@ warning_color = "yellow"
 
 ## Built-In Agent Presets
 
-Ralph supports three built-in coding-agent presets:
+Ralph supports six built-in coding-agent presets:
 
 - OpenCode: [anomalyco/opencode](https://github.com/anomalyco/opencode)
 - Codex: [openai/codex](https://github.com/openai/codex)
+- Claude Code
+- Droid
+- Gemini CLI: [google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli)
 - Raijin: [francescoalemanno/raijin-mono](https://github.com/francescoalemanno/raijin-mono/)
 
 Default command shapes:
 
 - OpenCode: `opencode run --format default --thinking`
 - Codex: `codex exec --dangerously-bypass-approvals-and-sandbox --ephemeral`
+- Claude Code: `claude --dangerously-skip-permissions --allow-dangerously-skip-permissions -p "$PROMPT"`
+- Droid: `droid exec --skip-permissions-unsafe "$PROMPT"`
+- Gemini CLI: `gemini -y -p "$PROMPT"`
 - Raijin: `raijin -ephemeral "$PROMPT"`
 
 Agent selection behavior:

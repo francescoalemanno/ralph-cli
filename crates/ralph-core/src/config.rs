@@ -391,6 +391,9 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.default_agent, "codex");
         assert!(config.agent_definition("codex").is_some());
+        assert!(config.agent_definition("claude").is_some());
+        assert!(config.agent_definition("droid").is_some());
+        assert!(config.agent_definition("gemini").is_some());
         assert!(config.agent_definition("opencode").is_some());
         assert!(config.agent_definition("raijin").is_some());
     }
@@ -434,6 +437,9 @@ mod tests {
         let raw = fs::read_to_string(user_path).unwrap();
         assert!(raw.contains("[[agents]]"));
         assert!(raw.contains("id = \"codex\""));
+        assert!(raw.contains("id = \"claude\""));
+        assert!(raw.contains("id = \"droid\""));
+        assert!(raw.contains("id = \"gemini\""));
         assert!(raw.contains("id = \"opencode\""));
         assert!(raw.contains("id = \"raijin\""));
     }
