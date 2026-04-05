@@ -132,13 +132,8 @@ impl RunControl {
         Self::default()
     }
 
-    pub fn cancel(&self) -> u8 {
+    pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-        1
-    }
-
-    pub fn force_cancel(&self) -> u8 {
-        self.cancel()
     }
 
     pub fn set_agent_id(&self, agent_id: impl Into<String>) {
@@ -153,15 +148,7 @@ impl RunControl {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancel_stage() >= 1
-    }
-
-    pub fn is_force_cancelled(&self) -> bool {
-        self.is_cancelled()
-    }
-
-    pub fn cancel_stage(&self) -> u8 {
-        u8::from(self.cancelled.load(Ordering::SeqCst))
+        self.cancelled.load(Ordering::SeqCst)
     }
 }
 
@@ -170,16 +157,13 @@ mod tests {
     use super::{LastRunStatus, RunControl, ScaffoldId};
 
     #[test]
-    fn cancellation_escalates_and_saturates() {
+    fn cancel_marks_control_as_canceled() {
         let control = RunControl::new();
-        assert_eq!(control.cancel_stage(), 0);
-        assert_eq!(control.cancel(), 1);
+        assert!(!control.is_cancelled());
+        control.cancel();
         assert!(control.is_cancelled());
-        assert!(control.is_force_cancelled());
-        assert_eq!(control.cancel(), 1);
-        assert_eq!(control.cancel_stage(), 1);
-        assert_eq!(control.force_cancel(), 1);
-        assert_eq!(control.cancel_stage(), 1);
+        control.cancel();
+        assert!(control.is_cancelled());
     }
 
     #[test]
