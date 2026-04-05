@@ -1,10 +1,7 @@
 mod console;
-mod engine;
-mod interactive;
 mod prompt;
 mod prompt_run;
 mod run;
-mod template;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -13,37 +10,9 @@ use ralph_core::{
     AgentConfig, AppConfig, LastRunStatus, PromptFile, ScaffoldId, TargetReview, TargetStore,
     TargetSummary,
 };
-use ralph_runner::{CommandRunner, RunnerAdapter};
-use tokio::sync::oneshot;
+use ralph_runner::CommandRunner;
 
 pub use console::ConsoleDelegate;
-pub use template::{WorkflowTemplateSource, WorkflowTemplateSummary};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlowActionStatus {
-    pub id: String,
-    pub label: String,
-    pub shortcut: Option<String>,
-    pub confirm_title: Option<String>,
-    pub confirm_message: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlowPauseStatus {
-    pub node_id: String,
-    pub message: Option<String>,
-    pub summary: Option<String>,
-    pub actions: Vec<FlowActionStatus>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlowStatus {
-    pub entrypoint_id: String,
-    pub current_node: Option<String>,
-    pub pause: Option<FlowPauseStatus>,
-    pub actions: Vec<FlowActionStatus>,
-    pub flow_ref: String,
-}
 
 #[derive(Debug)]
 pub enum RunEvent {
@@ -54,14 +23,6 @@ pub enum RunEvent {
     },
     Output(String),
     Note(String),
-    InteractiveSessionStart {
-        prompt_name: String,
-        ready: oneshot::Sender<()>,
-    },
-    InteractiveSessionEnd {
-        prompt_name: String,
-        ready: oneshot::Sender<()>,
-    },
     Finished {
         status: LastRunStatus,
         summary: String,
@@ -181,48 +142,6 @@ impl<R> RalphApp<R> {
         self.store.review_target(target)
     }
 
-    pub fn flow_status(&self, target: &str) -> Result<Option<FlowStatus>>
-    where
-        R: RunnerAdapter,
-    {
-        let target_config = self.store.read_target_config(target)?;
-        let target_summary = self.store.load_target(target)?;
-        Ok(self
-            .flow_status_summary(&target_config, &target_summary)?
-            .map(|status| FlowStatus {
-                entrypoint_id: status.entrypoint_id,
-                current_node: status.current_node,
-                pause: status.pause.map(|pause| FlowPauseStatus {
-                    node_id: pause.node_id,
-                    message: pause.message,
-                    summary: pause.summary,
-                    actions: pause
-                        .actions
-                        .into_iter()
-                        .map(|action| FlowActionStatus {
-                            id: action.id,
-                            label: action.label,
-                            shortcut: action.shortcut,
-                            confirm_title: action.confirm_title,
-                            confirm_message: action.confirm_message,
-                        })
-                        .collect(),
-                }),
-                actions: status
-                    .actions
-                    .into_iter()
-                    .map(|action| FlowActionStatus {
-                        id: action.id,
-                        label: action.label,
-                        shortcut: action.shortcut,
-                        confirm_title: action.confirm_title,
-                        confirm_message: action.confirm_message,
-                    })
-                    .collect(),
-                flow_ref: status.flow_ref,
-            }))
-    }
-
     pub fn delete_target(&self, target: &str) -> Result<()> {
         self.store.delete_target(target)
     }
@@ -232,36 +151,6 @@ impl<R> RalphApp<R> {
         target: &str,
         requested_file: Option<&str>,
     ) -> Result<Utf8PathBuf> {
-        let config = self.store.read_target_config(target)?;
-        let target_summary = self.store.load_target(target)?;
-        let target_dir = self.store.target_paths(target)?.dir;
-
-        if !config.entrypoints.is_empty() {
-            let entrypoints = crate::engine::resolve_target_entrypoints(&config, &target_summary);
-            if let Some(entrypoint) =
-                crate::engine::resolve_default_entrypoint(&config, &entrypoints)
-                && let Some(edit_path) = entrypoint.edit_path()
-            {
-                let resolved =
-                    crate::engine::resolve_artifact_path(&self.project_dir, &target_dir, edit_path);
-                return match requested_file {
-                    None => Ok(resolved),
-                    Some(name)
-                        if name == edit_path
-                            || name == resolved.file_name().unwrap_or_default() =>
-                    {
-                        Ok(resolved)
-                    }
-                    Some(name) => Err(anyhow!(
-                        "entrypoint '{}' exposes '{}' for editing, got '{}'",
-                        entrypoint.id(),
-                        edit_path,
-                        name
-                    )),
-                };
-            }
-        }
-
         Ok(self.resolve_prompt(target, requested_file)?.path)
     }
 
@@ -275,13 +164,6 @@ impl<R> RalphApp<R> {
         target_summary: &TargetSummary,
         prompt_name: Option<&str>,
     ) -> Result<PromptFile> {
-        if target_summary.has_flow_entrypoints() {
-            return Err(anyhow!(
-                "target '{}' uses flow entrypoints and does not expose runnable prompts",
-                target_summary.id
-            ));
-        }
-
         if target_summary.prompt_files.is_empty() {
             return Err(anyhow!(
                 "target '{}' has no runnable prompt files",
@@ -301,23 +183,6 @@ impl<R> RalphApp<R> {
                         target_summary.id
                     )
                 });
-        }
-
-        if let Some(last_prompt) = &target_summary.last_prompt
-            && let Some(prompt) = target_summary
-                .prompt_files
-                .iter()
-                .find(|prompt| &prompt.name == last_prompt)
-        {
-            return Ok(prompt.clone());
-        }
-
-        if let Some(prompt) = target_summary
-            .prompt_files
-            .iter()
-            .find(|prompt| prompt.name == "prompt_main.md")
-        {
-            return Ok(prompt.clone());
         }
 
         if target_summary.prompt_files.len() == 1 {

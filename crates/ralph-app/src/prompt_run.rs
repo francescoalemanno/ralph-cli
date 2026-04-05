@@ -4,10 +4,7 @@ use ralph_core::{LastRunStatus, RunControl, RunnerConfig, RunnerInvocation};
 use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
 use tokio::sync::mpsc::unbounded_channel;
 
-use crate::{
-    RalphApp, RunDelegate, RunEvent,
-    prompt::{CompletionCriterion, ParsedPrompt, interpolate_prompt_env, parse_prompt_directives},
-};
+use crate::{RalphApp, RunDelegate, RunEvent, prompt::interpolate_prompt_env};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedPromptRun {
@@ -21,10 +18,6 @@ impl<R> RalphApp<R>
 where
     R: RunnerAdapter,
 {
-    pub(crate) fn prepared_prompt_name<'a>(&self, prepared: &'a PreparedPromptRun) -> &'a str {
-        &prepared.prompt_name
-    }
-
     pub(crate) fn prepare_prompt_run(
         &self,
         prompt_path: &Utf8Path,
@@ -44,23 +37,7 @@ where
         Ok(prepared)
     }
 
-    pub(crate) fn prepare_inline_prompt_run(
-        &self,
-        target_dir: &Utf8Path,
-        prompt_name: &str,
-        prompt_text: &str,
-    ) -> Result<PreparedPromptRun> {
-        let prepared = PreparedPromptRun {
-            prompt_path: target_dir.join(format!(".{prompt_name}.md")),
-            prompt_name: prompt_name.to_owned(),
-            target_dir: target_dir.to_path_buf(),
-            raw_prompt: Some(prompt_text.to_owned()),
-        };
-        self.parse_prompt_run(&prepared)?;
-        Ok(prepared)
-    }
-
-    fn parse_prompt_run(&self, prepared: &PreparedPromptRun) -> Result<ParsedPrompt> {
+    fn parse_prompt_run(&self, prepared: &PreparedPromptRun) -> Result<String> {
         let raw_prompt = match &prepared.raw_prompt {
             Some(raw_prompt) => raw_prompt.clone(),
             None => self
@@ -68,14 +45,7 @@ where
                 .read_file(&prepared.prompt_path)
                 .with_context(|| format!("failed to read prompt file {}", prepared.prompt_path))?,
         };
-        let interpolated_prompt = interpolate_prompt_env(
-            &raw_prompt,
-            &self.project_dir,
-            &prepared.target_dir,
-            &prepared.prompt_path,
-            &prepared.prompt_name,
-        )?;
-        Ok(parse_prompt_directives(&interpolated_prompt))
+        interpolate_prompt_env(&raw_prompt, &self.project_dir, &prepared.target_dir)
     }
 
     pub(crate) async fn run_prepared_prompt<D>(
@@ -84,7 +54,7 @@ where
         max_iterations: usize,
         control: &RunControl,
         delegate: &mut D,
-        completed_summary: &str,
+        _completed_summary: &str,
         max_iterations_summary: &str,
     ) -> Result<LastRunStatus>
     where
@@ -95,9 +65,7 @@ where
         }
 
         for iteration in 1..=max_iterations {
-            let parsed_prompt = self.parse_prompt_run(prepared)?;
-            let criteria_before =
-                self.read_completion_inputs(&parsed_prompt.completion_criteria)?;
+            let prompt_text = self.parse_prompt_run(prepared)?;
 
             if control.is_cancelled() {
                 return Err(anyhow!("operation canceled"));
@@ -116,7 +84,7 @@ where
                 .execute_runner(
                     &config,
                     RunnerInvocation {
-                        prompt_text: parsed_prompt.prompt_text.clone(),
+                        prompt_text,
                         project_dir: self.project_dir.clone(),
                         target_dir: prepared.target_dir.clone(),
                         prompt_path: prepared.prompt_path.clone(),
@@ -132,22 +100,6 @@ where
                 delegate.on_event(RunEvent::Note(message.clone())).await?;
                 return Err(anyhow!(message));
             }
-
-            if !parsed_prompt.completion_criteria.is_empty()
-                && self.completion_criteria_satisfied(
-                    &parsed_prompt.completion_criteria,
-                    &criteria_before,
-                    &self.read_completion_inputs(&parsed_prompt.completion_criteria)?,
-                )?
-            {
-                delegate
-                    .on_event(RunEvent::Finished {
-                        status: LastRunStatus::Completed,
-                        summary: completed_summary.to_owned(),
-                    })
-                    .await?;
-                return Ok(LastRunStatus::Completed);
-            }
         }
 
         delegate
@@ -159,60 +111,6 @@ where
         Ok(LastRunStatus::MaxIterations)
     }
 
-    fn read_completion_inputs(
-        &self,
-        criteria: &[CompletionCriterion],
-    ) -> Result<Vec<Option<String>>> {
-        criteria
-            .iter()
-            .map(|criterion| {
-                let name = match criterion {
-                    CompletionCriterion::Watch { path }
-                    | CompletionCriterion::NoLineContainsAll { path, .. } => path,
-                };
-                let watch_path = Utf8Path::new(name);
-                let path = if watch_path.is_absolute() {
-                    watch_path.to_path_buf()
-                } else {
-                    self.project_dir.join(watch_path)
-                };
-                match std::fs::read_to_string(&path) {
-                    Ok(contents) => Ok(Some(contents)),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(error) => {
-                        Err(error).with_context(|| format!("failed to read watched file {}", path))
-                    }
-                }
-            })
-            .collect()
-    }
-
-    fn completion_criteria_satisfied(
-        &self,
-        criteria: &[CompletionCriterion],
-        before: &[Option<String>],
-        after: &[Option<String>],
-    ) -> Result<bool> {
-        if before.len() != criteria.len() || after.len() != criteria.len() {
-            return Err(anyhow!("completion criteria state length mismatch"));
-        }
-
-        Ok(criteria.iter().zip(before.iter().zip(after.iter())).all(
-            |(criterion, (before, after))| match criterion {
-                CompletionCriterion::Watch { .. } => after.is_some() && before == after,
-                CompletionCriterion::NoLineContainsAll { tokens, .. } => {
-                    after.as_deref().is_some_and(|contents| {
-                        !contents.lines().any(|line| {
-                            tokens
-                                .iter()
-                                .all(|token| !token.is_empty() && line.contains(token))
-                        })
-                    })
-                }
-            },
-        ))
-    }
-
     fn runner_config_for(&self, control: &RunControl) -> Result<RunnerConfig> {
         let agent_id = control
             .agent_id()
@@ -222,20 +120,6 @@ where
             .agent_definition(&agent_id)
             .ok_or_else(|| anyhow!("agent '{}' is not defined", agent_id))?;
         Ok(agent.non_interactive.clone())
-    }
-
-    pub(crate) fn interactive_runner_config_for(
-        &self,
-        control: &RunControl,
-    ) -> Result<RunnerConfig> {
-        let agent_id = control
-            .agent_id()
-            .unwrap_or_else(|| self.config.agent_id().to_owned());
-        let agent = self
-            .config
-            .agent_definition(&agent_id)
-            .ok_or_else(|| anyhow!("agent '{}' is not defined", agent_id))?;
-        Ok(agent.interactive.clone())
     }
 
     async fn execute_runner<D>(
@@ -294,10 +178,7 @@ mod tests {
     use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
     use tokio::sync::mpsc::UnboundedSender;
 
-    use crate::{
-        RalphApp, RunDelegate, RunEvent,
-        prompt::{CompletionCriterion, interpolate_prompt_env, parse_prompt_directives},
-    };
+    use crate::{RalphApp, RunDelegate, RunEvent, prompt::interpolate_prompt_env};
     #[derive(Clone)]
     struct ScriptedRunner {
         output: String,
@@ -387,37 +268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watched_prompts_complete_when_watched_files_are_unchanged() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        std::fs::write(project_dir.join("IMPLEMENTATION_PLAN.md"), "- item\n").unwrap();
-        let app = RalphApp::new(
-            project_dir.clone(),
-            AppConfig::default(),
-            ScriptedRunner {
-                output: "no plan changes".to_owned(),
-                exit_code: 0,
-            },
-        );
-        app.create_target("demo", Some(ScaffoldId::SinglePrompt))
-            .unwrap();
-        std::fs::write(
-            project_dir.join(".ralph/targets/demo/prompt_main.md"),
-            "{\"ralph\":\"watch\",\"path\":\"IMPLEMENTATION_PLAN.md\"}\n\n# Prompt\n",
-        )
-        .unwrap();
-
-        let mut delegate = TestDelegate;
-        let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
-
-        assert_eq!(
-            summary.last_run_status,
-            ralph_core::LastRunStatus::Completed
-        );
-    }
-
-    #[tokio::test]
-    async fn single_prompt_targets_still_run_to_max_iterations_without_plan_change_stop() {
+    async fn single_prompt_targets_run_to_max_iterations() {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let config = AppConfig {
@@ -446,39 +297,6 @@ mod tests {
         assert_eq!(
             summary.last_run_status,
             ralph_core::LastRunStatus::MaxIterations
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_watched_files_do_not_count_as_unchanged_completion() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let config = AppConfig {
-            max_iterations: 1,
-            ..Default::default()
-        };
-        let app = RalphApp::new(
-            project_dir.clone(),
-            config,
-            ScriptedRunner {
-                output: "left progress.txt missing".to_owned(),
-                exit_code: 0,
-            },
-        );
-        app.create_target("demo", Some(ScaffoldId::SinglePrompt))
-            .unwrap();
-
-        let mut delegate = TestDelegate;
-        let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
-
-        assert_eq!(
-            summary.last_run_status,
-            ralph_core::LastRunStatus::MaxIterations
-        );
-        assert!(
-            !project_dir
-                .join(".ralph/targets/demo/progress.txt")
-                .exists()
         );
     }
 
@@ -516,90 +334,26 @@ mod tests {
         assert_eq!(
             *seen_prompts.lock().unwrap(),
             vec![
-                "# Prompt\n\nFirst version".to_owned(),
-                "# Prompt\n\nSecond version".to_owned()
+                "# Prompt\n\nFirst version\n".to_owned(),
+                "# Prompt\n\nSecond version\n".to_owned()
             ]
         );
     }
 
     #[test]
-    fn prompt_directives_are_trimmed_before_runner_input() {
-        let parsed = parse_prompt_directives(
-            "{\"ralph\":\"watch\",\"path\":\"IMPLEMENTATION_PLAN.md\"}\n# Prompt\nBody\n{\"ralph\":\"complete_when\",\"type\":\"no_line_contains_all\",\"path\":\"specs/api.md\",\"tokens\":[\"completed\",\"false\"]}",
-        );
-
-        assert_eq!(
-            parsed.completion_criteria,
-            vec![
-                CompletionCriterion::Watch {
-                    path: "IMPLEMENTATION_PLAN.md".to_owned()
-                },
-                CompletionCriterion::NoLineContainsAll {
-                    path: "specs/api.md".to_owned(),
-                    tokens: vec!["completed".to_owned(), "false".to_owned()]
-                }
-            ]
-        );
-        assert_eq!(parsed.prompt_text, "# Prompt\nBody");
-    }
-
-    #[test]
-    fn blank_lines_are_preserved_after_trimming_directives() {
-        let parsed = parse_prompt_directives(
-            "# Prompt\n\n{\"ralph\":\"watch\",\"path\":\"IMPLEMENTATION_PLAN.md\"}\n\nBody\n",
-        );
-
-        assert_eq!(
-            parsed.completion_criteria,
-            vec![CompletionCriterion::Watch {
-                path: "IMPLEMENTATION_PLAN.md".to_owned()
-            }]
-        );
-        assert_eq!(parsed.prompt_text, "# Prompt\n\n\nBody");
-    }
-
-    #[test]
-    fn directive_like_lines_inside_code_fences_are_preserved() {
-        let parsed = parse_prompt_directives(
-            "```json\n{\"ralph\":\"watch\",\"path\":\"IMPLEMENTATION_PLAN.md\"}\n```\n",
-        );
-
-        assert!(parsed.completion_criteria.is_empty());
-        assert_eq!(
-            parsed.prompt_text,
-            "```json\n{\"ralph\":\"watch\",\"path\":\"IMPLEMENTATION_PLAN.md\"}\n```"
-        );
-    }
-
-    #[test]
-    fn invalid_json_lines_are_not_treated_as_directives() {
-        let parsed =
-            parse_prompt_directives("{\"ralph\":\"watch\",\"path\":\"foo\"\n# Prompt\nBody");
-
-        assert_eq!(
-            parsed.prompt_text,
-            "{\"ralph\":\"watch\",\"path\":\"foo\"\n# Prompt\nBody"
-        );
-        assert!(parsed.completion_criteria.is_empty());
-    }
-
-    #[test]
-    fn ralph_env_target_dir_is_interpolated_to_absolute_unix_path() {
+    fn ralph_env_project_and_target_dirs_are_interpolated_to_absolute_unix_paths() {
         let project_dir = Utf8PathBuf::from("/tmp/project");
         let target_dir = Utf8PathBuf::from("/tmp/project/.ralph/targets/demo");
-        let prompt_path = target_dir.join("prompt_main.md");
         let interpolated = interpolate_prompt_env(
-            "{\"ralph\":\"watch\",\"path\":\"{ralph-env:TARGET_DIR}/progress.txt\"}\nRead {ralph-env:TARGET_DIR}/progress.txt",
+            "Project {ralph-env:PROJECT_DIR}\nTarget {ralph-env:TARGET_DIR}/progress.txt",
             &project_dir,
             &target_dir,
-            &prompt_path,
-            "prompt_main.md",
         )
         .unwrap();
 
         assert_eq!(
             interpolated,
-            "{\"ralph\":\"watch\",\"path\":\"/tmp/project/.ralph/targets/demo/progress.txt\"}\nRead /tmp/project/.ralph/targets/demo/progress.txt"
+            "Project /tmp/project\nTarget /tmp/project/.ralph/targets/demo/progress.txt"
         );
     }
 
@@ -636,7 +390,7 @@ mod tests {
 
         assert_eq!(
             summary.last_run_status,
-            ralph_core::LastRunStatus::Completed
+            ralph_core::LastRunStatus::MaxIterations
         );
         let seen = seen_configs.lock().unwrap();
         assert_eq!(seen.len(), 1);

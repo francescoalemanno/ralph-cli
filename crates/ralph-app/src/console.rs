@@ -26,14 +26,6 @@ impl RunDelegate for ConsoleDelegate {
             RunEvent::Note(note) => {
                 eprintln!("{note}");
             }
-            RunEvent::InteractiveSessionStart { prompt_name, ready } => {
-                eprintln!("starting interactive session '{prompt_name}'");
-                let _ = ready.send(());
-            }
-            RunEvent::InteractiveSessionEnd { prompt_name, ready } => {
-                eprintln!("interactive session '{prompt_name}' finished");
-                let _ = ready.send(());
-            }
             RunEvent::Finished { status, summary } => {
                 println!("\n{} ({})", summary, status.label());
             }
