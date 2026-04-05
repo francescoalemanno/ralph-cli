@@ -25,8 +25,6 @@ pub(crate) enum OutputArg {
 pub(crate) enum ScaffoldArg {
     SinglePrompt,
     PlanBuild,
-    TaskDriven,
-    PlanDriven,
 }
 
 impl From<ScaffoldArg> for ScaffoldId {
@@ -34,8 +32,6 @@ impl From<ScaffoldArg> for ScaffoldId {
         match value {
             ScaffoldArg::SinglePrompt => ScaffoldId::SinglePrompt,
             ScaffoldArg::PlanBuild => ScaffoldId::PlanBuild,
-            ScaffoldArg::TaskDriven => ScaffoldId::TaskDriven,
-            ScaffoldArg::PlanDriven => ScaffoldId::PlanDriven,
         }
     }
 }
@@ -92,17 +88,15 @@ pub(crate) struct Cli {
 pub(crate) enum Commands {
     #[command(about = "Create a new target")]
     New(NewArgs),
-    #[command(about = "Run a target workflow or selected prompt loop")]
+    #[command(about = "Run a target or selected prompt loop")]
     Run(RunArgs),
     #[command(hide = true)]
     FakeAgent(FakeAgentArgs),
-    #[command(about = "Launch the interactive workflow creator against the user config")]
-    WorkflowCreator,
     #[command(about = "List targets", visible_alias = "status")]
     Ls,
     #[command(about = "Show target files")]
     Show(ShowArgs),
-    #[command(about = "Edit a target prompt or workflow input")]
+    #[command(about = "Edit a target prompt")]
     Edit(EditArgs),
     #[command(subcommand, about = "Inspect and manage supported coding agents")]
     Agent(AgentCommands),
@@ -118,8 +112,6 @@ pub(crate) enum Commands {
 pub(crate) struct NewArgs {
     #[arg(value_name = "TARGET")]
     pub(crate) target: Option<String>,
-    #[arg(long, value_name = "ID")]
-    pub(crate) template: Option<String>,
     #[arg(long, value_enum, default_value_t = ScaffoldArg::SinglePrompt)]
     pub(crate) scaffold: ScaffoldArg,
     #[arg(long, action = clap::ArgAction::SetTrue)]
@@ -134,10 +126,6 @@ pub(crate) struct RunArgs {
     pub(crate) target: Option<String>,
     #[arg(long, value_name = "FILE")]
     pub(crate) prompt: Option<String>,
-    #[arg(long, value_name = "ID")]
-    pub(crate) entrypoint: Option<String>,
-    #[arg(long, value_name = "ID")]
-    pub(crate) action: Option<String>,
     #[command(flatten)]
     pub(crate) runtime: RuntimeArgs,
 }
