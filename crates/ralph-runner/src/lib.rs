@@ -261,24 +261,16 @@ fn build_async_command(
 ) -> Result<AsyncCommand> {
     let command = match config.mode {
         CommandMode::Exec => {
-            let program = config
-                .program
-                .as_deref()
-                .ok_or_else(|| anyhow!("exec command is missing program"))?;
-            let program = render_template(program, context, prompt_file);
+            let (program, args) = rendered_exec_parts(config, context, prompt_file)?;
             let mut command = AsyncCommand::new(program);
-            for arg in &config.args {
-                command.arg(render_template(arg, context, prompt_file));
+            for arg in args {
+                command.arg(arg);
             }
             command
         }
         CommandMode::Shell => {
-            let template = config
-                .command
-                .as_deref()
-                .ok_or_else(|| anyhow!("shell command is missing command"))?;
             let mut command = shell_async_command();
-            command.arg(render_template(template, context, prompt_file));
+            command.arg(rendered_shell_command(config, context, prompt_file)?);
             command
         }
     };
@@ -292,28 +284,49 @@ fn build_std_command(
 ) -> Result<StdCommand> {
     let command = match config.mode {
         CommandMode::Exec => {
-            let program = config
-                .program
-                .as_deref()
-                .ok_or_else(|| anyhow!("exec command is missing program"))?;
-            let program = render_template(program, context, prompt_file);
+            let (program, args) = rendered_exec_parts(config, context, prompt_file)?;
             let mut command = StdCommand::new(program);
-            for arg in &config.args {
-                command.arg(render_template(arg, context, prompt_file));
+            for arg in args {
+                command.arg(arg);
             }
             command
         }
         CommandMode::Shell => {
-            let template = config
-                .command
-                .as_deref()
-                .ok_or_else(|| anyhow!("shell command is missing command"))?;
             let mut command = shell_std_command();
-            command.arg(render_template(template, context, prompt_file));
+            command.arg(rendered_shell_command(config, context, prompt_file)?);
             command
         }
     };
     Ok(command)
+}
+
+fn rendered_exec_parts(
+    config: &RunnerConfig,
+    context: &TemplateContext,
+    prompt_file: &str,
+) -> Result<(String, Vec<String>)> {
+    let program = config
+        .program
+        .as_deref()
+        .ok_or_else(|| anyhow!("exec command is missing program"))?;
+    let args = config
+        .args
+        .iter()
+        .map(|arg| render_template(arg, context, prompt_file))
+        .collect();
+    Ok((render_template(program, context, prompt_file), args))
+}
+
+fn rendered_shell_command(
+    config: &RunnerConfig,
+    context: &TemplateContext,
+    prompt_file: &str,
+) -> Result<String> {
+    let template = config
+        .command
+        .as_deref()
+        .ok_or_else(|| anyhow!("shell command is missing command"))?;
+    Ok(render_template(template, context, prompt_file))
 }
 
 fn rendered_envs(
