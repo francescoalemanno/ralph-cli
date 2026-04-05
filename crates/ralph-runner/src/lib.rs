@@ -12,7 +12,7 @@ use ralph_core::{
 use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::{Child as AsyncChild, Command as AsyncCommand},
+    process::Command as AsyncCommand,
     sync::mpsc::{self, UnboundedSender},
     task::JoinHandle,
     time::{Duration, sleep, timeout},
@@ -110,7 +110,6 @@ impl RunnerAdapter for CommandRunner {
         let prompt_file_path = prompt_file.path().to_string_lossy().to_string();
 
         let mut command = build_async_command(config, &context, &prompt_file_path)?;
-        configure_async_process_group(&mut command);
         command.current_dir(context.project_dir.as_std_path());
         command.kill_on_drop(true);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -127,7 +126,6 @@ impl RunnerAdapter for CommandRunner {
         );
 
         let mut child = command.spawn().context("failed to spawn runner process")?;
-        let child_pid = child.id();
         let stdout = child
             .stdout
             .take()
@@ -157,32 +155,12 @@ impl RunnerAdapter for CommandRunner {
         let stderr_task = tokio::spawn(read_stream(stderr, chunk_tx));
 
         let mut output_buffer = String::new();
-        let mut sent_cancel_stage = 0_u8;
         let exit_code = loop {
-            let cancel_stage = control.cancel_stage();
-            if cancel_stage > sent_cancel_stage {
-                match cancel_stage {
-                    1 => interrupt_runner(&mut child, child_pid).await,
-                    _ => force_kill_runner(&mut child, child_pid).await,
-                }
-                sent_cancel_stage = cancel_stage;
-            }
-
-            if sent_cancel_stage >= 2 {
+            if control.is_cancelled() {
+                let _ = child.start_kill();
                 stdout_task.abort();
                 stderr_task.abort();
                 let _ = timeout(Duration::from_millis(250), child.wait()).await;
-                return Err(anyhow!("runner canceled"));
-            }
-
-            if sent_cancel_stage >= 1
-                && child
-                    .try_wait()
-                    .context("failed while polling canceled runner")?
-                    .is_some()
-            {
-                stdout_task.abort();
-                stderr_task.abort();
                 return Err(anyhow!("runner canceled"));
             }
 
@@ -410,24 +388,6 @@ where
 }
 
 #[cfg(unix)]
-fn configure_async_process_group(command: &mut AsyncCommand) {
-    use std::io;
-
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn configure_async_process_group(_command: &mut AsyncCommand) {}
-
-#[cfg(unix)]
 fn configure_std_process_group(command: &mut StdCommand) {
     use std::os::unix::process::CommandExt;
 
@@ -444,25 +404,6 @@ fn configure_std_process_group(command: &mut StdCommand) {
 
 #[cfg(not(unix))]
 fn configure_std_process_group(_command: &mut StdCommand) {}
-
-async fn interrupt_runner(child: &mut AsyncChild, child_pid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = child_pid {
-        let _ = signal_process_group(pid, libc::SIGINT);
-        return;
-    }
-
-    let _ = child.start_kill();
-}
-
-async fn force_kill_runner(child: &mut AsyncChild, child_pid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = child_pid {
-        let _ = signal_process_group(pid, libc::SIGKILL);
-    }
-
-    let _ = child.start_kill();
-}
 
 #[cfg(unix)]
 fn signal_process_group(pid: u32, signal: i32) -> Result<()> {
@@ -774,7 +715,9 @@ mod tests {
                 .env
                 .get("OPENCODE_CONFIG_CONTENT")
                 .map(String::as_str),
-            Some(r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#)
+            Some(
+                r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#
+            )
         );
         assert_eq!(
             opencode
@@ -782,7 +725,9 @@ mod tests {
                 .env
                 .get("OPENCODE_CONFIG_CONTENT")
                 .map(String::as_str),
-            Some(r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#)
+            Some(
+                r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#
+            )
         );
     }
 
