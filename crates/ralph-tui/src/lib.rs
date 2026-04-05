@@ -19,13 +19,14 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 pub use editor::edit_file;
-use ralph_app::{FlowStatus, RalphApp, RunDelegate, RunEvent, WorkflowTemplateSummary};
-use ralph_core::{LastRunStatus, RunControl, TargetReview, TargetSummary};
+use ralph_app::{RalphApp, RunDelegate, RunEvent};
+use ralph_core::{LastRunStatus, RunControl, ScaffoldId, TargetReview, TargetSummary};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::runtime::Handle;
 use ui::{normalize_terminal_text, resume_terminal, suspend_terminal};
 
 const RUNNING_SCROLLBACK_LIMIT: usize = 100_000;
+const AVAILABLE_SCAFFOLDS: [ScaffoldId; 2] = [ScaffoldId::SinglePrompt, ScaffoldId::PlanBuild];
 
 pub fn run_tui(app: RalphApp) -> Result<()> {
     run_tui_with_target(app, None)
@@ -84,13 +85,7 @@ enum Screen {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConfirmationAction {
-    DeleteTarget {
-        target_id: String,
-    },
-    FlowAction {
-        target_id: String,
-        action_id: String,
-    },
+    DeleteTarget { target_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,8 +196,7 @@ struct TuiApp {
     selected_prompt: usize,
     screen: Screen,
     new_target_name: String,
-    workflow_templates: Vec<WorkflowTemplateSummary>,
-    selected_workflow_template: usize,
+    selected_scaffold: usize,
     message: String,
     running: Option<RunningState>,
     confirmation: Option<ConfirmationDialog>,
@@ -210,71 +204,6 @@ struct TuiApp {
 }
 
 impl TuiApp {
-    fn selected_target_has_flow_entrypoints(&self) -> bool {
-        self.selected_target()
-            .is_some_and(ralph_core::TargetSummary::has_flow_entrypoints)
-    }
-
-    fn selected_flow_status(&self) -> Option<FlowStatus> {
-        let target = self.selected_target()?;
-        self.app.flow_status(&target.id).ok().flatten()
-    }
-
-    fn selected_flow_actions(&self) -> Vec<ralph_app::FlowActionStatus> {
-        self.selected_flow_status()
-            .map(|status| {
-                if let Some(pause) = status.pause {
-                    pause.actions
-                } else {
-                    status.actions
-                }
-            })
-            .unwrap_or_default()
-    }
-
-    fn try_start_selected_flow_action_for_key(&mut self, key: KeyEvent) -> Result<bool> {
-        let KeyCode::Char(ch) = key.code else {
-            return Ok(false);
-        };
-        let Some(target_id) = self.selected_target().map(|target| target.id.clone()) else {
-            return Ok(false);
-        };
-        let pressed = ch.to_ascii_lowercase();
-
-        for action in self.selected_flow_actions() {
-            let Some(shortcut) = action.shortcut.as_deref() else {
-                continue;
-            };
-            let mut chars = shortcut.chars();
-            let Some(first) = chars.next() else {
-                continue;
-            };
-            if chars.next().is_some() {
-                continue;
-            }
-            if first.to_ascii_lowercase() == pressed {
-                if let (Some(title), Some(body)) = (
-                    action.confirm_title.as_deref(),
-                    action.confirm_message.as_deref(),
-                ) {
-                    self.confirmation = Some(ConfirmationDialog::new(
-                        title,
-                        body.replace("{target}", &target_id),
-                        ConfirmationAction::FlowAction {
-                            target_id: target_id.clone(),
-                            action_id: action.id.clone(),
-                        },
-                    ));
-                } else {
-                    self.start_named_flow_action(&target_id, &action.id)?;
-                }
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
-    }
-
     fn new(app: RalphApp, handle: Handle, target: Option<String>) -> Self {
         let (tx, rx) = mpsc::channel();
         let mut this = Self {
@@ -288,14 +217,12 @@ impl TuiApp {
             selected_prompt: 0,
             screen: Screen::Dashboard,
             new_target_name: String::new(),
-            workflow_templates: Vec::new(),
-            selected_workflow_template: 0,
+            selected_scaffold: 0,
             message: String::new(),
             running: None,
             confirmation: None,
             tick_count: 0,
         };
-        this.reload_workflow_templates();
         this.reload_targets();
         if let Some(target) = target {
             if let Some(index) = this.targets.iter().position(|summary| summary.id == target) {
@@ -406,8 +333,7 @@ impl TuiApp {
             KeyCode::Char('n') => {
                 self.screen = Screen::NewTarget;
                 self.new_target_name.clear();
-                self.reload_workflow_templates();
-                self.selected_workflow_template = 0;
+                self.selected_scaffold = 0;
             }
             KeyCode::Char('r') => self.start_run()?,
             KeyCode::Char('e') => {
@@ -432,9 +358,7 @@ impl TuiApp {
             KeyCode::Char('a') => {
                 self.cycle_agent(None)?;
             }
-            _ => {
-                let _ = self.try_start_selected_flow_action_for_key(key)?;
-            }
+            _ => {}
         }
         Ok(())
     }
@@ -476,8 +400,8 @@ impl TuiApp {
             KeyCode::Esc => {
                 self.screen = Screen::Dashboard;
             }
-            KeyCode::Tab | KeyCode::Down | KeyCode::Right => self.cycle_workflow_template(1),
-            KeyCode::Up | KeyCode::Left => self.cycle_workflow_template(-1),
+            KeyCode::Tab | KeyCode::Down | KeyCode::Right => self.cycle_scaffold(1),
+            KeyCode::Up | KeyCode::Left => self.cycle_scaffold(-1),
             KeyCode::Backspace => {
                 self.new_target_name.pop();
             }
@@ -487,12 +411,8 @@ impl TuiApp {
                     self.message = "target name cannot be empty".to_owned();
                     return Ok(());
                 }
-                let Some(template_id) = self.selected_workflow_template().map(|template| template.id.clone()) else {
-                    self.message = "no workflow templates are available".to_owned();
-                    return Ok(());
-                };
-                let summary = match self.app.create_target_from_template(&target_name, &template_id)
-                {
+                let scaffold = self.selected_scaffold();
+                let summary = match self.app.create_target(&target_name, Some(scaffold)) {
                     Ok(summary) => summary,
                     Err(error) => {
                         self.message = error.to_string();
@@ -506,7 +426,10 @@ impl TuiApp {
                     self.refresh_selected_target_review();
                 }
                 self.screen = Screen::Dashboard;
-                let opened_path = Some(self.app.resolve_target_edit_path(&summary.id, None)?);
+                let opened_path = summary
+                    .prompt_files
+                    .first()
+                    .map(|prompt| prompt.path.clone());
                 if let Some(opened_path) = opened_path {
                     let editor = self.app.config().editor_override.clone();
                     suspend_terminal(terminal)?;
@@ -627,20 +550,6 @@ impl TuiApp {
                         RunEvent::Note(note) => {
                             running.push_terminal_text(&format!("\n{note}\n"));
                         }
-                        RunEvent::InteractiveSessionStart { prompt_name, ready } => {
-                            let _ = ready.send(());
-                            running.push_terminal_text(&format!(
-                                "\nstarting interactive session '{}'\n",
-                                prompt_name
-                            ));
-                        }
-                        RunEvent::InteractiveSessionEnd { prompt_name, ready } => {
-                            let _ = ready.send(());
-                            running.push_terminal_text(&format!(
-                                "\ninteractive session '{}' finished\n",
-                                prompt_name
-                            ));
-                        }
                         RunEvent::Finished { status, summary } => {
                             running.finish(status);
                             running.push_terminal_text(&format!(
@@ -693,58 +602,10 @@ impl TuiApp {
     fn handle_ui_event_in_terminal(
         &mut self,
         event: UiEvent,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<()> {
-        match event {
-            UiEvent::RunEvent(RunEvent::InteractiveSessionStart { prompt_name, ready }) => {
-                self.handle_interactive_session_handoff(prompt_name, ready, terminal)
-            }
-            other => {
-                self.handle_ui_event(other);
-                Ok(())
-            }
-        }
-    }
-
-    fn handle_interactive_session_handoff(
-        &mut self,
-        prompt_name: String,
-        ready: tokio::sync::oneshot::Sender<()>,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> Result<()> {
-        if let Some(running) = &mut self.running {
-            running.push_terminal_text(&format!(
-                "\nstarting interactive session '{}'\n",
-                prompt_name
-            ));
-        }
-
-        suspend_terminal(terminal)?;
-        let _ = ready.send(());
-
-        loop {
-            match self
-                .rx
-                .recv()
-                .map_err(|_| anyhow!("interactive session lost its UI channel"))?
-            {
-                UiEvent::Tick => {
-                    self.tick_count = self.tick_count.wrapping_add(1);
-                }
-                UiEvent::RunEvent(RunEvent::InteractiveSessionEnd { prompt_name, ready }) => {
-                    resume_terminal(terminal)?;
-                    let _ = ready.send(());
-                    if let Some(running) = &mut self.running {
-                        running.push_terminal_text(&format!(
-                            "\ninteractive session '{}' finished\n",
-                            prompt_name
-                        ));
-                    }
-                    return Ok(());
-                }
-                other => self.handle_ui_event(other),
-            }
-        }
+        self.handle_ui_event(event);
+        Ok(())
     }
 
     fn reload_targets(&mut self) {
@@ -773,37 +634,14 @@ impl TuiApp {
         }
     }
 
-    fn reload_workflow_templates(&mut self) {
-        match self.app.list_workflow_templates() {
-            Ok(templates) => {
-                self.workflow_templates = templates;
-                if self.workflow_templates.is_empty() {
-                    self.selected_workflow_template = 0;
-                } else {
-                    self.selected_workflow_template = self
-                        .selected_workflow_template
-                        .min(self.workflow_templates.len() - 1);
-                }
-            }
-            Err(error) => {
-                self.workflow_templates = Vec::new();
-                self.selected_workflow_template = 0;
-                self.message = error.to_string();
-            }
-        }
+    fn selected_scaffold(&self) -> ScaffoldId {
+        AVAILABLE_SCAFFOLDS[self.selected_scaffold % AVAILABLE_SCAFFOLDS.len()]
     }
 
-    fn selected_workflow_template(&self) -> Option<&WorkflowTemplateSummary> {
-        self.workflow_templates.get(self.selected_workflow_template)
-    }
-
-    fn cycle_workflow_template(&mut self, delta: isize) {
-        if self.workflow_templates.is_empty() {
-            return;
-        }
-        let len = self.workflow_templates.len() as isize;
-        let current = self.selected_workflow_template as isize;
-        self.selected_workflow_template = (current + delta).rem_euclid(len) as usize;
+    fn cycle_scaffold(&mut self, delta: isize) {
+        let len = AVAILABLE_SCAFFOLDS.len() as isize;
+        let current = self.selected_scaffold as isize;
+        self.selected_scaffold = (current + delta).rem_euclid(len) as usize;
     }
 
     fn selected_target(&self) -> Option<&TargetSummary> {
@@ -830,11 +668,7 @@ impl TuiApp {
             return Err(anyhow!("select a target first"));
         };
         let target_id = target.id.clone();
-        let prompt_name = if target.has_flow_entrypoints() {
-            None
-        } else {
-            self.selected_prompt().map(|prompt| prompt.name.clone())
-        };
+        let prompt_name = self.selected_prompt().map(|prompt| prompt.name.clone());
         self.app
             .resolve_target_edit_path(&target_id, prompt_name.as_deref())
     }
@@ -848,14 +682,6 @@ impl TuiApp {
     }
 
     fn start_run(&mut self) -> Result<()> {
-        if self.selected_target_has_flow_entrypoints() {
-            let Some(target_id) = self.selected_target().map(|target| target.id.clone()) else {
-                self.message = "select a target first".to_owned();
-                return Ok(());
-            };
-            return self.start_run_for(&target_id, None);
-        }
-
         let Some((target_id, prompt_name)) = self.selected_target_and_prompt() else {
             self.message = "select a target and prompt first".to_owned();
             return Ok(());
@@ -873,7 +699,7 @@ impl TuiApp {
         let requested_prompt = prompt_name.map(ToOwned::to_owned);
         let display_prompt = requested_prompt
             .clone()
-            .unwrap_or_else(|| "workflow_auto".to_owned());
+            .unwrap_or_else(|| "<prompt>".to_owned());
         self.running = Some(RunningState::new(
             target_id.to_owned(),
             display_prompt,
@@ -888,40 +714,6 @@ impl TuiApp {
                 .run_target_with_control(
                     &target_id,
                     requested_prompt.as_deref(),
-                    run_control,
-                    &mut delegate,
-                )
-                .await
-                .map_err(|error| error.to_string());
-            let _ = tx.send(UiEvent::RunDone(result));
-        });
-
-        Ok(())
-    }
-
-    fn start_named_flow_action(&mut self, target_id: &str, action_id: &str) -> Result<()> {
-        let tx = self.tx.clone();
-        let app = self.app.clone();
-        let control = RunControl::new();
-        let run_control = control.clone();
-        let target_id = target_id.to_owned();
-        let action_id = action_id.to_owned();
-        self.running = Some(RunningState::new(
-            target_id.clone(),
-            action_id.clone(),
-            None,
-            control,
-        ));
-        self.screen = Screen::Running;
-
-        self.handle.spawn(async move {
-            let mut delegate = ChannelDelegate { tx: tx.clone() };
-            let result = app
-                .run_target_with_options(
-                    &target_id,
-                    None,
-                    None,
-                    Some(&action_id),
                     run_control,
                     &mut delegate,
                 )
@@ -958,15 +750,6 @@ impl TuiApp {
                 self.reload_targets();
                 self.message = format!("deleted {target_id}");
                 Ok(())
-            }
-            ConfirmationAction::FlowAction {
-                target_id,
-                action_id,
-            } => {
-                if let Some(index) = self.targets.iter().position(|item| item.id == target_id) {
-                    self.selected_target = index;
-                }
-                self.start_named_flow_action(&target_id, &action_id)
             }
         }
     }
@@ -1142,47 +925,17 @@ mod tests {
     }
 
     #[test]
-    fn workflow_targets_are_detected_from_flow_entrypoints_even_without_scaffold() -> Result<()> {
+    fn new_target_screen_cycles_builtin_scaffolds() -> Result<()> {
         let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(project_dir.clone())?;
-        app.create_target("demo", Some(ScaffoldId::PlanDriven))?;
-        std::fs::write(
-            project_dir.join(".ralph/targets/demo/target.toml"),
-            "id = \"demo\"\nlast_run_status = \"never_run\"\ndefault_entrypoint = \"main\"\n\n[[entrypoints]]\nid = \"main\"\nkind = \"flow\"\nflow = \"builtin://flows/plan_driven.toml\"\nedit_path = \"GOAL.md\"\n",
-        )?;
-
-        let runtime = Runtime::new()?;
-        let tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
-
-        assert!(tui.selected_target_has_flow_entrypoints());
-        Ok(())
-    }
-
-    #[test]
-    fn new_target_screen_loads_project_workflow_templates() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let workflow_dir = project_dir.join(".ralph/workflows/release_loop");
-        std::fs::create_dir_all(workflow_dir.join("templates"))?;
-        std::fs::write(
-            workflow_dir.join("workflow.toml"),
-            "version = 1\nid = \"release_loop\"\nname = \"Release Loop\"\ndefault_entrypoint = \"main\"\n\n[[entrypoints]]\nid = \"main\"\nkind = \"prompt\"\npath = \"prompt_main.md\"\nedit_path = \"prompt_main.md\"\n\n[[materialize]]\nkind = \"file\"\npath = \"prompt_main.md\"\nsource = \"self://templates/prompt_main.md\"\n",
-        )?;
-        std::fs::write(
-            workflow_dir.join("templates/prompt_main.md"),
-            "# Prompt\n\nShip it.\n",
-        )?;
-
         let app = RalphApp::load(project_dir)?;
         let runtime = Runtime::new()?;
         let mut tui = TuiApp::new(app, runtime.handle().clone(), None);
         tui.screen = super::Screen::NewTarget;
-        tui.reload_workflow_templates();
+        assert_eq!(tui.selected_scaffold(), ScaffoldId::SinglePrompt);
 
-        assert!(
-            tui.workflow_templates
-                .iter()
-                .any(|template| template.id == "release_loop")
-        );
+        tui.cycle_scaffold(1);
+
+        assert_eq!(tui.selected_scaffold(), ScaffoldId::PlanBuild);
         Ok(())
     }
 
@@ -1221,10 +974,10 @@ mod tests {
     }
 
     #[test]
-    fn smart_run_on_new_workflow_target_starts_from_flow_entrypoint() -> Result<()> {
+    fn start_run_uses_the_selected_prompt() -> Result<()> {
         let (_temp, project_dir) = temp_project_dir();
         let app = RalphApp::load(project_dir)?;
-        app.create_target("demo", Some(ScaffoldId::TaskDriven))?;
+        app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
 
         let runtime = Runtime::new()?;
         let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
@@ -1232,8 +985,8 @@ mod tests {
         tui.start_run()?;
 
         let running = tui.running.as_ref().expect("running state");
-        assert_eq!(running.prompt_name, "workflow_auto");
-        assert_eq!(running.requested_prompt.as_deref(), None);
+        assert_eq!(running.prompt_name, "prompt_main.md");
+        assert_eq!(running.requested_prompt.as_deref(), Some("prompt_main.md"));
         assert!(tui.running.is_some());
         Ok(())
     }
@@ -1374,33 +1127,6 @@ mod tests {
         tui.handle_confirmation_key(KeyEvent::from(KeyCode::Enter))?;
         assert!(tui.confirmation.is_none());
         assert!(tui.app.list_targets()?.is_empty());
-
-        Ok(())
-    }
-
-    #[test]
-    fn workflow_rebuild_requires_explicit_yes_confirmation() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(project_dir.clone())?;
-        app.create_target("demo", Some(ScaffoldId::PlanDriven))?;
-        let target_dir = project_dir.join(".ralph/targets/demo");
-        std::fs::write(target_dir.join("plan.toml"), "version = 1\n")?;
-        let target_config = target_dir.join("target.toml");
-        let mut raw = std::fs::read_to_string(&target_config)?;
-        raw.push_str(
-            "\n[runtime]\nactive_entrypoint = \"main\"\ncurrent_node = \"plan_driven_paused\"\n",
-        );
-        std::fs::write(&target_config, raw)?;
-
-        let runtime = Runtime::new()?;
-        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
-
-        tui.handle_dashboard_key(KeyEvent::from(KeyCode::Char('x')), &mut test_terminal()?)?;
-        assert!(tui.confirmation.is_some());
-        tui.handle_confirmation_key(KeyEvent::from(KeyCode::Enter))?;
-        assert!(tui.confirmation.is_none());
-        assert!(target_dir.join("plan.toml").exists());
-        assert!(!target_dir.join(".history").exists());
 
         Ok(())
     }

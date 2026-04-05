@@ -32,12 +32,6 @@ struct ShortcutHint {
     tone: ShortcutTone,
 }
 
-struct OwnedShortcutHint {
-    key: String,
-    label: String,
-    tone: ShortcutTone,
-}
-
 impl TuiApp {
     pub(super) fn draw(&mut self, frame: &mut Frame<'_>) {
         frame.render_widget(
@@ -218,32 +212,13 @@ impl TuiApp {
                         tone: ShortcutTone::Warning,
                     },
                 ]);
-                let mut spans = shortcut_spans(&hints, self);
-                if self.selected_target_has_flow_entrypoints() {
-                    let dynamic_hints = self
-                        .selected_flow_actions()
-                        .into_iter()
-                        .filter_map(|action| {
-                            let shortcut = action.shortcut?;
-                            Some(OwnedShortcutHint {
-                                key: shortcut,
-                                label: action.label,
-                                tone: ShortcutTone::Accent,
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    if !dynamic_hints.is_empty() {
-                        spans.push(Span::styled("  ", Style::default().fg(self.muted_color())));
-                        spans.extend(shortcut_spans_owned(&dynamic_hints, self));
-                    }
-                }
-                spans
+                shortcut_spans(&hints, self)
             }
             Screen::NewTarget => shortcut_spans(
                 &[
                     ShortcutHint {
                         key: "Tab",
-                        label: "switch template",
+                        label: "switch scaffold",
                         tone: ShortcutTone::Accent,
                     },
                     ShortcutHint {
@@ -289,10 +264,9 @@ impl TuiApp {
                 .iter()
                 .map(|target| {
                     let prompt_count = target.prompt_files.len();
-                    let template = target
-                        .template
-                        .clone()
-                        .or_else(|| target.scaffold.map(|value| value.as_str().to_owned()))
+                    let scaffold = target
+                        .scaffold
+                        .map(|value| value.as_str().to_owned())
                         .unwrap_or_else(|| "none".to_owned());
                     let status = target.last_run_status;
                     ListItem::new(Text::from(vec![
@@ -327,7 +301,7 @@ impl TuiApp {
                             ),
                             Span::styled("◆", Style::default().fg(self.subtle_color())),
                             Span::styled(
-                                format!(" template {}", template),
+                                format!(" scaffold {}", scaffold),
                                 Style::default().fg(self.muted_color()),
                             ),
                         ]),
@@ -376,13 +350,11 @@ impl TuiApp {
                 ])
                 .split(inner);
 
-            let template = target
-                .template
-                .clone()
-                .or_else(|| target.scaffold.map(|value| value.as_str().to_owned()))
+            let scaffold = target
+                .scaffold
+                .map(|value| value.as_str().to_owned())
                 .unwrap_or_else(|| "none".to_owned());
-            let flow_status = self.selected_flow_status();
-            let mut header_lines = vec![
+            let header_lines = vec![
                 Line::from(vec![
                     Span::styled(
                         format!(" {} ", status_badge(target.last_run_status)),
@@ -404,8 +376,8 @@ impl TuiApp {
                 ]),
                 Line::from(vec![Span::styled(
                     format!(
-                        "template {}  ◆  last_prompt {}",
-                        template,
+                        "scaffold {}  ◆  last_prompt {}",
+                        scaffold,
                         target.last_prompt.as_deref().unwrap_or("<none>")
                     ),
                     Style::default().fg(self.muted_color()),
@@ -419,22 +391,6 @@ impl TuiApp {
                     Style::default().fg(self.muted_color()),
                 )]),
             ];
-            if let Some(flow_status) = flow_status {
-                let flow_state = if flow_status.pause.is_some() {
-                    "paused"
-                } else {
-                    "active"
-                };
-                header_lines.push(Line::from(vec![Span::styled(
-                    format!(
-                        "entrypoint {}  ◆  node {}  ◆  state {}",
-                        flow_status.entrypoint_id,
-                        flow_status.current_node.as_deref().unwrap_or("<start>"),
-                        flow_state,
-                    ),
-                    Style::default().fg(self.muted_color()),
-                )]));
-            }
 
             let header = Paragraph::new(Text::from(header_lines)).block(
                 self.panel_block()
@@ -442,10 +398,7 @@ impl TuiApp {
             );
             frame.render_widget(header, sections[0]);
 
-            let has_flow_entrypoints = target.has_flow_entrypoints();
-            let titles = if has_flow_entrypoints {
-                vec![Line::from("workflow input")]
-            } else if target.prompt_files.is_empty() {
+            let titles = if target.prompt_files.is_empty() {
                 vec![Line::from("no prompts")]
             } else {
                 target
@@ -459,14 +412,10 @@ impl TuiApp {
                     self.selected_prompt
                         .min(target.prompt_files.len().saturating_sub(1)),
                 )
-                .block(self.panel_block().title(self.title_line(
-                    "Prompts",
-                    if has_flow_entrypoints {
-                        "Flow entrypoints run internally"
-                    } else {
-                        "Choose which loop prompt to run"
-                    },
-                )))
+                .block(
+                    self.panel_block()
+                        .title(self.title_line("Prompts", "Choose which loop prompt to run")),
+                )
                 .highlight_style(
                     Style::default()
                         .fg(self.accent_color())
@@ -479,43 +428,21 @@ impl TuiApp {
             let prompt_preview = self
                 .selected_target_review()
                 .and_then(|review| {
-                    if has_flow_entrypoints {
+                    self.selected_prompt().and_then(|prompt| {
                         review
                             .files
                             .iter()
-                            .find(|file| file.name == "GOAL.md")
+                            .find(|file| file.name == prompt.name)
                             .map(|file| file.contents.clone())
-                    } else {
-                        self.selected_prompt().and_then(|prompt| {
-                            review
-                                .files
-                                .iter()
-                                .find(|file| file.name == prompt.name)
-                                .map(|file| file.contents.clone())
-                        })
-                    }
+                    })
                 })
-                .unwrap_or_else(|| {
-                    if has_flow_entrypoints {
-                        "<missing GOAL.md>".to_owned()
-                    } else {
-                        "<missing prompt>".to_owned()
-                    }
-                });
+                .unwrap_or_else(|| "<missing prompt>".to_owned());
 
             let preview = Paragraph::new(prompt_preview)
-                .block(self.panel_block().title(self.title_line(
-                    if has_flow_entrypoints {
-                        "Goal Preview"
-                    } else {
-                        "Prompt Preview"
-                    },
-                    if has_flow_entrypoints {
-                        "User-facing workflow input"
-                    } else {
-                        "Selected runnable prompt"
-                    },
-                )))
+                .block(
+                    self.panel_block()
+                        .title(self.title_line("Prompt Preview", "Selected runnable prompt")),
+                )
                 .style(Style::default().fg(self.text_color()))
                 .wrap(Wrap { trim: false });
             frame.render_widget(preview, sections[2]);
@@ -534,14 +461,10 @@ impl TuiApp {
                     .collect::<Vec<_>>()
                     .join("\n"),
             )
-            .block(self.panel_block().title(self.title_line(
-                "Files",
-                if has_flow_entrypoints {
-                    "Flow targets expose GOAL.md and state files"
-                } else {
-                    "Runnable prompts are marked with *"
-                },
-            )))
+            .block(
+                self.panel_block()
+                    .title(self.title_line("Files", "Runnable prompts are marked with *")),
+            )
             .style(Style::default().fg(self.muted_color()))
             .wrap(Wrap { trim: false });
             frame.render_widget(files, sections[3]);
@@ -566,19 +489,15 @@ impl TuiApp {
         } else {
             format!("{} ", self.new_target_name)
         };
-        let selected_template = self.selected_workflow_template();
-        let template_name = selected_template
-            .map(|template| template.name.as_str())
-            .unwrap_or("<none>");
-        let template_source = selected_template
-            .map(|template| template.source.label())
-            .unwrap_or("none");
-        let template_description = selected_template
-            .and_then(|template| template.description.as_deref())
-            .unwrap_or("No workflow templates are available.");
+        let selected_scaffold = self.selected_scaffold();
+        let scaffold_name = selected_scaffold.as_str();
+        let scaffold_description = match selected_scaffold {
+            ralph_core::ScaffoldId::SinglePrompt => "Creates one runnable markdown prompt file.",
+            ralph_core::ScaffoldId::PlanBuild => "Creates a two-step plan/build markdown target.",
+        };
         let text = Text::from(vec![
             Line::from(vec![Span::styled(
-                "Create a target from a discovered workflow template.",
+                "Create a target from a builtin scaffold.",
                 Style::default().fg(self.muted_color()),
             )]),
             Line::from(""),
@@ -587,27 +506,23 @@ impl TuiApp {
                 Span::styled(name_display, Style::default().fg(self.text_color())),
             ]),
             Line::from(vec![
-                Span::styled("template ", key_style(self.success_color())),
+                Span::styled("scaffold ", key_style(self.success_color())),
                 Span::styled(
-                    template_name,
+                    scaffold_name,
                     Style::default()
                         .fg(self.text_color())
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("  ({template_source})"),
-                    Style::default().fg(self.muted_color()),
-                ),
             ]),
             Line::from(vec![Span::styled(
-                template_description,
+                scaffold_description,
                 Style::default().fg(self.muted_color()),
             )]),
             Line::from(""),
             Line::from(vec![
                 Span::styled("Tab", key_style(self.accent_color())),
                 Span::styled(
-                    " switch template  ",
+                    " switch scaffold  ",
                     Style::default().fg(self.muted_color()),
                 ),
                 Span::styled("Enter", key_style(self.success_color())),
@@ -619,7 +534,7 @@ impl TuiApp {
         let widget = Paragraph::new(text)
             .block(
                 self.panel_block()
-                    .title(self.title_line("New Target", "Builtin and user workflow templates")),
+                    .title(self.title_line("New Target", "Create a scaffolded markdown target")),
             )
             .style(
                 Style::default()
@@ -969,29 +884,6 @@ fn shortcut_spans(hints: &[ShortcutHint], app: &TuiApp) -> Vec<Span<'static>> {
     spans
 }
 
-fn shortcut_spans_owned(hints: &[OwnedShortcutHint], app: &TuiApp) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    for (index, hint) in hints.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled("  ", Style::default().fg(app.muted_color())));
-        }
-        spans.push(Span::styled(
-            hint.key.clone(),
-            key_style(match hint.tone {
-                ShortcutTone::Accent => app.accent_color(),
-                ShortcutTone::Success => app.success_color(),
-                ShortcutTone::Warning => app.warning_color(),
-                ShortcutTone::Neutral => app.text_color(),
-            }),
-        ));
-        spans.push(Span::styled(
-            format!(" {}", hint.label),
-            Style::default().fg(app.muted_color()),
-        ));
-    }
-    spans
-}
-
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
@@ -1115,92 +1007,6 @@ mod tests {
                 "live spinner text still shown for {status:?}"
             );
         }
-
-        Ok(())
-    }
-
-    #[test]
-    fn dashboard_footer_shows_dynamic_pause_actions_from_flow_state() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(&project_dir)?;
-        app.create_target("prompt", Some(ScaffoldId::SinglePrompt))?;
-        app.create_target("tasks", Some(ScaffoldId::TaskDriven))?;
-        app.create_target("workflow", Some(ScaffoldId::PlanDriven))?;
-        for (target, node_id) in [
-            ("tasks", "task_driven_paused"),
-            ("workflow", "plan_driven_paused"),
-        ] {
-            let target_config = project_dir.join(format!(".ralph/targets/{target}/target.toml"));
-            let mut raw = std::fs::read_to_string(&target_config)?;
-            raw.push_str(&format!(
-                "\n[runtime]\nactive_entrypoint = \"main\"\ncurrent_node = \"{node_id}\"\n"
-            ));
-            std::fs::write(target_config, raw)?;
-        }
-
-        let runtime = Runtime::new()?;
-        let prompt_tui = TuiApp::new(
-            app.clone(),
-            runtime.handle().clone(),
-            Some("prompt".to_owned()),
-        );
-        let prompt_footer = prompt_tui
-            .footer_spans()
-            .into_iter()
-            .map(|span| span.content.to_string())
-            .collect::<String>();
-        assert!(!prompt_footer.contains("Interview goal"));
-        assert!(!prompt_footer.contains("rebase"));
-        assert!(!prompt_footer.contains("rebuild"));
-        assert!(!prompt_footer.contains("build"));
-
-        let task_tui = TuiApp::new(
-            app.clone(),
-            runtime.handle().clone(),
-            Some("tasks".to_owned()),
-        );
-        let task_footer = task_tui
-            .footer_spans()
-            .into_iter()
-            .map(|span| span.content.to_string())
-            .collect::<String>();
-        assert!(task_footer.contains("Build current backlog"));
-        assert!(task_footer.contains("Interview goal"));
-        assert!(task_footer.contains("Rebase backlog"));
-        assert!(task_footer.contains("Rebuild from scratch"));
-
-        let workflow_tui = TuiApp::new(app, runtime.handle().clone(), Some("workflow".to_owned()));
-        let workflow_footer = workflow_tui
-            .footer_spans()
-            .into_iter()
-            .map(|span| span.content.to_string())
-            .collect::<String>();
-        assert!(workflow_footer.contains("Build current plan"));
-        assert!(workflow_footer.contains("Interview goal"));
-        assert!(workflow_footer.contains("Rebase plan"));
-        assert!(workflow_footer.contains("Rebuild from scratch"));
-
-        Ok(())
-    }
-
-    #[test]
-    fn dashboard_footer_shows_flow_actions_for_fresh_flow_targets() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(&project_dir)?;
-        app.create_target("tasks", Some(ScaffoldId::TaskDriven))?;
-
-        let runtime = Runtime::new()?;
-        let tui = TuiApp::new(app, runtime.handle().clone(), Some("tasks".to_owned()));
-        let footer = tui
-            .footer_spans()
-            .into_iter()
-            .map(|span| span.content.to_string())
-            .collect::<String>();
-
-        assert!(footer.contains("Build current backlog"));
-        assert!(footer.contains("Interview goal"));
-        assert!(footer.contains("Rebase backlog"));
-        assert!(footer.contains("Rebuild from scratch"));
 
         Ok(())
     }
