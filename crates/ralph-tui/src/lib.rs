@@ -265,7 +265,7 @@ impl TuiApp {
             }
 
             while let Ok(event) = self.rx.try_recv() {
-                self.handle_ui_event_in_terminal(event, terminal)?;
+                self.handle_ui_event(event);
             }
         }
 
@@ -597,15 +597,6 @@ impl TuiApp {
                 }
             },
         }
-    }
-
-    fn handle_ui_event_in_terminal(
-        &mut self,
-        event: UiEvent,
-        _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> Result<()> {
-        self.handle_ui_event(event);
-        Ok(())
     }
 
     fn reload_targets(&mut self) {
