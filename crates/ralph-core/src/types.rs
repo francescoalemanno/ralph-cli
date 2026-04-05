@@ -1,9 +1,6 @@
-use std::{
-    collections::BTreeMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
-    },
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 
 use camino::Utf8PathBuf;
@@ -38,8 +35,6 @@ pub enum ScaffoldId {
     #[default]
     SinglePrompt,
     PlanBuild,
-    TaskDriven,
-    PlanDriven,
 }
 
 impl ScaffoldId {
@@ -47,89 +42,8 @@ impl ScaffoldId {
         match self {
             Self::SinglePrompt => "single_prompt",
             Self::PlanBuild => "plan_build",
-            Self::TaskDriven => "task_driven",
-            Self::PlanDriven => "plan_driven",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EntrypointKind {
-    Prompt,
-    Flow,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum TargetEntrypoint {
-    Prompt {
-        id: String,
-        path: String,
-        #[serde(default)]
-        hidden: bool,
-        #[serde(default)]
-        edit_path: Option<String>,
-    },
-    Flow {
-        id: String,
-        flow: String,
-        #[serde(default)]
-        params: BTreeMap<String, String>,
-        #[serde(default)]
-        hidden: bool,
-        #[serde(default)]
-        edit_path: Option<String>,
-    },
-}
-
-impl TargetEntrypoint {
-    pub fn id(&self) -> &str {
-        match self {
-            Self::Prompt { id, .. } | Self::Flow { id, .. } => id,
-        }
-    }
-
-    pub fn kind(&self) -> EntrypointKind {
-        match self {
-            Self::Prompt { .. } => EntrypointKind::Prompt,
-            Self::Flow { .. } => EntrypointKind::Flow,
-        }
-    }
-
-    pub fn hidden(&self) -> bool {
-        match self {
-            Self::Prompt { hidden, .. } | Self::Flow { hidden, .. } => *hidden,
-        }
-    }
-
-    pub fn edit_path(&self) -> Option<&str> {
-        match self {
-            Self::Prompt { edit_path, .. } | Self::Flow { edit_path, .. } => edit_path.as_deref(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct FlowRuntimeState {
-    #[serde(default)]
-    pub active_entrypoint: Option<String>,
-    #[serde(default)]
-    pub current_node: Option<String>,
-    #[serde(default)]
-    pub vars: BTreeMap<String, String>,
-    #[serde(default)]
-    pub last_signal: Option<String>,
-    #[serde(default)]
-    pub last_note: Option<String>,
-    #[serde(default)]
-    pub inflight: Option<FlowRuntimeInflight>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FlowRuntimeInflight {
-    pub node_id: String,
-    pub started_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,14 +52,6 @@ pub struct TargetConfig {
     #[serde(default)]
     pub scaffold: Option<ScaffoldId>,
     #[serde(default)]
-    pub template: Option<String>,
-    #[serde(default)]
-    pub default_entrypoint: Option<String>,
-    #[serde(default)]
-    pub entrypoints: Vec<TargetEntrypoint>,
-    #[serde(default)]
-    pub runtime: Option<FlowRuntimeState>,
-    #[serde(default)]
     pub created_at: Option<u64>,
     #[serde(default)]
     pub max_iterations: Option<usize>,
@@ -153,14 +59,6 @@ pub struct TargetConfig {
     pub last_prompt: Option<String>,
     #[serde(default)]
     pub last_run_status: LastRunStatus,
-}
-
-impl TargetConfig {
-    pub fn has_flow_entrypoints(&self) -> bool {
-        self.entrypoints
-            .iter()
-            .any(|entrypoint| entrypoint.kind() == EntrypointKind::Flow)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,21 +87,9 @@ pub struct TargetSummary {
     pub prompt_files: Vec<PromptFile>,
     pub files: Vec<TargetFile>,
     pub scaffold: Option<ScaffoldId>,
-    #[serde(default)]
-    pub template: Option<String>,
-    #[serde(default)]
-    pub default_entrypoint: Option<String>,
-    #[serde(default)]
-    pub flow_entrypoints: Vec<String>,
     pub created_at: Option<u64>,
     pub last_prompt: Option<String>,
     pub last_run_status: LastRunStatus,
-}
-
-impl TargetSummary {
-    pub fn has_flow_entrypoints(&self) -> bool {
-        !self.flow_entrypoints.is_empty()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,7 +123,7 @@ pub struct RunnerResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct RunControl {
-    cancel_stage: Arc<AtomicU8>,
+    cancelled: Arc<AtomicBool>,
     agent_id: Arc<Mutex<Option<String>>>,
 }
 
@@ -247,12 +133,12 @@ impl RunControl {
     }
 
     pub fn cancel(&self) -> u8 {
-        self.bump_cancel_stage()
+        self.cancelled.store(true, Ordering::SeqCst);
+        1
     }
 
     pub fn force_cancel(&self) -> u8 {
-        self.cancel_stage.store(2, Ordering::SeqCst);
-        2
+        self.cancel()
     }
 
     pub fn set_agent_id(&self, agent_id: impl Into<String>) {
@@ -271,35 +157,17 @@ impl RunControl {
     }
 
     pub fn is_force_cancelled(&self) -> bool {
-        self.cancel_stage() >= 2
+        self.is_cancelled()
     }
 
     pub fn cancel_stage(&self) -> u8 {
-        self.cancel_stage.load(Ordering::SeqCst)
-    }
-
-    fn bump_cancel_stage(&self) -> u8 {
-        let mut current = self.cancel_stage.load(Ordering::SeqCst);
-        loop {
-            let next = current.saturating_add(1).min(2);
-            match self.cancel_stage.compare_exchange(
-                current,
-                next,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
-                Ok(_) => return next,
-                Err(observed) => current = observed,
-            }
-        }
+        u8::from(self.cancelled.load(Ordering::SeqCst))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use super::{LastRunStatus, RunControl, ScaffoldId, TargetConfig, TargetSummary};
+    use super::{LastRunStatus, RunControl, ScaffoldId};
 
     #[test]
     fn cancellation_escalates_and_saturates() {
@@ -307,13 +175,11 @@ mod tests {
         assert_eq!(control.cancel_stage(), 0);
         assert_eq!(control.cancel(), 1);
         assert!(control.is_cancelled());
-        assert!(!control.is_force_cancelled());
-        assert_eq!(control.cancel(), 2);
         assert!(control.is_force_cancelled());
-        assert_eq!(control.cancel(), 2);
-        assert_eq!(control.cancel_stage(), 2);
-        assert_eq!(control.force_cancel(), 2);
-        assert_eq!(control.cancel_stage(), 2);
+        assert_eq!(control.cancel(), 1);
+        assert_eq!(control.cancel_stage(), 1);
+        assert_eq!(control.force_cancel(), 1);
+        assert_eq!(control.cancel_stage(), 1);
     }
 
     #[test]
@@ -329,59 +195,5 @@ mod tests {
         assert_eq!(LastRunStatus::Completed.label(), "completed");
         assert_eq!(ScaffoldId::SinglePrompt.as_str(), "single_prompt");
         assert_eq!(ScaffoldId::PlanBuild.as_str(), "plan_build");
-        assert_eq!(ScaffoldId::TaskDriven.as_str(), "task_driven");
-        assert_eq!(ScaffoldId::PlanDriven.as_str(), "plan_driven");
-    }
-
-    #[test]
-    fn flow_entrypoint_visibility_comes_from_flow_entrypoints() {
-        let config = TargetConfig {
-            id: "demo".to_owned(),
-            scaffold: None,
-            template: None,
-            default_entrypoint: None,
-            entrypoints: Vec::new(),
-            runtime: None,
-            created_at: None,
-            max_iterations: None,
-            last_prompt: None,
-            last_run_status: LastRunStatus::NeverRun,
-        };
-        assert!(!config.has_flow_entrypoints());
-
-        let config = TargetConfig {
-            id: "demo".to_owned(),
-            scaffold: None,
-            template: Some("demo".to_owned()),
-            default_entrypoint: Some("main".to_owned()),
-            entrypoints: vec![super::TargetEntrypoint::Flow {
-                id: "main".to_owned(),
-                flow: "builtin://flows/demo.toml".to_owned(),
-                params: BTreeMap::new(),
-                hidden: false,
-                edit_path: Some("GOAL.md".to_owned()),
-            }],
-            runtime: None,
-            created_at: None,
-            max_iterations: None,
-            last_prompt: None,
-            last_run_status: LastRunStatus::NeverRun,
-        };
-        let summary = TargetSummary {
-            id: "demo".to_owned(),
-            dir: camino::Utf8PathBuf::from("/tmp/demo"),
-            prompt_files: Vec::new(),
-            files: Vec::new(),
-            scaffold: None,
-            template: Some("demo".to_owned()),
-            default_entrypoint: Some("main".to_owned()),
-            flow_entrypoints: vec!["main".to_owned()],
-            created_at: None,
-            last_prompt: None,
-            last_run_status: LastRunStatus::NeverRun,
-        };
-
-        assert!(config.has_flow_entrypoints());
-        assert!(summary.has_flow_entrypoints());
     }
 }

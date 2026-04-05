@@ -1,5 +1,3 @@
-use std::fs;
-
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 
@@ -14,21 +12,17 @@ pub(crate) fn materialize_target_scaffold(
             write_scaffold_file(target_dir, "0_plan.md", &plan_build_plan_prompt())?;
             write_scaffold_file(target_dir, "1_build.md", &plan_build_build_prompt())?;
         }
-        ScaffoldId::TaskDriven => {
-            write_scaffold_file(target_dir, "GOAL.md", &plan_driven_goal_template())?;
+        ScaffoldId::SinglePrompt => {
             write_scaffold_file(
                 target_dir,
-                "progress.toml",
-                &task_driven_progress_seed_template(),
+                "prompt_main.md",
+                &single_prompt_target_template(),
             )?;
-        }
-        ScaffoldId::PlanDriven => {
-            write_scaffold_file(target_dir, "GOAL.md", &plan_driven_goal_template())?;
-            fs::create_dir_all(target_dir.join("specs"))
-                .with_context(|| format!("failed to create {}", target_dir.join("specs")))?;
-        }
-        ScaffoldId::SinglePrompt => {
-            write_scaffold_file(target_dir, "prompt_main.md", &single_prompt_template())?;
+            write_scaffold_file(
+                target_dir,
+                "progress.txt",
+                &single_prompt_progress_template(),
+            )?;
         }
     }
 
@@ -38,9 +32,7 @@ pub(crate) fn materialize_target_scaffold(
 pub fn bare_prompt_template(scaffold: ScaffoldId) -> String {
     match scaffold {
         ScaffoldId::PlanBuild => plan_build_plan_prompt(),
-        ScaffoldId::TaskDriven => plan_driven_goal_template(),
-        ScaffoldId::PlanDriven => plan_driven_goal_template(),
-        ScaffoldId::SinglePrompt => single_prompt_template(),
+        ScaffoldId::SinglePrompt => single_prompt_bare_template(),
     }
 }
 
@@ -76,8 +68,6 @@ ULTIMATE GOAL - We want to achieve:
 [project-specific goal].
 
 Consider missing elements and plan accordingly. If an element is missing, search first to confirm it does not already exist, then, if needed, author the specification at `specs/FILENAME.md`.
-
-{"ralph":"watch","path":"IMPLEMENTATION_PLAN.md"}
 "#
     .to_owned()
 }
@@ -92,59 +82,65 @@ fn plan_build_build_prompt() -> String {
 4. Update `IMPLEMENTATION_PLAN.md` in the repository root with completed work and new findings.
 5. Update `AGENTS.md` only when you learn durable operational guidance about running or debugging the project.
 6. If you find no work left to do in `IMPLEMENTATION_PLAN.md` and/or `specs/*`, leave `IMPLEMENTATION_PLAN.md` unchanged.
-
-{"ralph":"watch","path":"IMPLEMENTATION_PLAN.md"}
 "#
     .to_owned()
 }
 
-fn single_prompt_template() -> String {
-    "# Requests (not sorted by priority)\n- A\n- B\n- C\n\n# Execution policy\n1. Read {ralph-env:TARGET_DIR}/progress.txt.\n2. Execute the single most high leverage item in \"Requests\".\n3. If an item was executed, update progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item; else if no item was left to execute, do not change progress.\n4. Stop\n\n{\"ralph\":\"watch\",\"path\":\"{ralph-env:TARGET_DIR}/progress.txt\"}\n"
+fn single_prompt_target_template() -> String {
+    "# Requests (not sorted by priority)\n- A\n- B\n- C\n\n# Execution policy\n1a. Study the existing source code before deciding something is missing.\n1b. Study `{ralph-env:TARGET_DIR}/progress.txt`.\n2. Execute the single most high leverage remaining item in \"Requests\".\n3. Update `{ralph-env:TARGET_DIR}/progress.txt` with completed work and new findings when that keeps the next loop grounded.\n4. Stop.\n"
         .to_owned()
 }
 
-fn plan_driven_goal_template() -> String {
-    "# Goal\n\nCapture the desired outcome here.\n\n- Requests\n- Constraints\n- Observations\n- Acceptance notes\n"
+fn single_prompt_bare_template() -> String {
+    "# Requests (not sorted by priority)\n- A\n- B\n- C\n\n# Execution policy\n1. Read the existing source code before deciding something is missing.\n2. Execute the single most high leverage item in \"Requests\".\n3. Update this file with completed work and new findings when that keeps the next loop grounded.\n4. Stop.\n"
         .to_owned()
 }
 
-fn task_driven_progress_seed_template() -> String {
-    r#"version = 1
-
-[[items]]
-description = "Planning phase"
-steps = [
-    "Revise progress.toml into a clear ordered list of concrete tasks derived from your studies",
-    "Do not start other items",
-    "Stop after updating progress.toml"
-]
-completed = false
-"#
-    .to_owned()
+fn single_prompt_progress_template() -> String {
+    "Completed work:\n- \n\nOpen findings:\n- \n\nNext candidate work:\n- \n".to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{bare_prompt_template, materialize_target_scaffold};
     use crate::ScaffoldId;
+    use camino::Utf8Path;
 
     #[test]
-    fn workflow_scaffolds_expose_goal_template_for_bare_prompts() {
-        let task_driven = bare_prompt_template(ScaffoldId::TaskDriven);
-        let plan_driven = bare_prompt_template(ScaffoldId::PlanDriven);
-
-        assert!(task_driven.starts_with("# Goal"));
-        assert_eq!(task_driven, plan_driven);
+    fn bare_prompt_template_returns_markdown() {
+        assert!(bare_prompt_template(ScaffoldId::SinglePrompt).contains("# Requests"));
+        assert!(bare_prompt_template(ScaffoldId::PlanBuild).contains("ULTIMATE GOAL"));
+        assert!(
+            bare_prompt_template(ScaffoldId::SinglePrompt)
+                .contains("Update this file with completed work")
+        );
     }
 
     #[test]
-    fn plan_driven_scaffold_creates_goal_file_and_specs_dir() {
+    fn materialize_plan_build_writes_both_prompt_files() {
         let temp = tempfile::tempdir().unwrap();
-        let target_dir = camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let target_dir = Utf8Path::from_path(temp.path()).unwrap();
 
-        materialize_target_scaffold(&target_dir, ScaffoldId::PlanDriven).unwrap();
+        materialize_target_scaffold(target_dir, ScaffoldId::PlanBuild).unwrap();
 
-        assert!(target_dir.join("GOAL.md").is_file());
-        assert!(target_dir.join("specs").is_dir());
+        assert!(target_dir.join("0_plan.md").exists());
+        assert!(target_dir.join("1_build.md").exists());
+    }
+
+    #[test]
+    fn materialize_single_prompt_writes_progress_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let target_dir = Utf8Path::from_path(temp.path()).unwrap();
+
+        materialize_target_scaffold(target_dir, ScaffoldId::SinglePrompt).unwrap();
+
+        let prompt = std::fs::read_to_string(target_dir.join("prompt_main.md")).unwrap();
+        let progress = std::fs::read_to_string(target_dir.join("progress.txt")).unwrap();
+
+        assert!(
+            prompt.contains("Update `{ralph-env:TARGET_DIR}/progress.txt` with completed work")
+        );
+        assert!(progress.contains("Completed work:"));
+        assert!(progress.contains("Open findings:"));
     }
 }

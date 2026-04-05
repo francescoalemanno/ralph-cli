@@ -11,7 +11,6 @@ pub use config::{AppConfig, ConfigFileScope, ThemeConfig};
 pub use scaffold::bare_prompt_template;
 pub use store::TargetStore;
 pub use types::{
-    EntrypointKind, FlowRuntimeInflight, FlowRuntimeState, LastRunStatus, PromptFile, RunControl,
-    RunnerInvocation, RunnerResult, ScaffoldId, TargetConfig, TargetEntrypoint, TargetFile,
-    TargetFileContents, TargetPaths, TargetReview, TargetSummary,
+    LastRunStatus, PromptFile, RunControl, RunnerInvocation, RunnerResult, ScaffoldId,
+    TargetConfig, TargetFile, TargetFileContents, TargetPaths, TargetReview, TargetSummary,
 };

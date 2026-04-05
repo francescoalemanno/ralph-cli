@@ -7,9 +7,8 @@ use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 
 use crate::{
-    EntrypointKind, LastRunStatus, PromptFile, ScaffoldId, TargetConfig, TargetEntrypoint,
-    TargetFile, TargetFileContents, TargetPaths, TargetReview, TargetSummary, atomic_write,
-    scaffold::materialize_target_scaffold,
+    LastRunStatus, PromptFile, ScaffoldId, TargetConfig, TargetFile, TargetFileContents,
+    TargetPaths, TargetReview, TargetSummary, atomic_write, scaffold::materialize_target_scaffold,
 };
 
 pub(crate) const ARTIFACT_DIR_NAME: &str = ".ralph";
@@ -25,10 +24,6 @@ impl TargetStore {
         TargetConfig {
             id: target_id.to_owned(),
             scaffold,
-            template: scaffold.map(|value| value.as_str().to_owned()),
-            default_entrypoint: default_entrypoint_for_scaffold(scaffold),
-            entrypoints: default_entrypoints_for_scaffold(scaffold),
-            runtime: None,
             created_at: Some(current_unix_timestamp()),
             max_iterations: None,
             last_prompt: None,
@@ -119,7 +114,7 @@ impl TargetStore {
             return Err(anyhow!("target '{target_id}' does not exist"));
         }
         let config = self.read_target_config(target_id)?;
-        let files = self.list_target_files_with_config(target_id, &config)?;
+        let files = self.list_target_files(target_id)?;
         let prompt_files = files
             .iter()
             .filter(|file| file.is_prompt)
@@ -135,9 +130,6 @@ impl TargetStore {
             prompt_files,
             files,
             scaffold: config.scaffold,
-            template: config.template.clone(),
-            default_entrypoint: resolved_default_entrypoint(&config),
-            flow_entrypoints: resolved_flow_entrypoints(&config),
             created_at: config.created_at,
             last_prompt: config.last_prompt,
             last_run_status: config.last_run_status,
@@ -221,11 +213,7 @@ impl TargetStore {
         self.write_target_config(&config)
     }
 
-    fn list_target_files_with_config(
-        &self,
-        target_id: &str,
-        config: &TargetConfig,
-    ) -> Result<Vec<TargetFile>> {
+    fn list_target_files(&self, target_id: &str) -> Result<Vec<TargetFile>> {
         let paths = self.target_paths(target_id)?;
         let mut files = Vec::new();
         for entry in fs::read_dir(&paths.dir)
@@ -242,7 +230,7 @@ impl TargetStore {
                 .ok_or_else(|| anyhow!("target file missing file name"))?
                 .to_owned();
             files.push(TargetFile {
-                is_prompt: is_target_prompt_file(config, &name),
+                is_prompt: is_prompt_file_name(&name),
                 name,
                 path,
             });
@@ -265,75 +253,6 @@ fn current_unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
-}
-
-fn is_target_prompt_file(config: &TargetConfig, name: &str) -> bool {
-    if !config.entrypoints.is_empty() {
-        return config.entrypoints.iter().any(
-            |entrypoint| matches!(entrypoint, TargetEntrypoint::Prompt { path, .. } if path == name),
-        );
-    }
-
-    is_prompt_file_name(name)
-}
-
-fn default_entrypoint_for_scaffold(scaffold: Option<ScaffoldId>) -> Option<String> {
-    match scaffold {
-        Some(ScaffoldId::TaskDriven | ScaffoldId::PlanDriven) => Some("main".to_owned()),
-        _ => None,
-    }
-}
-
-fn default_entrypoints_for_scaffold(scaffold: Option<ScaffoldId>) -> Vec<TargetEntrypoint> {
-    match scaffold {
-        Some(ScaffoldId::PlanDriven) => vec![TargetEntrypoint::Flow {
-            id: "main".to_owned(),
-            flow: "builtin://flows/plan_driven.toml".to_owned(),
-            params: std::collections::BTreeMap::from([
-                ("goal_file".to_owned(), "GOAL.md".to_owned()),
-                ("derived_file".to_owned(), "plan.toml".to_owned()),
-                ("specs_dir".to_owned(), "specs".to_owned()),
-                ("journal_file".to_owned(), "journal.txt".to_owned()),
-                ("archive_prefix".to_owned(), "goal_rebuild".to_owned()),
-            ]),
-            hidden: false,
-            edit_path: Some("GOAL.md".to_owned()),
-        }],
-        Some(ScaffoldId::TaskDriven) => vec![TargetEntrypoint::Flow {
-            id: "main".to_owned(),
-            flow: "builtin://flows/task_driven.toml".to_owned(),
-            params: std::collections::BTreeMap::from([
-                ("goal_file".to_owned(), "GOAL.md".to_owned()),
-                ("derived_file".to_owned(), "progress.toml".to_owned()),
-                ("journal_file".to_owned(), "journal.txt".to_owned()),
-                ("archive_prefix".to_owned(), "task_rebuild".to_owned()),
-            ]),
-            hidden: false,
-            edit_path: Some("GOAL.md".to_owned()),
-        }],
-        _ => Vec::new(),
-    }
-}
-
-fn resolved_default_entrypoint(config: &TargetConfig) -> Option<String> {
-    if let Some(default_entrypoint) = &config.default_entrypoint {
-        return Some(default_entrypoint.clone());
-    }
-
-    if let Some(entrypoint) = config.entrypoints.first() {
-        return Some(entrypoint.id().to_owned());
-    }
-
-    None
-}
-
-fn resolved_flow_entrypoints(config: &TargetConfig) -> Vec<String> {
-    config
-        .entrypoints
-        .iter()
-        .filter(|entrypoint| entrypoint.kind() == EntrypointKind::Flow && !entrypoint.hidden())
-        .map(|entrypoint| entrypoint.id().to_owned())
-        .collect()
 }
 
 #[cfg(test)]
@@ -404,76 +323,15 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(prompt_names, vec!["prompt_main.md"]);
-        assert!(summary.created_at.is_some());
-    }
-
-    #[test]
-    fn plan_driven_scaffold_creates_goal_file_and_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = TargetStore::new(
-            camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
-        );
-
-        let summary = store
-            .create_target("demo", Some(ScaffoldId::PlanDriven))
-            .unwrap();
-
-        assert!(summary.prompt_files.is_empty());
-        assert_eq!(summary.flow_entrypoints, vec!["main"]);
-        assert_eq!(summary.default_entrypoint.as_deref(), Some("main"));
-        assert!(summary.files.iter().any(|file| file.name == "GOAL.md"));
-        assert!(summary.files.iter().all(|file| !file.is_prompt));
-        assert!(
-            store
-                .target_paths("demo")
-                .unwrap()
-                .dir
-                .join("specs")
-                .is_dir()
-        );
-
-        let config = store.read_target_config("demo").unwrap();
-        assert_eq!(config.default_entrypoint.as_deref(), Some("main"));
-        assert_eq!(config.entrypoints.len(), 1);
-        assert!(config.runtime.is_none());
-    }
-
-    #[test]
-    fn task_driven_scaffold_creates_goal_and_progress_files() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = TargetStore::new(
-            camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
-        );
-
-        let summary = store
-            .create_target("demo", Some(ScaffoldId::TaskDriven))
-            .unwrap();
-
-        assert!(summary.prompt_files.is_empty());
-        assert_eq!(summary.flow_entrypoints, vec!["main"]);
-        assert_eq!(summary.default_entrypoint.as_deref(), Some("main"));
-        assert!(summary.files.iter().any(|file| file.name == "GOAL.md"));
+        assert!(summary.files.iter().any(|file| file.name == "progress.txt"));
         assert!(
             summary
                 .files
                 .iter()
-                .any(|file| file.name == "progress.toml")
+                .find(|file| file.name == "progress.txt")
+                .is_some_and(|file| !file.is_prompt)
         );
-        assert!(summary.files.iter().all(|file| !file.is_prompt));
-
-        let config = store.read_target_config("demo").unwrap();
-        assert_eq!(config.default_entrypoint.as_deref(), Some("main"));
-        assert_eq!(config.entrypoints.len(), 1);
-        assert!(config.runtime.is_none());
-        let progress = std::fs::read_to_string(
-            store
-                .target_paths("demo")
-                .unwrap()
-                .dir
-                .join("progress.toml"),
-        )
-        .unwrap();
-        assert!(progress.contains("description = \"Planning phase\""));
+        assert!(summary.created_at.is_some());
     }
 
     #[test]
@@ -588,13 +446,13 @@ mod tests {
     }
 
     #[test]
-    fn single_prompt_scaffold_uses_target_specific_progress_path() {
+    fn single_prompt_scaffold_keeps_progress_outside_the_prompt_file() {
         let temp = tempfile::tempdir().unwrap();
         let store = TargetStore::new(
             camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
         );
 
-        store
+        let summary = store
             .create_target("demo", Some(ScaffoldId::SinglePrompt))
             .unwrap();
         let prompt = std::fs::read_to_string(
@@ -605,18 +463,37 @@ mod tests {
                 .join("prompt_main.md"),
         )
         .unwrap();
+        let progress =
+            std::fs::read_to_string(store.target_paths("demo").unwrap().dir.join("progress.txt"))
+                .unwrap();
 
-        assert!(
-            prompt
-                .contains("{\"ralph\":\"watch\",\"path\":\"{ralph-env:TARGET_DIR}/progress.txt\"}")
-        );
         assert!(prompt.contains("# Requests (not sorted by priority)"));
-        assert!(prompt.contains("1. Read {ralph-env:TARGET_DIR}/progress.txt."));
         assert!(
             prompt.contains(
-                "3. If an item was executed, update progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item; else if no item was left to execute, do not change progress."
+                "1a. Study the existing source code before deciding something is missing."
             )
         );
-        assert!(prompt.contains("4. Stop"));
+        assert!(prompt.contains("1b. Study `{ralph-env:TARGET_DIR}/progress.txt`."));
+        assert!(
+            prompt.contains(
+                "2. Execute the single most high leverage remaining item in \"Requests\"."
+            )
+        );
+        assert!(
+            prompt.contains(
+                "3. Update `{ralph-env:TARGET_DIR}/progress.txt` with completed work and new findings when that keeps the next loop grounded."
+            )
+        );
+        assert!(prompt.contains("4. Stop."));
+        assert_eq!(
+            summary
+                .prompt_files
+                .iter()
+                .map(|prompt| prompt.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["prompt_main.md"]
+        );
+        assert!(progress.contains("Completed work:"));
+        assert!(progress.contains("Next candidate work:"));
     }
 }
