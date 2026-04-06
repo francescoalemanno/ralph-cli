@@ -45,33 +45,18 @@ async fn try_main() -> Result<()> {
     let cli = Cli::parse();
     let project_dir = resolve_project_dir(cli.project_dir.clone())?;
 
-    match cli.command {
-        None => {
-            if !io::stdin().is_terminal() {
-                return Err(anyhow!(
-                    "stdin preloading is not supported when opening the TUI; use `ralph --file REQ.md` or `ralph \"your request\"`"
-                ));
-            }
-            let launch = build_tui_launch_options(&project_dir, &cli)?;
-            let mut app = RalphApp::load(project_dir.clone())?;
-            cli.runtime.apply_to(&mut app)?;
-            run_tui_with_options(app, launch)
-        }
-        Some(command) => run_command(project_dir, cli.runtime, command).await,
-    }
+    run_command(project_dir, cli.runtime, cli.command).await
 }
 
-fn build_tui_launch_options(project_dir: &Utf8Path, args: &Cli) -> Result<TuiLaunchOptions> {
-    let workflow = args.workflow_args.workflow.clone().ok_or_else(|| {
-        anyhow!(
-            "opening the runner TUI requires both a workflow and a request; use `ralph -w <workflow-id> \"your request\"` or `ralph -w <workflow-id> --file REQ.md`"
-        )
-    })?;
+fn build_tui_launch_options(
+    project_dir: &Utf8Path,
+    args: &cli::RunArgs,
+) -> Result<TuiLaunchOptions> {
     let argv = args.request_args.argv_text();
     let provided = args.request_args.provided_count();
     if provided != 1 {
         return Err(anyhow!(
-            "opening the runner TUI requires both a workflow and a request; provide the request in exactly one form: argv or --file"
+            "opening the runner TUI requires both a workflow and a request; use `ralph run <workflow-id> \"your request\"` or `ralph run <workflow-id> --file REQ.md`"
         ));
     }
 
@@ -94,13 +79,13 @@ fn build_tui_launch_options(project_dir: &Utf8Path, args: &Cli) -> Result<TuiLau
         (None, None) => None,
         _ => {
             return Err(anyhow!(
-                "opening the runner TUI requires both a workflow and a request; provide the request in exactly one form: argv or --file"
+                "opening the runner TUI requires both a workflow and a request; use `ralph run <workflow-id> \"your request\"` or `ralph run <workflow-id> --file REQ.md`"
             ));
         }
     };
 
     Ok(TuiLaunchOptions {
-        preset_workflow: Some(workflow),
+        preset_workflow: Some(args.workflow.clone()),
         preloaded_request,
     })
 }
@@ -112,18 +97,30 @@ async fn run_command(
 ) -> Result<()> {
     match command {
         Commands::Run(args) => {
-            let mut app = RalphApp::load(project_dir)?;
-            runtime.apply_to(&mut app)?;
-            let mut delegate = ConsoleDelegate;
-            let summary = app
-                .run_workflow(
-                    &args.workflow_args.workflow,
-                    resolve_workflow_request_input(&args)?,
-                    &mut delegate,
-                )
-                .await?;
-            print_workflow_run(&summary);
-            Ok(())
+            if args.cli {
+                let mut app = RalphApp::load(project_dir)?;
+                runtime.apply_to(&mut app)?;
+                let mut delegate = ConsoleDelegate;
+                let summary = app
+                    .run_workflow(
+                        &args.workflow,
+                        resolve_workflow_request_input(&args)?,
+                        &mut delegate,
+                    )
+                    .await?;
+                print_workflow_run(&summary);
+                Ok(())
+            } else {
+                if !io::stdin().is_terminal() {
+                    return Err(anyhow!(
+                        "stdin preloading is not supported in TUI mode; use `ralph run --cli <workflow-id>` or pass the request as argv text or `--file`"
+                    ));
+                }
+                let launch = build_tui_launch_options(&project_dir, &args)?;
+                let mut app = RalphApp::load(project_dir)?;
+                runtime.apply_to(&mut app)?;
+                run_tui_with_options(app, launch)
+            }
         }
         Commands::Emit(args) => run_emit(args),
         Commands::Ls => {
@@ -445,6 +442,7 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::RunArgs;
     use std::fs;
 
     #[test]
@@ -601,5 +599,46 @@ prompts:
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn tui_launch_options_require_exactly_one_request_form() {
+        let project_dir = Utf8Path::new("/tmp/project");
+        let error = build_tui_launch_options(
+            project_dir,
+            &RunArgs {
+                cli: false,
+                workflow: "task-based".to_owned(),
+                request_args: RequestArgs::default(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("opening the runner TUI requires both a workflow and a request"));
+        assert!(error.contains("ralph run <workflow-id>"));
+    }
+
+    #[test]
+    fn tui_launch_options_preserve_positional_workflow_and_argv_request() {
+        let project_dir = Utf8Path::new("/tmp/project");
+        let launch = build_tui_launch_options(
+            project_dir,
+            &RunArgs {
+                cli: false,
+                workflow: "task-based".to_owned(),
+                request_args: RequestArgs {
+                    request_file: None,
+                    request: vec!["fix".to_owned(), "tests".to_owned()],
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(launch.preset_workflow.as_deref(), Some("task-based"));
+        let preload = launch.preloaded_request.expect("preloaded request");
+        assert_eq!(preload.source, TuiRequestSource::Argv);
+        assert_eq!(preload.text, "fix tests");
+        assert!(preload.file_path.is_none());
     }
 }

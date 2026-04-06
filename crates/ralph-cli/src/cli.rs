@@ -8,9 +8,9 @@ const ROOT_LONG_ABOUT: &str = "\
 Ralph runs request-driven workflows from the workflow registry.
 \
 \n\
-\n`ralph -w <workflow-id> <request>` opens the workflow runner TUI directly.
-\nThe root TUI requires both `-w/--workflow` and a request provided as argv text or `--file`.
-\n`ralph run -w <workflow-id> <request>` runs a workflow against a request.
+\n`ralph run <workflow-id> <request>` opens the workflow runner TUI.
+\nThe TUI requires both a workflow id and a request provided as argv text or `--file`.
+\n`ralph run --cli <workflow-id> <request>` runs a workflow in CLI mode.
 \
 \n\
 \nUse the CLI when you want workflow execution, workflow inspection, setup tools, or\
@@ -55,23 +55,25 @@ impl RuntimeArgs {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "ralph", about = ROOT_ABOUT, long_about = ROOT_LONG_ABOUT)]
+#[command(
+    name = "ralph",
+    about = ROOT_ABOUT,
+    long_about = ROOT_LONG_ABOUT,
+    arg_required_else_help = true,
+    subcommand_required = true
+)]
 pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub(crate) project_dir: Option<Utf8PathBuf>,
     #[command(flatten)]
     pub(crate) runtime: RuntimeArgs,
-    #[command(flatten)]
-    pub(crate) workflow_args: OptionalWorkflowArgs,
-    #[command(flatten)]
-    pub(crate) request_args: RequestArgs,
     #[command(subcommand)]
-    pub(crate) command: Option<Commands>,
+    pub(crate) command: Commands,
 }
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum Commands {
-    #[command(about = "Run a workflow")]
+    #[command(about = "Open the workflow runner TUI, or use --cli for CLI mode")]
     Run(RunArgs),
     #[command(about = "Emit an agent event into the current Ralph run WAL")]
     Emit(EmitArgs),
@@ -93,22 +95,12 @@ pub(crate) enum Commands {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RunArgs {
-    #[command(flatten)]
-    pub(crate) workflow_args: RequiredWorkflowArgs,
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub(crate) cli: bool,
+    #[arg(value_name = "WORKFLOW_ID", help = WORKFLOW_HELP)]
+    pub(crate) workflow: String,
     #[command(flatten)]
     pub(crate) request_args: RequestArgs,
-}
-
-#[derive(Debug, Clone, Args, Default)]
-pub(crate) struct OptionalWorkflowArgs {
-    #[arg(short = 'w', long, value_name = "WORKFLOW_ID", help = WORKFLOW_HELP)]
-    pub(crate) workflow: Option<String>,
-}
-
-#[derive(Debug, Clone, Args)]
-pub(crate) struct RequiredWorkflowArgs {
-    #[arg(short = 'w', long, value_name = "WORKFLOW_ID", help = WORKFLOW_HELP)]
-    pub(crate) workflow: String,
 }
 
 #[derive(Debug, Clone, Args, Default)]
@@ -220,21 +212,18 @@ mod tests {
     use super::{Cli, Commands};
 
     #[test]
-    fn no_subcommand_opens_the_tui() {
-        let cli = Cli::try_parse_from(["ralph"]).unwrap();
-
-        assert!(cli.command.is_none());
+    fn root_cli_requires_a_subcommand() {
+        assert!(Cli::try_parse_from(["ralph"]).is_err());
     }
 
     #[test]
-    fn run_subcommand_parses_workflow_id_and_request() {
-        let cli =
-            Cli::try_parse_from(["ralph", "run", "-w", "task-based", "fix", "tests"]).unwrap();
+    fn run_subcommand_parses_positional_workflow_and_request() {
+        let cli = Cli::try_parse_from(["ralph", "run", "task-based", "fix", "tests"]).unwrap();
 
-        let Some(Commands::Run(args)) = cli.command else {
+        let Commands::Run(args) = cli.command else {
             panic!("expected run subcommand");
         };
-        assert_eq!(args.workflow_args.workflow, "task-based");
+        assert_eq!(args.workflow, "task-based");
         assert_eq!(
             args.request_args.request,
             vec!["fix".to_owned(), "tests".to_owned()]
@@ -242,61 +231,52 @@ mod tests {
     }
 
     #[test]
-    fn root_cli_parses_workflow_agent_and_request() {
+    fn run_subcommand_accepts_global_runtime_flags() {
         let cli = Cli::try_parse_from([
             "ralph",
-            "-w",
-            "task-based",
+            "run",
             "--agent",
             "claude",
+            "task-based",
             "ship",
             "it",
         ])
         .unwrap();
 
-        assert!(cli.command.is_none());
-        assert_eq!(cli.workflow_args.workflow.as_deref(), Some("task-based"));
+        let Commands::Run(args) = cli.command else {
+            panic!("expected run subcommand");
+        };
+        assert_eq!(args.workflow, "task-based");
         assert_eq!(cli.runtime.agent.as_deref(), Some("claude"));
         assert_eq!(
-            cli.request_args.request,
+            args.request_args.request,
             vec!["ship".to_owned(), "it".to_owned()]
         );
     }
 
     #[test]
-    fn root_cli_parses_request_file() {
-        let cli = Cli::try_parse_from(["ralph", "--file", "REQ.md"]).unwrap();
+    fn run_subcommand_parses_request_file() {
+        let cli = Cli::try_parse_from(["ralph", "run", "task-based", "--file", "REQ.md"]).unwrap();
 
-        assert_eq!(
-            cli.request_args.request_file,
-            Some(camino::Utf8PathBuf::from("REQ.md"))
-        );
-    }
-
-    #[test]
-    fn run_subcommand_accepts_global_runtime_flags() {
-        let cli =
-            Cli::try_parse_from(["ralph", "run", "-w", "task-based", "--agent", "claude"]).unwrap();
-
-        let Some(Commands::Run(args)) = cli.command else {
+        let Commands::Run(args) = cli.command else {
             panic!("expected run subcommand");
         };
-        assert_eq!(cli.runtime.agent.as_deref(), Some("claude"));
-        assert_eq!(args.workflow_args.workflow, "task-based");
-    }
-
-    #[test]
-    fn run_subcommand_parses_request_file_with_same_flag_as_tui() {
-        let cli =
-            Cli::try_parse_from(["ralph", "run", "-w", "task-based", "--file", "REQ.md"]).unwrap();
-
-        let Some(Commands::Run(args)) = cli.command else {
-            panic!("expected run subcommand");
-        };
-        assert_eq!(args.workflow_args.workflow, "task-based");
+        assert_eq!(args.workflow, "task-based");
         assert_eq!(
             args.request_args.request_file,
             Some(camino::Utf8PathBuf::from("REQ.md"))
         );
+    }
+
+    #[test]
+    fn run_subcommand_parses_cli_flag() {
+        let cli =
+            Cli::try_parse_from(["ralph", "run", "--cli", "task-based", "fix", "tests"]).unwrap();
+
+        let Commands::Run(args) = cli.command else {
+            panic!("expected run subcommand");
+        };
+        assert!(args.cli);
+        assert_eq!(args.workflow, "task-based");
     }
 }
