@@ -58,6 +58,7 @@ where
                 &control,
                 delegate,
                 &format!("Run complete for {}", target_summary.id),
+                &format!("Run failed for {}", target_summary.id),
                 &format!("Reached max iterations for {}", target_summary.id),
             )
             .await
@@ -70,7 +71,8 @@ where
                 let _ = self.store.set_last_run(target, &prompt.name, status);
             })?;
 
-        self.store.set_last_run(target, &prompt.name, status)?;
+        self.store
+            .set_last_run(target, &status.final_prompt_name, status.status)?;
         self.store.load_target(target)
     }
 
@@ -87,15 +89,18 @@ where
             anyhow!("prompt path '{prompt_path}' must have a parent directory for TARGET_DIR")
         })?;
         let prepared = self.prepare_prompt_run(prompt_path, target_dir)?;
-        self.run_prepared_prompt(
-            &prepared,
-            self.config.max_iterations,
-            &control,
-            delegate,
-            &format!("Run complete for {}", prompt_path),
-            &format!("Reached max iterations for {}", prompt_path),
-        )
-        .await
+        Ok(self
+            .run_prepared_prompt(
+                &prepared,
+                self.config.max_iterations,
+                &control,
+                delegate,
+                &format!("Run complete for {}", prompt_path),
+                &format!("Run failed for {}", prompt_path),
+                &format!("Reached max iterations for {}", prompt_path),
+            )
+            .await?
+            .status)
     }
 }
 

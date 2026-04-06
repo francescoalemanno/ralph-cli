@@ -1,6 +1,10 @@
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
-use ralph_core::{LastRunStatus, RunControl, RunnerConfig, RunnerInvocation};
+use ralph_core::{
+    LastRunStatus, LoopControlDecision, RunControl, RunnerConfig, RunnerInvocation,
+    current_agent_events_offset, list_prompt_names_in_dir, read_agent_events_since,
+    reduce_loop_control,
+};
 use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -12,6 +16,12 @@ pub(crate) struct PreparedPromptRun {
     prompt_name: String,
     target_dir: Utf8PathBuf,
     raw_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptRunOutcome {
+    pub(crate) status: LastRunStatus,
+    pub(crate) final_prompt_name: String,
 }
 
 impl<R> RalphApp<R>
@@ -54,9 +64,10 @@ where
         max_iterations: usize,
         control: &RunControl,
         delegate: &mut D,
-        _completed_summary: &str,
+        completed_summary: &str,
+        failed_summary: &str,
         max_iterations_summary: &str,
-    ) -> Result<LastRunStatus>
+    ) -> Result<PromptRunOutcome>
     where
         D: RunDelegate,
     {
@@ -64,8 +75,9 @@ where
             return Err(anyhow!("max_iterations must be greater than zero"));
         }
 
+        let mut current = prepared.clone();
         for iteration in 1..=max_iterations {
-            let prompt_text = self.parse_prompt_run(prepared)?;
+            let prompt_text = self.parse_prompt_run(&current)?;
 
             if control.is_cancelled() {
                 return Err(anyhow!("operation canceled"));
@@ -73,22 +85,25 @@ where
 
             delegate
                 .on_event(RunEvent::IterationStarted {
-                    prompt_name: prepared.prompt_name.clone(),
+                    prompt_name: current.prompt_name.clone(),
                     iteration,
                     max_iterations,
                 })
                 .await?;
 
             let config = self.runner_config_for(control)?;
+            let wal_offset = current_agent_events_offset(&current.target_dir)?;
+            let run_id = next_run_id(iteration);
             let result = self
                 .execute_runner(
                     &config,
                     RunnerInvocation {
+                        run_id: run_id.clone(),
                         prompt_text,
                         project_dir: self.project_dir.clone(),
-                        target_dir: prepared.target_dir.clone(),
-                        prompt_path: prepared.prompt_path.clone(),
-                        prompt_name: prepared.prompt_name.clone(),
+                        target_dir: current.target_dir.clone(),
+                        prompt_path: current.prompt_path.clone(),
+                        prompt_name: current.prompt_name.clone(),
                     },
                     control,
                     delegate,
@@ -98,7 +113,55 @@ where
             if result.exit_code != 0 {
                 let message = format!("runner exited with code {}", result.exit_code);
                 delegate.on_event(RunEvent::Note(message.clone())).await?;
-                return Err(anyhow!(message));
+                delegate
+                    .on_event(RunEvent::Finished {
+                        status: LastRunStatus::Failed,
+                        summary: format_summary(failed_summary, &message),
+                    })
+                    .await?;
+                return Ok(PromptRunOutcome {
+                    status: LastRunStatus::Failed,
+                    final_prompt_name: current.prompt_name,
+                });
+            }
+
+            let log_read = read_agent_events_since(&current.target_dir, wal_offset)?;
+            let run_events = log_read
+                .records
+                .into_iter()
+                .filter(|record| record.run_id == run_id)
+                .collect::<Vec<_>>();
+
+            match reduce_loop_control(&run_events, &current.prompt_name) {
+                Some(LoopControlDecision::Continue) => {}
+                Some(LoopControlDecision::StopOk(body)) => {
+                    delegate
+                        .on_event(RunEvent::Finished {
+                            status: LastRunStatus::Completed,
+                            summary: format_summary(completed_summary, &body),
+                        })
+                        .await?;
+                    return Ok(PromptRunOutcome {
+                        status: LastRunStatus::Completed,
+                        final_prompt_name: current.prompt_name,
+                    });
+                }
+                Some(LoopControlDecision::StopError(body)) => {
+                    delegate
+                        .on_event(RunEvent::Finished {
+                            status: LastRunStatus::Failed,
+                            summary: format_summary(failed_summary, &body),
+                        })
+                        .await?;
+                    return Ok(PromptRunOutcome {
+                        status: LastRunStatus::Failed,
+                        final_prompt_name: current.prompt_name,
+                    });
+                }
+                Some(LoopControlDecision::Route(route)) if iteration < max_iterations => {
+                    current = self.prepare_routed_prompt(&current.target_dir, &route)?;
+                }
+                Some(LoopControlDecision::Route(_)) | None => {}
             }
         }
 
@@ -108,7 +171,10 @@ where
                 summary: max_iterations_summary.to_owned(),
             })
             .await?;
-        Ok(LastRunStatus::MaxIterations)
+        Ok(PromptRunOutcome {
+            status: LastRunStatus::MaxIterations,
+            final_prompt_name: current.prompt_name,
+        })
     }
 
     fn runner_config_for(&self, control: &RunControl) -> Result<RunnerConfig> {
@@ -154,6 +220,41 @@ where
             }
         }
     }
+
+    fn prepare_routed_prompt(
+        &self,
+        target_dir: &Utf8Path,
+        route: &str,
+    ) -> Result<PreparedPromptRun> {
+        let available_routes = list_prompt_names_in_dir(target_dir)?;
+        if !available_routes.iter().any(|candidate| candidate == route) {
+            return Err(anyhow!(
+                "routed prompt '{}' no longer exists under {}",
+                route,
+                target_dir
+            ));
+        }
+        self.prepare_prompt_run(&target_dir.join(route), target_dir)
+    }
+}
+
+fn format_summary(prefix: &str, body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}: {trimmed}")
+    }
+}
+
+fn next_run_id(iteration: usize) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let ts_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    format!("{}-{ts_unix_ms}-{iteration}", std::process::id())
 }
 
 async fn forward_stream_event<D>(delegate: &mut D, event: RunnerStreamEvent) -> Result<()>
@@ -173,7 +274,8 @@ mod tests {
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
     use ralph_core::{
-        AppConfig, RunControl, RunnerConfig, RunnerInvocation, RunnerResult, ScaffoldId,
+        AgentEventRecord, AppConfig, RunControl, RunnerConfig, RunnerInvocation, RunnerResult,
+        ScaffoldId, append_agent_event,
     };
     use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
     use tokio::sync::mpsc::UnboundedSender;
@@ -193,6 +295,12 @@ mod tests {
     #[derive(Clone)]
     struct ConfigCapturingRunner {
         seen_configs: Arc<Mutex<Vec<RunnerConfig>>>,
+    }
+
+    #[derive(Clone)]
+    struct EventWritingRunner {
+        events: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+        seen_prompts: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -250,6 +358,51 @@ mod tests {
             _stream: Option<UnboundedSender<RunnerStreamEvent>>,
         ) -> Result<RunnerResult> {
             self.seen_configs.lock().unwrap().push(config.clone());
+            Ok(RunnerResult {
+                output: String::new(),
+                exit_code: 0,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl RunnerAdapter for EventWritingRunner {
+        async fn run(
+            &self,
+            _config: &ralph_core::RunnerConfig,
+            invocation: RunnerInvocation,
+            _control: &RunControl,
+            _stream: Option<UnboundedSender<RunnerStreamEvent>>,
+        ) -> Result<RunnerResult> {
+            self.seen_prompts
+                .lock()
+                .unwrap()
+                .push(invocation.prompt_name.clone());
+            let events = {
+                let mut queued = self.events.lock().unwrap();
+                if queued.is_empty() {
+                    Vec::new()
+                } else {
+                    queued.remove(0)
+                }
+            };
+            for (event, body) in events {
+                append_agent_event(
+                    &invocation.target_dir,
+                    &AgentEventRecord {
+                        v: 1,
+                        ts_unix_ms: 42,
+                        run_id: invocation.run_id.clone(),
+                        event,
+                        body,
+                        project_dir: invocation.project_dir.clone(),
+                        target_dir: invocation.target_dir.clone(),
+                        prompt_path: invocation.prompt_path.clone(),
+                        prompt_name: invocation.prompt_name.clone(),
+                        pid: 123,
+                    },
+                )?;
+            }
             Ok(RunnerResult {
                 output: String::new(),
                 exit_code: 0,
@@ -395,5 +548,103 @@ mod tests {
         let seen = seen_configs.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].program.as_deref(), Some("raijin"));
+    }
+
+    #[tokio::test]
+    async fn loop_stop_ok_marks_run_completed() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let app = RalphApp::new(
+            project_dir.clone(),
+            AppConfig {
+                max_iterations: 3,
+                ..Default::default()
+            },
+            EventWritingRunner {
+                events: Arc::new(Mutex::new(vec![vec![(
+                    "loop-stop:ok".to_owned(),
+                    "done".to_owned(),
+                )]])),
+                seen_prompts: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+        app.create_target("demo", Some(ScaffoldId::SinglePrompt))
+            .unwrap();
+
+        let mut delegate = TestDelegate;
+        let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
+
+        assert_eq!(
+            summary.last_run_status,
+            ralph_core::LastRunStatus::Completed
+        );
+        assert_eq!(summary.last_prompt.as_deref(), Some("prompt_main.md"));
+    }
+
+    #[tokio::test]
+    async fn loop_stop_error_marks_run_failed_without_runner_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let app = RalphApp::new(
+            project_dir.clone(),
+            AppConfig {
+                max_iterations: 3,
+                ..Default::default()
+            },
+            EventWritingRunner {
+                events: Arc::new(Mutex::new(vec![vec![(
+                    "loop-stop:error".to_owned(),
+                    "blocked".to_owned(),
+                )]])),
+                seen_prompts: Arc::new(Mutex::new(Vec::new())),
+            },
+        );
+        app.create_target("demo", Some(ScaffoldId::SinglePrompt))
+            .unwrap();
+
+        let mut delegate = TestDelegate;
+        let summary = app.run_target("demo", None, &mut delegate).await.unwrap();
+
+        assert_eq!(summary.last_run_status, ralph_core::LastRunStatus::Failed);
+        assert_eq!(summary.last_prompt.as_deref(), Some("prompt_main.md"));
+    }
+
+    #[tokio::test]
+    async fn loop_route_switches_to_the_requested_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let seen_prompts = Arc::new(Mutex::new(Vec::new()));
+        let app = RalphApp::new(
+            project_dir.clone(),
+            AppConfig {
+                max_iterations: 2,
+                ..Default::default()
+            },
+            EventWritingRunner {
+                events: Arc::new(Mutex::new(vec![
+                    vec![("loop-route".to_owned(), "1_build.md".to_owned())],
+                    Vec::new(),
+                ])),
+                seen_prompts: seen_prompts.clone(),
+            },
+        );
+        app.create_target("demo", Some(ScaffoldId::PlanBuild))
+            .unwrap();
+
+        let mut delegate = TestDelegate;
+        let summary = app
+            .run_target_with_control("demo", Some("0_plan.md"), RunControl::new(), &mut delegate)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *seen_prompts.lock().unwrap(),
+            vec!["0_plan.md".to_owned(), "1_build.md".to_owned()]
+        );
+        assert_eq!(summary.last_prompt.as_deref(), Some("1_build.md"));
+        assert_eq!(
+            summary.last_run_status,
+            ralph_core::LastRunStatus::MaxIterations
+        );
     }
 }
