@@ -153,6 +153,7 @@ ralph workflow-creator
 ralph ls
 ralph show <target> [--file <name>]
 ralph edit <target> [--prompt <file>]
+ralph emit <event> [body ...]
 
 ralph agent list
 ralph agent current
@@ -172,6 +173,7 @@ Daily workflow:
 - `ls`: list known targets
 - `show`: inspect target files
 - `edit`: open the selected prompt or workflow input in your editor
+- `emit`: append an agent event to the current Ralph run WAL
 
 ## Target Model
 
@@ -214,7 +216,64 @@ Plan-build scaffold:
 - `0_plan.md`
 - `1_build.md`
 
-These prompts watch `IMPLEMENTATION_PLAN.md` through prompt-local NDJSON directives.
+The plan prompt repairs `specs/*` and `IMPLEMENTATION_PLAN.md` until they are fully aligned with the existing codebase, then routes to the build prompt. The build prompt executes exactly one high-priority plan item, continues on itself while the plan stays valid, and routes back to planning when specs or plan need reshaping.
+
+`0_plan.md`:
+
+```md
+# Execution policy
+1. Study `specs/*`.
+2. Study `IMPLEMENTATION_PLAN.md` if present in the repository root.
+3. Study the codebase areas that appear to hold shared utilities, core modules, or reusable components.
+4. Study the existing source code before deciding something is missing.
+5. Decide whether `specs/*`, `IMPLEMENTATION_PLAN.md`, and the existing source code are fully aligned and implementation-ready.
+   - If they are fully aligned, continue to 6.
+   - If you found gaps, inconsistencies, ambiguities, missing specifications, or plan defects that still need repair, continue to 7.
+6. Find the single most high-leverage remaining build item in `IMPLEMENTATION_PLAN.md`.
+   - If no build item remains, you MUST run `$RALPH_BIN emit loop-stop:ok no-build-items-remaining`, and then goto 10. Stop.
+   - Else run `$RALPH_BIN emit loop-route 1_build.md` and goto 10. Stop.
+7. Reconcile `specs/*`, `IMPLEMENTATION_PLAN.md`, and the existing source code. Prefer shared, consolidated solutions already present in the codebase over ad hoc duplication.
+8. Update `specs/*` conservatively until a builder could implement without guessing.
+9. Update `IMPLEMENTATION_PLAN.md` in the repository root as a prioritized list of remaining work, where each bullet is one concrete, observable outcome small enough for one build loop to finish completely. Then run `$RALPH_BIN emit loop-continue iterating-on-plan`.
+10. Stop.
+
+# Constraints
+0. NEVER implement, plan ONLY.
+1. NEVER assume that something is not-implemented; study the source code.
+2. YAGNI ruthlessly - no speculative features.
+3. Prefer refining `specs/*` over pushing guesses into implementation.
+4. Order `IMPLEMENTATION_PLAN.md` so earlier work unlocks later work and front-loads risk reduction, shared interfaces, migrations, and compatibility work.
+5. Fold low-value chores into the item they validate; do not create standalone busywork items unless they materially unblock later work.
+6. Prefer vertical-slice plan items over horizontal phase-based items whenever possible, because vertical slices reduce integration risk, surface hidden dependencies earlier, and leave the repository in a more verifiable working state after each build loop.
+7. Consider missing elements and plan accordingly. If an element is missing, search first to confirm it does not already exist, then, if needed, author the specification at `specs/FILENAME.md`.
+
+# ULTIMATE GOAL
+[project-specific goal]
+```
+
+`1_build.md`:
+
+```md
+# Execution policy
+1. Study `specs/*`.
+2. Study `IMPLEMENTATION_PLAN.md` if present in the repository root.
+3. Study the existing source code before deciding something is missing.
+4. Check whether `IMPLEMENTATION_PLAN.md` and `specs/*` are sufficient to implement without guessing.
+   - If they are missing, stale, ambiguous, or materially inconsistent with the code, run `$RALPH_BIN emit loop-route 0_plan.md` and goto 9. Stop.
+5. Find the single most high-leverage open item in `IMPLEMENTATION_PLAN.md`.
+   - If no open item remains, run `$RALPH_BIN emit loop-route 0_plan.md` and goto 9. Stop.
+   - Else run `$RALPH_BIN emit loop-continue single-build-task-taken` and proceed.
+6. Execute ONLY the chosen high-priority item completely against the specifications. Do not leave placeholders or partial implementations behind.
+7. Run the checks relevant to the code you changed.
+8. Update `IMPLEMENTATION_PLAN.md` with completed work and new findings such that the next worker can continue seamlessly. Update `AGENTS.md` only when you learn durable operational guidance about running or debugging the project.
+9. Stop.
+
+# Constraints
+1. NEVER assume that something is not-implemented; study the source code.
+2. YAGNI ruthlessly - no speculative features.
+3. If the work requires materially reshaping specs or the plan, route back to `0_plan.md` instead of guessing.
+4. Execute only one plan item per run.
+```
 
 Single-prompt scaffold:
 
@@ -223,18 +282,22 @@ Single-prompt scaffold:
 The single-prompt template uses runtime interpolation:
 
 ```md
-# Requests (not sorted by priority)
-- A
-- B
-- C
-
 # Execution policy
-1. Read {ralph-env:TARGET_DIR}/progress.txt.
-2. Execute the single most high leverage item in "Requests".
-3. Update your progress in {ralph-env:TARGET_DIR}/progress.txt with the notions about the executed item
-4. Stop
+1. Study `{ralph-env:TARGET_DIR}/progress.txt`.
+2. Study the existing source code.
+4. Find the single most high-leverage item in the requests.
+   - If no request item remains, run `$RALPH_BIN emit loop-stop:ok no-requests-remaining`, goto 7. Stop.
+   - Else run `$RALPH_BIN emit loop-continue single-task-taken` and proceed.
+5. Execute ONLY the chosen high-priority item.
+6. Update `{ralph-env:TARGET_DIR}/progress.txt` with completed work and new findings such that the next worker can continue seamlessly.
+7. Stop.
 
-{"ralph":"watch","path":"{ralph-env:TARGET_DIR}/progress.txt"}
+# Constraints
+1. NEVER assume that something is not-implemented, study the source code.
+2. YAGNI ruthlessly - no speculative features
+
+# REQUESTS
+[item list or file path with plan decomposed in tasks]
 ```
 
 Plan-driven scaffold:
@@ -292,6 +355,31 @@ For example:
 ```
 
 becomes an absolute Unix-style target path at runtime.
+
+## Agent Runtime Env
+
+When Ralph spawns an agent process it also injects:
+
+- `RALPH_BIN`
+- `RALPH_PROJECT_DIR`
+- `RALPH_TARGET_DIR`
+- `RALPH_PROMPT_PATH`
+- `RALPH_PROMPT_NAME`
+- `RALPH_RUN_ID`
+
+Agents can use the current Ralph binary to emit validated run events:
+
+```bash
+$RALPH_BIN emit loop-continue "one more pass"
+$RALPH_BIN emit loop-stop:ok "plan complete"
+$RALPH_BIN emit loop-stop:error "blocked by tests"
+$RALPH_BIN emit loop-route "1_build.md"
+$RALPH_BIN emit note "updated progress.toml"
+```
+
+`loop-route` only accepts a prompt filename in the root of the current target. Unknown `loop-*`
+events are rejected with a human-readable error message on stderr. Non-`loop-*` events are
+treated as observability-only custom events.
 
 ## Configuration
 
