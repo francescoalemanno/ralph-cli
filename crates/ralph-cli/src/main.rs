@@ -10,7 +10,7 @@ use std::{
 use crate::{
     cli::{
         AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, EmitArgs, InitArgs,
-        RequestArgs, RuntimeArgs,
+        RequestArgs,
     },
     output::{
         AgentCurrentRow, agent_list_rows, print_agent_current, print_agent_list,
@@ -45,7 +45,7 @@ async fn try_main() -> Result<()> {
     let cli = Cli::parse();
     let project_dir = resolve_project_dir(cli.project_dir.clone())?;
 
-    run_command(project_dir, cli.runtime, cli.command).await
+    run_command(project_dir, cli.command).await
 }
 
 fn build_tui_launch_options(
@@ -90,16 +90,12 @@ fn build_tui_launch_options(
     })
 }
 
-async fn run_command(
-    project_dir: Utf8PathBuf,
-    runtime: RuntimeArgs,
-    command: Commands,
-) -> Result<()> {
+async fn run_command(project_dir: Utf8PathBuf, command: Commands) -> Result<()> {
     match command {
         Commands::Run(args) => {
             if args.cli {
                 let mut app = RalphApp::load(project_dir)?;
-                runtime.apply_to(&mut app)?;
+                args.runtime.apply_to(&mut app)?;
                 let mut delegate = ConsoleDelegate;
                 let summary = app
                     .run_workflow(
@@ -118,7 +114,7 @@ async fn run_command(
                 }
                 let launch = build_tui_launch_options(&project_dir, &args)?;
                 let mut app = RalphApp::load(project_dir)?;
-                runtime.apply_to(&mut app)?;
+                args.runtime.apply_to(&mut app)?;
                 run_tui_with_options(app, launch)
             }
         }
@@ -442,7 +438,7 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::RunArgs;
+    use crate::cli::{RunArgs, RuntimeArgs};
     use std::fs;
 
     #[test]
@@ -608,6 +604,7 @@ prompts:
             project_dir,
             &RunArgs {
                 cli: false,
+                runtime: RuntimeArgs::default(),
                 workflow: "task-based".to_owned(),
                 request_args: RequestArgs::default(),
             },
@@ -626,6 +623,7 @@ prompts:
             project_dir,
             &RunArgs {
                 cli: false,
+                runtime: RuntimeArgs::default(),
                 workflow: "task-based".to_owned(),
                 request_args: RequestArgs {
                     request_file: None,
