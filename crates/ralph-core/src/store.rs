@@ -14,6 +14,28 @@ use crate::{
 pub(crate) const ARTIFACT_DIR_NAME: &str = ".ralph";
 const TARGETS_DIR_NAME: &str = "targets";
 
+pub fn list_prompt_names_in_dir(dir: &Utf8Path) -> Result<Vec<String>> {
+    let mut prompt_names = Vec::new();
+    for entry in
+        fs::read_dir(dir).with_context(|| format!("failed to read target directory {}", dir))?
+    {
+        let entry = entry?;
+        let path = Utf8PathBuf::from_path_buf(entry.path())
+            .map_err(|_| anyhow!("non-UTF8 target file under {}", dir))?;
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        if is_prompt_file_name(name) {
+            prompt_names.push(name.to_owned());
+        }
+    }
+    prompt_names.sort();
+    Ok(prompt_names)
+}
+
 #[derive(Debug, Clone)]
 pub struct TargetStore {
     project_dir: Utf8PathBuf,
@@ -297,9 +319,15 @@ mod tests {
         let build_prompt =
             std::fs::read_to_string(store.target_paths("demo").unwrap().dir.join("1_build.md"))
                 .unwrap();
+        assert!(plan_prompt.contains("# ULTIMATE GOAL\n[project-specific goal]"));
         assert!(
-            plan_prompt.contains("ULTIMATE GOAL - We want to achieve:\n[project-specific goal].")
+            plan_prompt.contains(
+                "you MUST run `$RALPH_BIN emit loop-stop:ok no-build-items-remaining`"
+            )
         );
+        assert!(plan_prompt.contains("0. NEVER implement, plan ONLY."));
+        assert!(plan_prompt.contains("$RALPH_BIN emit loop-continue iterating-on-plan"));
+        assert!(build_prompt.contains("$RALPH_BIN emit loop-continue single-build-task-taken"));
         assert!(!plan_prompt.contains("Update [project-specific goal] placeholder below."));
         assert!(!build_prompt.contains("[project-specific goal]"));
     }
@@ -319,13 +347,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(prompt_names, vec!["prompt_main.md"]);
-        assert!(summary.files.iter().any(|file| file.name == "progress.txt"));
-        assert!(
+        assert_eq!(
             summary
                 .files
                 .iter()
-                .find(|file| file.name == "progress.txt")
-                .is_some_and(|file| !file.is_prompt)
+                .map(|file| (file.name.as_str(), file.is_prompt))
+                .collect::<Vec<_>>(),
+            vec![("prompt_main.md", true), ("target.toml", false)]
         );
         assert!(summary.created_at.is_some());
     }
@@ -442,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn single_prompt_scaffold_keeps_progress_outside_the_prompt_file() {
+    fn single_prompt_scaffold_references_agent_managed_progress_file() {
         let temp = tempfile::tempdir().unwrap();
         let store = TargetStore::new(
             camino::Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap(),
@@ -459,28 +487,31 @@ mod tests {
                 .join("prompt_main.md"),
         )
         .unwrap();
-        let progress =
-            std::fs::read_to_string(store.target_paths("demo").unwrap().dir.join("progress.txt"))
-                .unwrap();
 
-        assert!(prompt.contains("# Requests (not sorted by priority)"));
         assert!(
             prompt.contains(
-                "1a. Study the existing source code before deciding something is missing."
-            )
-        );
-        assert!(prompt.contains("1b. Study `{ralph-env:TARGET_DIR}/progress.txt`."));
-        assert!(
-            prompt.contains(
-                "2. Execute the single most high leverage remaining item in \"Requests\"."
+                "1. Study `{ralph-env:TARGET_DIR}/progress.txt`."
             )
         );
         assert!(
             prompt.contains(
-                "3. Update `{ralph-env:TARGET_DIR}/progress.txt` with completed work and new findings when that keeps the next loop grounded."
+                "2. Study the existing source code."
             )
         );
-        assert!(prompt.contains("4. Stop."));
+        assert!(
+            prompt.contains(
+                "4. Find the single most high-leverage item in the requests."
+            )
+        );
+        assert!(prompt.contains("$RALPH_BIN emit loop-stop:ok no-requests-remaining"));
+        assert!(prompt.contains("$RALPH_BIN emit loop-continue single-task-taken"));
+        assert!(
+            prompt.contains(
+                "6. Update `{ralph-env:TARGET_DIR}/progress.txt` with completed work and new findings such that the next worker can continue seamlessly."
+            )
+        );
+        assert!(prompt.contains("# Constraints"));
+        assert!(prompt.contains("# REQUESTS"));
         assert_eq!(
             summary
                 .prompt_files
@@ -489,7 +520,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["prompt_main.md"]
         );
-        assert!(progress.contains("Completed work:"));
-        assert!(progress.contains("Next candidate work:"));
+        assert!(!store
+            .target_paths("demo")
+            .unwrap()
+            .dir
+            .join("progress.txt")
+            .exists());
     }
 }
