@@ -36,6 +36,12 @@ struct PromptFileRow {
     status: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct EmitEventRow {
+    event: String,
+    message: String,
+}
+
 pub(crate) fn print_agent_list(output: OutputArg, rows: &[AgentListRow]) -> Result<()> {
     let text = rows
         .iter()
@@ -143,6 +149,14 @@ pub(crate) fn print_prompt_file_row(
         None => row.prompt.clone(),
     };
     print_json_or_text(output, &row, text)
+}
+
+pub(crate) fn print_emitted_event(output: OutputArg, event: &str) -> Result<()> {
+    let row = EmitEventRow {
+        event: event.to_owned(),
+        message: format!("event {event} emitted."),
+    };
+    print_json_or_text(output, &row, row.message.clone())
 }
 
 pub(crate) fn print_json_or_text<T>(output: OutputArg, value: &T, text: String) -> Result<()>

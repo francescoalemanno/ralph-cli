@@ -90,6 +90,8 @@ pub(crate) enum Commands {
     New(NewArgs),
     #[command(about = "Run a target or selected prompt loop")]
     Run(RunArgs),
+    #[command(about = "Emit an agent event into the current Ralph run WAL")]
+    Emit(EmitArgs),
     #[command(hide = true)]
     FakeAgent(FakeAgentArgs),
     #[command(about = "List targets", visible_alias = "status")]
@@ -128,6 +130,18 @@ pub(crate) struct RunArgs {
     pub(crate) prompt: Option<String>,
     #[command(flatten)]
     pub(crate) runtime: RuntimeArgs,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct EmitArgs {
+    #[arg(value_name = "EVENT")]
+    pub(crate) event: String,
+    #[arg(
+        value_name = "BODY",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    pub(crate) body: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]

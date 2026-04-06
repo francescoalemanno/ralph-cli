@@ -5,18 +5,23 @@ mod output;
 use std::{env, fs, process::ExitCode};
 
 use crate::{
-    cli::{AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, InitArgs, OutputArg},
+    cli::{
+        AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, EmitArgs, InitArgs, OutputArg,
+    },
     output::{
         AgentCurrentRow, agent_list_rows, print_agent_current, print_agent_list, print_bare_file,
-        print_json_or_text, print_prompt_file_row, print_target_list, print_target_review,
-        print_target_summary,
+        print_emitted_event, print_json_or_text, print_prompt_file_row, print_target_list,
+        print_target_review, print_target_summary,
     },
 };
 use anyhow::{Context, Result, anyhow};
-use camino::Utf8PathBuf;
+use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
 use ralph_app::{ConsoleDelegate, RalphApp};
-use ralph_core::{AppConfig, ConfigFileScope, ScaffoldId, atomic_write, bare_prompt_template};
+use ralph_core::{
+    AgentEventRecord, AppConfig, ConfigFileScope, ScaffoldId, append_agent_event, atomic_write,
+    bare_prompt_template, list_prompt_names_in_dir,
+};
 use ralph_tui::{edit_file, run_tui, run_tui_scoped};
 use serde::Serialize;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -110,6 +115,7 @@ async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Comma
                 }
             }
         }
+        Commands::Emit(args) => run_emit(output, args),
         Commands::FakeAgent(args) => fake_agent::run(args.command),
         Commands::Ls => {
             let app = RalphApp::load(project_dir)?;
@@ -207,6 +213,125 @@ fn run_config_command(
             )
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmitContext {
+    run_id: String,
+    project_dir: Utf8PathBuf,
+    target_dir: Utf8PathBuf,
+    prompt_path: Utf8PathBuf,
+    prompt_name: String,
+}
+
+fn run_emit(output: OutputArg, args: EmitArgs) -> Result<()> {
+    let event = args.event.trim().to_owned();
+    if event.is_empty() {
+        return Err(anyhow!("event name cannot be empty"));
+    }
+
+    let body = args.body.join(" ");
+    let context = emit_context_from_env()?;
+    validate_emit_args(&event, &body, &context)?;
+    let wal_target_dir = context.target_dir.clone();
+
+    append_agent_event(
+        &wal_target_dir,
+        &AgentEventRecord {
+            v: 1,
+            ts_unix_ms: current_unix_timestamp_ms(),
+            run_id: context.run_id,
+            event: event.clone(),
+            body,
+            project_dir: context.project_dir,
+            target_dir: context.target_dir,
+            prompt_path: context.prompt_path,
+            prompt_name: context.prompt_name,
+            pid: std::process::id(),
+        },
+    )?;
+
+    print_emitted_event(output, &event)
+}
+
+fn emit_context_from_env() -> Result<EmitContext> {
+    Ok(EmitContext {
+        run_id: required_env("RALPH_RUN_ID")?,
+        project_dir: env_utf8_path("RALPH_PROJECT_DIR")?,
+        target_dir: env_utf8_path("RALPH_TARGET_DIR")?,
+        prompt_path: env_utf8_path("RALPH_PROMPT_PATH")?,
+        prompt_name: required_env("RALPH_PROMPT_NAME")?,
+    })
+}
+
+fn validate_emit_args(event: &str, body: &str, context: &EmitContext) -> Result<()> {
+    if !event.starts_with("loop-") {
+        return Ok(());
+    }
+
+    match event {
+        "loop-continue" | "loop-stop:ok" | "loop-stop:error" => Ok(()),
+        "loop-route" => validate_loop_route_body(body, context),
+        _ => Err(anyhow!(unsupported_loop_event_message(event))),
+    }
+}
+
+fn validate_loop_route_body(body: &str, context: &EmitContext) -> Result<()> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(invalid_route_message(trimmed, &context.target_dir)));
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(anyhow!(invalid_route_message(trimmed, &context.target_dir)));
+    }
+    if !trimmed.ends_with(".md") {
+        return Err(anyhow!(invalid_route_message(trimmed, &context.target_dir)));
+    }
+
+    let routes = list_prompt_names_in_dir(&context.target_dir)?;
+    if routes.iter().any(|route| route == trimmed) {
+        return Ok(());
+    }
+    Err(anyhow!(invalid_route_message(trimmed, &context.target_dir)))
+}
+
+fn invalid_route_message(route: &str, target_dir: &Utf8Path) -> String {
+    let routes = list_prompt_names_in_dir(target_dir).unwrap_or_default();
+    if routes.is_empty() {
+        format!(
+            "\"{route}\" is not a valid event body for `loop-route`.\nNo routes are available in {}.",
+            target_dir
+        )
+    } else {
+        format!(
+            "\"{route}\" is not a valid event body for `loop-route`.\nChoose among the available routes:\n{}",
+            routes.join("\n")
+        )
+    }
+}
+
+fn unsupported_loop_event_message(event: &str) -> String {
+    format!(
+        "`{event}` is not a supported loop event.\nChoose among:\nloop-continue\nloop-stop:ok\nloop-stop:error\nloop-route"
+    )
+}
+
+fn required_env(key: &str) -> Result<String> {
+    env::var(key)
+        .map_err(|_| anyhow!("missing {key}; this command only works inside a Ralph agent run"))
+}
+
+fn env_utf8_path(key: &str) -> Result<Utf8PathBuf> {
+    Ok(Utf8PathBuf::from(required_env(key)?))
+}
+
+fn current_unix_timestamp_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn run_init(project_dir: Utf8PathBuf, args: InitArgs) -> Result<()> {
@@ -319,6 +444,8 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -338,5 +465,64 @@ mod tests {
         let cwd = Utf8PathBuf::from_path_buf(env::current_dir().unwrap()).unwrap();
         let resolved = resolve_bare_prompt_path(Some("notes/prompt.md")).unwrap();
         assert_eq!(resolved, cwd.join("notes/prompt.md"));
+    }
+
+    fn emit_context(target_dir: Utf8PathBuf, prompt_name: &str) -> EmitContext {
+        EmitContext {
+            run_id: "run-1".to_owned(),
+            project_dir: Utf8PathBuf::from("/tmp/project"),
+            target_dir: target_dir.clone(),
+            prompt_path: target_dir.join(prompt_name),
+            prompt_name: prompt_name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn loop_route_validation_lists_available_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let target_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        fs::write(target_dir.join("0_plan.md"), "# plan\n").unwrap();
+        fs::write(target_dir.join("1_build.md"), "# build\n").unwrap();
+
+        let error = validate_loop_route_body("1_bud.md", &emit_context(target_dir, "0_plan.md"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("\"1_bud.md\" is not a valid event body for `loop-route`."));
+        assert!(error.contains("0_plan.md"));
+        assert!(error.contains("1_build.md"));
+    }
+
+    #[test]
+    fn unsupported_loop_events_are_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let target_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        fs::write(target_dir.join("prompt_main.md"), "# prompt\n").unwrap();
+
+        let error = validate_emit_args(
+            "loop-pause",
+            "later",
+            &emit_context(target_dir, "prompt_main.md"),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("`loop-pause` is not a supported loop event."));
+        assert!(error.contains("loop-continue"));
+        assert!(error.contains("loop-route"));
+    }
+
+    #[test]
+    fn non_loop_events_are_allowed_without_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let target_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        fs::write(target_dir.join("prompt_main.md"), "# prompt\n").unwrap();
+
+        validate_emit_args(
+            "note",
+            "free form",
+            &emit_context(target_dir, "prompt_main.md"),
+        )
+        .unwrap();
     }
 }
