@@ -108,6 +108,7 @@ pub struct TargetFileContents {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerInvocation {
+    pub run_id: String,
     pub prompt_text: String,
     pub project_dir: Utf8PathBuf,
     pub target_dir: Utf8PathBuf,

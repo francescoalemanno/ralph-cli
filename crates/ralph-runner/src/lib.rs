@@ -40,6 +40,7 @@ pub struct InteractiveSessionOutcome {
 
 #[derive(Debug, Clone)]
 struct TemplateContext {
+    run_id: String,
     prompt_text: String,
     project_dir: Utf8PathBuf,
     target_dir: Utf8PathBuf,
@@ -51,6 +52,7 @@ struct TemplateContext {
 impl TemplateContext {
     fn from_invocation(invocation: RunnerInvocation) -> Self {
         Self {
+            run_id: invocation.run_id,
             prompt_text: invocation.prompt_text,
             project_dir: invocation.project_dir,
             target_dir: invocation.target_dir,
@@ -62,6 +64,7 @@ impl TemplateContext {
 
     fn from_interactive(invocation: &InteractiveSessionInvocation) -> Self {
         Self {
+            run_id: String::new(),
             prompt_text: invocation.initial_prompt.clone(),
             project_dir: invocation.project_dir.clone(),
             target_dir: invocation.target_dir.clone(),
@@ -344,6 +347,9 @@ fn rendered_envs(
         "RALPH_PROJECT_DIR".to_owned(),
         context.project_dir.to_string(),
     ));
+    if !context.run_id.is_empty() {
+        envs.push(("RALPH_RUN_ID".to_owned(), context.run_id.clone()));
+    }
     let ralph_bin = current_binary_path();
     if !ralph_bin.is_empty() {
         envs.push(("RALPH_BIN".to_owned(), ralph_bin));
@@ -620,6 +626,7 @@ mod tests {
     #[test]
     fn mode_template_is_distinct_from_prompt_name() {
         let context = TemplateContext::from_invocation(RunnerInvocation {
+            run_id: "run-1".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
             target_dir: "/tmp/project/.ralph/targets/demo".into(),
@@ -666,6 +673,7 @@ mod tests {
     #[test]
     fn env_templates_render_prompt_file_and_prompt() {
         let context = TemplateContext::from_invocation(RunnerInvocation {
+            run_id: "run-1".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
             target_dir: "/tmp/project/.ralph/targets/demo".into(),
@@ -679,6 +687,7 @@ mod tests {
     #[test]
     fn render_template_exposes_current_binary_placeholder() {
         let context = TemplateContext::from_invocation(RunnerInvocation {
+            run_id: "run-1".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
             target_dir: "/tmp/project/.ralph/targets/demo".into(),
@@ -693,6 +702,7 @@ mod tests {
     #[test]
     fn rendered_envs_include_current_binary_path() {
         let context = TemplateContext::from_invocation(RunnerInvocation {
+            run_id: "run-1".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
             target_dir: "/tmp/project/.ralph/targets/demo".into(),
