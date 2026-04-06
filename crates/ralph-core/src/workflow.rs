@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fs};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+};
 
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
@@ -10,6 +13,7 @@ const WORKFLOW_VERSION: u8 = 1;
 const REQUEST_TOKEN: &str = "{ralph-request}";
 const PROJECT_DIR_TOKEN: &str = "{ralph-env:PROJECT_DIR}";
 const REMOVED_RUN_DIR_TOKEN: &str = "{ralph-env:RUN_DIR}";
+const OPTION_TOKEN_PREFIX: &str = "{ralph-option:";
 
 pub const NO_ROUTE_OK: &str = "no-route-ok";
 pub const NO_ROUTE_ERROR: &str = "no-route-error";
@@ -22,6 +26,8 @@ pub struct WorkflowDefinition {
     #[serde(default)]
     pub description: String,
     pub entrypoint: String,
+    #[serde(default)]
+    pub options: BTreeMap<String, WorkflowOptionDefinition>,
     #[serde(default)]
     pub request: Option<WorkflowRequestDefinition>,
     pub prompts: BTreeMap<String, WorkflowPromptDefinition>,
@@ -62,6 +68,20 @@ impl WorkflowDefinition {
             ));
         }
 
+        let mut seen_flags = BTreeMap::new();
+        for option_id in self.options.keys() {
+            let flag = workflow_option_flag(option_id)?;
+            if let Some(existing) = seen_flags.insert(flag.clone(), option_id.clone()) {
+                return Err(anyhow!(
+                    "workflow '{}' options '{}' and '{}' both map to CLI flag '--{}'",
+                    self.workflow_id,
+                    existing,
+                    option_id,
+                    flag
+                ));
+            }
+        }
+
         for (prompt_id, prompt) in &self.prompts {
             if prompt_id.trim().is_empty() {
                 return Err(anyhow!(
@@ -99,6 +119,16 @@ impl WorkflowDefinition {
                     REMOVED_RUN_DIR_TOKEN,
                     PROJECT_DIR_TOKEN
                 ));
+            }
+            for option_id in referenced_option_ids(&prompt.prompt) {
+                if !self.options.contains_key(option_id) {
+                    return Err(anyhow!(
+                        "workflow '{}' prompt '{}' references undefined option '{}'",
+                        self.workflow_id,
+                        prompt_id,
+                        option_id
+                    ));
+                }
             }
         }
 
@@ -170,6 +200,14 @@ impl WorkflowDefinition {
         self.prompts.values().any(|prompt| prompt.is_interactive)
     }
 
+    pub fn option(&self, option_id: &str) -> Option<&WorkflowOptionDefinition> {
+        self.options.get(option_id)
+    }
+
+    pub fn option_ids(&self) -> Vec<&str> {
+        self.options.keys().map(String::as_str).collect()
+    }
+
     pub fn source_path(&self) -> Option<&Utf8Path> {
         self.source_path.as_deref()
     }
@@ -186,6 +224,16 @@ pub struct WorkflowPromptDefinition {
     #[serde(rename = "fallback-route")]
     pub fallback_route: String,
     pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkflowOptionDefinition {
+    #[serde(default)]
+    pub help: String,
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub value_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +275,52 @@ pub struct WorkflowSummary {
     pub title: String,
     pub description: String,
     pub path: Utf8PathBuf,
+}
+
+pub fn workflow_option_flag(option_id: &str) -> Result<String> {
+    if option_id.trim().is_empty() {
+        return Err(anyhow!("workflow option ids cannot be empty"));
+    }
+
+    let mut flag = String::new();
+    for ch in option_id.chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => flag.push(ch.to_ascii_lowercase()),
+            '-' | '_' => {}
+            _ => {
+                return Err(anyhow!(
+                    "workflow option '{}' contains unsupported character '{}'; use ASCII letters, digits, '-' or '_'",
+                    option_id,
+                    ch
+                ));
+            }
+        }
+    }
+
+    if flag.is_empty() {
+        return Err(anyhow!(
+            "workflow option '{}' must contain at least one ASCII letter or digit",
+            option_id
+        ));
+    }
+
+    Ok(flag)
+}
+
+fn referenced_option_ids(prompt: &str) -> BTreeSet<&str> {
+    let mut option_ids = BTreeSet::new();
+    let mut remaining = prompt;
+
+    while let Some(start) = remaining.find(OPTION_TOKEN_PREFIX) {
+        let token = &remaining[start + OPTION_TOKEN_PREFIX.len()..];
+        let Some(end) = token.find('}') else {
+            break;
+        };
+        option_ids.insert(&token[..end]);
+        remaining = &token[end + 1..];
+    }
+
+    option_ids
 }
 
 pub fn workflow_config_dir() -> Result<Utf8PathBuf> {
@@ -356,9 +450,10 @@ mod tests {
     use camino::Utf8PathBuf;
 
     use super::{
-        NO_ROUTE_ERROR, WorkflowDefinition, WorkflowFileRequest, WorkflowPromptDefinition,
-        WorkflowRequestDefinition, WorkflowRuntimeRequest, list_workflows, load_workflow,
-        load_workflow_from_path, seed_builtin_workflows_if_missing, workflow_config_dir,
+        NO_ROUTE_ERROR, WorkflowDefinition, WorkflowFileRequest, WorkflowOptionDefinition,
+        WorkflowPromptDefinition, WorkflowRequestDefinition, WorkflowRuntimeRequest,
+        list_workflows, load_workflow, load_workflow_from_path, seed_builtin_workflows_if_missing,
+        workflow_config_dir,
     };
     use crate::config::configure_test_global_config_home;
 
@@ -475,6 +570,7 @@ prompts:
             title: "Broken".to_owned(),
             description: String::new(),
             entrypoint: "main".to_owned(),
+            options: BTreeMap::new(),
             request: Some(WorkflowRequestDefinition {
                 runtime: Some(WorkflowRuntimeRequest {
                     argv: true,
@@ -510,6 +606,7 @@ prompts:
             title: "Broken".to_owned(),
             description: String::new(),
             entrypoint: "main".to_owned(),
+            options: BTreeMap::new(),
             request: None,
             prompts: BTreeMap::from([(
                 "main".to_owned(),
@@ -526,6 +623,75 @@ prompts:
         let error = workflow.validate().unwrap_err().to_string();
         assert!(error.contains("unsupported interpolation"));
         assert!(error.contains("{ralph-env:RUN_DIR}"));
+    }
+
+    #[test]
+    fn validation_rejects_undefined_option_tokens() {
+        let workflow = WorkflowDefinition {
+            version: 1,
+            workflow_id: "broken".to_owned(),
+            title: "Broken".to_owned(),
+            description: String::new(),
+            entrypoint: "main".to_owned(),
+            options: BTreeMap::new(),
+            request: None,
+            prompts: BTreeMap::from([(
+                "main".to_owned(),
+                WorkflowPromptDefinition {
+                    title: "Main".to_owned(),
+                    is_interactive: false,
+                    fallback_route: NO_ROUTE_ERROR.to_owned(),
+                    prompt: "{ralph-option:progress-file}".to_owned(),
+                },
+            )]),
+            source_path: None,
+        };
+
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("references undefined option 'progress-file'"));
+    }
+
+    #[test]
+    fn validation_rejects_conflicting_option_flags() {
+        let workflow = WorkflowDefinition {
+            version: 1,
+            workflow_id: "broken".to_owned(),
+            title: "Broken".to_owned(),
+            description: String::new(),
+            entrypoint: "main".to_owned(),
+            options: BTreeMap::from([
+                (
+                    "progress-file".to_owned(),
+                    WorkflowOptionDefinition {
+                        help: String::new(),
+                        default: Some("progress.txt".to_owned()),
+                        value_name: None,
+                    },
+                ),
+                (
+                    "progress_file".to_owned(),
+                    WorkflowOptionDefinition {
+                        help: String::new(),
+                        default: Some("progress-2.txt".to_owned()),
+                        value_name: None,
+                    },
+                ),
+            ]),
+            request: None,
+            prompts: BTreeMap::from([(
+                "main".to_owned(),
+                WorkflowPromptDefinition {
+                    title: "Main".to_owned(),
+                    is_interactive: false,
+                    fallback_route: NO_ROUTE_ERROR.to_owned(),
+                    prompt: "hello".to_owned(),
+                },
+            )]),
+            source_path: None,
+        };
+
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("both map to CLI flag '--progressfile'"));
     }
 
     #[test]

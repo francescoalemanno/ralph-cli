@@ -15,7 +15,8 @@ pub use atomic::atomic_write;
 pub use config::{ARTIFACT_DIR_NAME, AppConfig, ConfigFileScope, ThemeConfig, global_config_dir};
 pub use types::{LastRunStatus, RunControl, RunnerInvocation, RunnerResult, WorkflowRunSummary};
 pub use workflow::{
-    NO_ROUTE_ERROR, NO_ROUTE_OK, WorkflowDefinition, WorkflowFileRequest, WorkflowPromptDefinition,
-    WorkflowRequestDefinition, WorkflowRuntimeRequest, WorkflowSummary, list_workflows,
-    load_workflow, load_workflow_from_path, seed_builtin_workflows_if_missing, workflow_config_dir,
+    NO_ROUTE_ERROR, NO_ROUTE_OK, WorkflowDefinition, WorkflowFileRequest, WorkflowOptionDefinition,
+    WorkflowPromptDefinition, WorkflowRequestDefinition, WorkflowRuntimeRequest, WorkflowSummary,
+    list_workflows, load_workflow, load_workflow_from_path, seed_builtin_workflows_if_missing,
+    workflow_config_dir, workflow_option_flag,
 };

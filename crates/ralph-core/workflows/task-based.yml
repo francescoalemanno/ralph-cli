@@ -3,6 +3,11 @@ workflow_id: task-based
 title: Task Based
 description: Execute one high-priority task at a time against a supplied request list.
 entrypoint: main
+options:
+  progress-file:
+    help: Progress file to read before work and update before handing off.
+    default: progress.txt
+    value_name: FILE
 request:
   runtime:
     argv: true
@@ -15,12 +20,12 @@ prompts:
     fallback-route: no-route-error
     prompt: |
       # Execution policy
-      1. Study `progress.txt`.
+      1. Study `{ralph-option:progress-file}`.
       2. Study the existing source code.
       3. Find the single most high-leverage item in the requests.
          - If none found, run `$RALPH_BIN emit loop-stop:ok found-no-open-task`, goto 7. Stop.
       4. Execute ONLY the chosen high-priority item.
-      5. Update `progress.txt` with completed work and new findings such that the next worker can continue seamlessly.
+      5. Update `{ralph-option:progress-file}` with completed work and new findings such that the next worker can continue seamlessly.
       6. After finishing 6: run `$RALPH_BIN emit loop-continue handoff-to-next-worker`, goto 7. Stop.
       7. Stop.
 

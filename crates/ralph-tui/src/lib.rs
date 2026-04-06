@@ -1,6 +1,7 @@
 mod editor;
 mod ui;
 
+use std::collections::BTreeMap;
 use std::io;
 
 use anyhow::{Context, Result, anyhow};
@@ -15,7 +16,10 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 pub use editor::edit_file;
-use ralph_app::{RalphApp, RunDelegate, RunEvent, WorkflowRequestInput, format_iteration_banner};
+use ralph_app::{
+    RalphApp, RunDelegate, RunEvent, WorkflowRequestInput, WorkflowRunInput,
+    format_iteration_banner,
+};
 use ralph_core::{
     LastRunStatus, RunControl, RunnerConfig, WorkflowDefinition, WorkflowRunSummary,
     WorkflowRuntimeRequest, atomic_write,
@@ -41,6 +45,7 @@ const RUNNING_SCROLLBACK_LIMIT: usize = 100_000;
 pub struct TuiLaunchOptions {
     pub preset_workflow: Option<String>,
     pub preloaded_request: Option<TuiPreloadedRequest>,
+    pub workflow_options: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +223,7 @@ struct TuiApp {
     request_text: String,
     request_file: String,
     request_origin: RequestOrigin,
+    workflow_options: BTreeMap<String, String>,
     message: String,
     running: Option<RunningState>,
     auto_start_run: bool,
@@ -242,6 +248,7 @@ impl TuiApp {
             request_text: String::new(),
             request_file: String::new(),
             request_origin: RequestOrigin::None,
+            workflow_options: launch.workflow_options,
             message: String::new(),
             running: None,
             auto_start_run: false,
@@ -594,6 +601,7 @@ impl TuiApp {
         let tx = self.tx.clone();
         let app = self.app.clone();
         let control_for_task = control.clone();
+        let workflow_options = self.workflow_options.clone();
 
         self.message = format!("running workflow '{}'", workflow_id);
         self.running = Some(RunningState::new(control));
@@ -603,7 +611,10 @@ impl TuiApp {
             let result = app
                 .run_workflow_with_control(
                     &workflow_id,
-                    request_input,
+                    WorkflowRunInput {
+                        request: request_input,
+                        options: workflow_options,
+                    },
                     control_for_task,
                     &mut delegate,
                 )
@@ -1351,6 +1362,7 @@ mod tests {
                     text: "ship it".to_owned(),
                     file_path: None,
                 }),
+                workflow_options: Default::default(),
             },
         )
         .unwrap();
@@ -1421,6 +1433,7 @@ prompt_env_var = "PROMPT"
                     text: "ship it".to_owned(),
                     file_path: None,
                 }),
+                workflow_options: Default::default(),
             },
         )
         .unwrap();

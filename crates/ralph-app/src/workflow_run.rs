@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -9,6 +10,7 @@ use ralph_core::{
     LastRunStatus, LoopControlDecision, NO_ROUTE_ERROR, NO_ROUTE_OK, RunControl, RunnerConfig,
     RunnerInvocation, WorkflowDefinition, WorkflowRunSummary, WorkflowRuntimeRequest,
     current_agent_events_offset, load_workflow, read_agent_events_since, reduce_loop_control,
+    workflow_option_flag,
 };
 use ralph_runner::{InteractiveSessionInvocation, RunnerAdapter, RunnerStreamEvent};
 use tokio::sync::mpsc::unbounded_channel;
@@ -30,6 +32,12 @@ impl WorkflowRequestInput {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowRunInput {
+    pub request: WorkflowRequestInput,
+    pub options: BTreeMap<String, String>,
+}
+
 async fn forward_stream_event<D>(delegate: &mut D, event: RunnerStreamEvent) -> Result<()>
 where
     D: RunDelegate,
@@ -46,20 +54,20 @@ where
     pub async fn run_workflow<D>(
         &self,
         workflow_id: &str,
-        request_input: WorkflowRequestInput,
+        input: WorkflowRunInput,
         delegate: &mut D,
     ) -> Result<WorkflowRunSummary>
     where
         D: RunDelegate,
     {
-        self.run_workflow_with_control(workflow_id, request_input, RunControl::new(), delegate)
+        self.run_workflow_with_control(workflow_id, input, RunControl::new(), delegate)
             .await
     }
 
     pub async fn run_workflow_with_control<D>(
         &self,
         workflow_id: &str,
-        request_input: WorkflowRequestInput,
+        input: WorkflowRunInput,
         control: RunControl,
         delegate: &mut D,
     ) -> Result<WorkflowRunSummary>
@@ -71,7 +79,8 @@ where
             .source_path()
             .ok_or_else(|| anyhow!("workflow '{}' does not have a source path", workflow_id))?
             .to_path_buf();
-        let request = self.resolve_workflow_request(&workflow, request_input)?;
+        let workflow_options = self.resolve_workflow_options(&workflow, input.options)?;
+        let request = self.resolve_workflow_request(&workflow, input.request)?;
         let run_id = next_workflow_run_id();
         let run_dir = self.workflow_run_dir(&workflow.workflow_id, &run_id);
         fs::create_dir_all(run_dir.as_std_path())
@@ -92,8 +101,12 @@ where
             let prompt = workflow.prompt(&current_prompt_id).ok_or_else(|| {
                 anyhow!("workflow prompt '{}' no longer exists", current_prompt_id)
             })?;
-            let prompt_text =
-                interpolate_workflow_prompt(&prompt.prompt, &self.project_dir, request.as_deref())?;
+            let prompt_text = interpolate_workflow_prompt(
+                &prompt.prompt,
+                &self.project_dir,
+                request.as_deref(),
+                &workflow_options,
+            )?;
 
             delegate
                 .on_event(RunEvent::IterationStarted {
@@ -378,6 +391,47 @@ where
         }
     }
 
+    fn resolve_workflow_options(
+        &self,
+        workflow: &WorkflowDefinition,
+        mut provided_options: BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>> {
+        let unknown_options = provided_options
+            .keys()
+            .filter(|option_id| workflow.option(option_id).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unknown_options.is_empty() {
+            return Err(anyhow!(
+                "workflow '{}' does not define options: {}",
+                workflow.workflow_id,
+                unknown_options.join(", ")
+            ));
+        }
+
+        let mut resolved = BTreeMap::new();
+        for option_id in workflow.option_ids() {
+            let definition = workflow
+                .option(option_id)
+                .expect("option ids are sourced from the workflow");
+            let value = provided_options
+                .remove(option_id)
+                .or_else(|| definition.default.clone())
+                .ok_or_else(|| {
+                    let flag =
+                        workflow_option_flag(option_id).unwrap_or_else(|_| option_id.to_owned());
+                    anyhow!(
+                        "workflow '{}' requires option '--{}'",
+                        workflow.workflow_id,
+                        flag
+                    )
+                })?;
+            resolved.insert(option_id.to_owned(), value);
+        }
+
+        Ok(resolved)
+    }
+
     fn workflow_run_dir(&self, workflow_id: &str, run_id: &str) -> Utf8PathBuf {
         self.project_dir
             .join(".ralph")
@@ -534,6 +588,7 @@ fn next_workflow_run_id() -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs,
         sync::{Arc, Mutex},
     };
@@ -547,7 +602,7 @@ mod tests {
     };
     use tokio::sync::mpsc::UnboundedSender;
 
-    use crate::{RalphApp, RunDelegate, RunEvent, WorkflowRequestInput};
+    use crate::{RalphApp, RunDelegate, RunEvent, WorkflowRequestInput, WorkflowRunInput};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -694,8 +749,11 @@ prompts:
         let summary = app
             .run_workflow(
                 "plan-build",
-                WorkflowRequestInput {
-                    argv: Some("ship it".to_owned()),
+                WorkflowRunInput {
+                    request: WorkflowRequestInput {
+                        argv: Some("ship it".to_owned()),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 &mut delegate,
@@ -752,8 +810,11 @@ prompts:
         let summary = app
             .run_workflow(
                 "pdd",
-                WorkflowRequestInput {
-                    argv: Some("rough idea".to_owned()),
+                WorkflowRunInput {
+                    request: WorkflowRequestInput {
+                        argv: Some("rough idea".to_owned()),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 &mut delegate,
@@ -819,8 +880,11 @@ prompts:
         let error = app
             .run_workflow(
                 "pdd",
-                WorkflowRequestInput {
-                    stdin: Some("rough idea".to_owned()),
+                WorkflowRunInput {
+                    request: WorkflowRequestInput {
+                        stdin: Some("rough idea".to_owned()),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
                 &mut delegate,
@@ -833,6 +897,80 @@ prompts:
         unsafe {
             std::env::remove_var("RALPH_CONFIG_HOME");
         }
+    }
+
+    #[tokio::test]
+    async fn run_workflow_interpolates_declared_option_values() -> Result<()> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let config_home = temp.path().join("config-home");
+        fs::create_dir_all(config_home.join("workflows")).unwrap();
+        unsafe {
+            std::env::set_var("RALPH_CONFIG_HOME", &config_home);
+        }
+        fs::write(
+            config_home.join("workflows/task-based.yml"),
+            r#"
+version: 1
+workflow_id: task-based
+title: Task Based
+entrypoint: main
+options:
+  progress-file:
+    default: progress.txt
+request:
+  runtime:
+    argv: true
+prompts:
+  main:
+    title: Main
+    is_interactive: false
+    fallback-route: no-route-error
+    prompt: |
+      progress={ralph-option:progress-file}
+      request={ralph-request}
+"#,
+        )?;
+
+        let runner = WorkflowSpyRunner {
+            events: Arc::new(Mutex::new(vec![vec![(
+                "loop-stop:ok".to_owned(),
+                "done".to_owned(),
+            )]])),
+            ..Default::default()
+        };
+        let app = RalphApp::new(project_dir, AppConfig::default(), runner.clone());
+        let mut delegate = TestDelegate::default();
+
+        app.run_workflow(
+            "task-based",
+            WorkflowRunInput {
+                request: WorkflowRequestInput {
+                    argv: Some("ship it".to_owned()),
+                    ..Default::default()
+                },
+                options: BTreeMap::from([(
+                    "progress-file".to_owned(),
+                    "custom-progress.txt".to_owned(),
+                )]),
+            },
+            &mut delegate,
+        )
+        .await?;
+
+        let invocation = runner.invocations.lock().unwrap().first().cloned().unwrap();
+        assert!(
+            invocation
+                .prompt_text
+                .contains("progress=custom-progress.txt")
+        );
+        assert!(invocation.prompt_text.contains("request=ship it"));
+
+        unsafe {
+            std::env::remove_var("RALPH_CONFIG_HOME");
+        }
+        Ok(())
     }
 
     #[test]

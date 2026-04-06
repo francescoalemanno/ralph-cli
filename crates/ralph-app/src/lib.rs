@@ -14,7 +14,7 @@ use ralph_runner::{
 };
 
 pub use console::ConsoleDelegate;
-pub use workflow_run::WorkflowRequestInput;
+pub use workflow_run::{WorkflowRequestInput, WorkflowRunInput};
 
 #[derive(Debug)]
 pub enum RunEvent {
