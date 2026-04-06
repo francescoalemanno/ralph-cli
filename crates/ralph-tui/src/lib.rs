@@ -227,7 +227,7 @@ impl TuiApp {
     fn new(app: RalphApp, handle: Handle, launch: TuiLaunchOptions) -> Result<Self> {
         let workflow_id = launch
             .preset_workflow
-            .ok_or_else(|| anyhow!("opening the runner TUI requires --workflow/-w"))?;
+            .ok_or_else(|| anyhow!("opening the runner TUI requires a workflow id"))?;
         let workflow = app.load_workflow(&workflow_id)?;
         let (tx, rx) = std::sync::mpsc::channel();
         let mut this = Self {
