@@ -2,9 +2,8 @@ mod agent;
 mod agent_events;
 mod atomic;
 mod config;
-mod scaffold;
-mod store;
 mod types;
+mod workflow;
 
 pub use agent::{AgentConfig, CodingAgent, CommandMode, PromptInput, RunnerConfig, builtin_agents};
 pub use agent_events::{
@@ -13,10 +12,10 @@ pub use agent_events::{
     read_agent_events_since, reduce_loop_control,
 };
 pub use atomic::atomic_write;
-pub use config::{AppConfig, ConfigFileScope, ThemeConfig};
-pub use scaffold::bare_prompt_template;
-pub use store::{TargetStore, list_prompt_names_in_dir};
-pub use types::{
-    LastRunStatus, PromptFile, RunControl, RunnerInvocation, RunnerResult, ScaffoldId,
-    TargetConfig, TargetFile, TargetFileContents, TargetPaths, TargetReview, TargetSummary,
+pub use config::{ARTIFACT_DIR_NAME, AppConfig, ConfigFileScope, ThemeConfig, global_config_dir};
+pub use types::{LastRunStatus, RunControl, RunnerInvocation, RunnerResult, WorkflowRunSummary};
+pub use workflow::{
+    NO_ROUTE_ERROR, NO_ROUTE_OK, WorkflowDefinition, WorkflowFileRequest, WorkflowPromptDefinition,
+    WorkflowRequestDefinition, WorkflowRuntimeRequest, WorkflowSummary, list_workflows,
+    load_workflow, load_workflow_from_path, seed_builtin_workflows_if_missing, workflow_config_dir,
 };

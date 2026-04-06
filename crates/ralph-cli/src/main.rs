@@ -1,36 +1,35 @@
 mod cli;
-mod fake_agent;
 mod output;
 
-use std::{env, fs, process::ExitCode};
+use std::{
+    env, fs,
+    io::{self, IsTerminal, Read},
+    process::ExitCode,
+};
 
 use crate::{
     cli::{
-        AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, EmitArgs, InitArgs, OutputArg,
+        AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, EmitArgs, InitArgs,
+        RequestArgs, RuntimeArgs,
     },
     output::{
-        AgentCurrentRow, agent_list_rows, print_agent_current, print_agent_list, print_bare_file,
-        print_emitted_event, print_json_or_text, print_prompt_file_row, print_target_list,
-        print_target_review, print_target_summary,
+        AgentCurrentRow, agent_list_rows, print_agent_current, print_agent_list,
+        print_emitted_event, print_workflow_definition, print_workflow_list, print_workflow_run,
     },
 };
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::Parser;
-use ralph_app::{ConsoleDelegate, RalphApp};
+use ralph_app::{ConsoleDelegate, RalphApp, WorkflowRequestInput};
 use ralph_core::{
-    AgentEventRecord, AppConfig, ConfigFileScope, ScaffoldId, append_agent_event, atomic_write,
-    bare_prompt_template, list_prompt_names_in_dir,
+    AgentEventRecord, AppConfig, ConfigFileScope, append_agent_event, atomic_write,
+    load_workflow_from_path, seed_builtin_workflows_if_missing,
 };
-use ralph_tui::{edit_file, run_tui, run_tui_scoped};
+use ralph_tui::{
+    TuiLaunchOptions, TuiPreloadedRequest, TuiRequestSource, edit_file, run_tui_with_options,
+};
 use serde::Serialize;
 use tracing_subscriber::{EnvFilter, fmt};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TargetMode<'a> {
-    Target(&'a str),
-    BarePrompt(Utf8PathBuf),
-}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -44,123 +43,118 @@ async fn main() -> ExitCode {
 async fn try_main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
-    let project_dir = resolve_project_dir(cli.project_dir)?;
+    let project_dir = resolve_project_dir(cli.project_dir.clone())?;
 
-    match (cli.command, cli.target) {
-        (None, None) => run_tui(RalphApp::load(project_dir)?),
-        (None, Some(target)) => run_tui_scoped(RalphApp::load(project_dir)?, &target),
-        (Some(command), _) => run_command(project_dir, cli.output, command).await,
+    match cli.command {
+        None => {
+            if !io::stdin().is_terminal() {
+                return Err(anyhow!(
+                    "stdin preloading is not supported when opening the TUI; use `ralph --file REQ.md` or `ralph \"your request\"`"
+                ));
+            }
+            let launch = build_tui_launch_options(&project_dir, &cli)?;
+            let mut app = RalphApp::load(project_dir.clone())?;
+            cli.runtime.apply_to(&mut app)?;
+            run_tui_with_options(app, launch)
+        }
+        Some(command) => run_command(project_dir, cli.runtime, command).await,
     }
 }
 
-async fn run_command(project_dir: Utf8PathBuf, output: OutputArg, command: Commands) -> Result<()> {
-    match command {
-        Commands::New(args) => {
-            let app = RalphApp::load(project_dir)?;
-            match resolve_target_mode(args.target.as_deref(), args.prompt.as_deref())? {
-                TargetMode::Target(target) => {
-                    let scaffold: ScaffoldId = args.scaffold.into();
-                    let summary = app.create_target(target, Some(scaffold))?;
-                    if args.edit {
-                        let prompt_path = summary
-                            .prompt_files
-                            .first()
-                            .map(|prompt| prompt.path.clone())
-                            .ok_or_else(|| {
-                                anyhow!("target '{}' has no runnable prompt files", summary.id)
-                            })?;
-                        edit_file(&prompt_path, app.config().editor_override.as_deref())?;
-                    }
-                    print_target_summary(output, &summary)
-                }
-                TargetMode::BarePrompt(prompt_path) => {
-                    let scaffold: ScaffoldId = args.scaffold.into();
-                    create_bare_prompt_file(&prompt_path, scaffold)?;
-                    if args.edit {
-                        edit_file(&prompt_path, app.config().editor_override.as_deref())?;
-                    }
-                    print_prompt_file_row(
-                        output,
-                        prompt_path.to_string(),
-                        Some(scaffold.as_str().to_owned()),
-                        None,
-                    )
-                }
-            }
+fn build_tui_launch_options(project_dir: &Utf8Path, args: &Cli) -> Result<TuiLaunchOptions> {
+    let workflow = args.workflow_args.workflow.clone().ok_or_else(|| {
+        anyhow!(
+            "opening the runner TUI requires both a workflow and a request; use `ralph -w <workflow-id> \"your request\"` or `ralph -w <workflow-id> --file REQ.md`"
+        )
+    })?;
+    let argv = args.request_args.argv_text();
+    let provided = args.request_args.provided_count();
+    if provided != 1 {
+        return Err(anyhow!(
+            "opening the runner TUI requires both a workflow and a request; provide the request in exactly one form: argv or --file"
+        ));
+    }
+
+    let preloaded_request = match (argv, args.request_args.request_file.clone()) {
+        (Some(text), None) => Some(TuiPreloadedRequest {
+            source: TuiRequestSource::Argv,
+            text,
+            file_path: None,
+        }),
+        (None, Some(path)) => {
+            let resolved = resolve_project_relative_path(project_dir, &path);
+            let text = fs::read_to_string(resolved.as_std_path())
+                .with_context(|| format!("failed to read request file {}", resolved))?;
+            Some(TuiPreloadedRequest {
+                source: TuiRequestSource::File,
+                text,
+                file_path: Some(path),
+            })
         }
+        (None, None) => None,
+        _ => {
+            return Err(anyhow!(
+                "opening the runner TUI requires both a workflow and a request; provide the request in exactly one form: argv or --file"
+            ));
+        }
+    };
+
+    Ok(TuiLaunchOptions {
+        preset_workflow: Some(workflow),
+        preloaded_request,
+    })
+}
+
+async fn run_command(
+    project_dir: Utf8PathBuf,
+    runtime: RuntimeArgs,
+    command: Commands,
+) -> Result<()> {
+    match command {
         Commands::Run(args) => {
             let mut app = RalphApp::load(project_dir)?;
-            args.runtime.apply_to(&mut app)?;
+            runtime.apply_to(&mut app)?;
             let mut delegate = ConsoleDelegate;
-            match resolve_target_mode(args.target.as_deref(), args.prompt.as_deref())? {
-                TargetMode::Target(target) => {
-                    let summary = app
-                        .run_target_with_control(
-                            target,
-                            args.prompt.as_deref(),
-                            ralph_core::RunControl::new(),
-                            &mut delegate,
-                        )
-                        .await?;
-                    print_target_summary(output, &summary)
-                }
-                TargetMode::BarePrompt(prompt_path) => {
-                    let status = app.run_prompt_file(&prompt_path, &mut delegate).await?;
-                    print_prompt_file_row(
-                        output,
-                        prompt_path.to_string(),
-                        None,
-                        Some(status.label().to_owned()),
-                    )
-                }
-            }
+            let summary = app
+                .run_workflow(
+                    &args.workflow_args.workflow,
+                    resolve_workflow_request_input(&args)?,
+                    &mut delegate,
+                )
+                .await?;
+            print_workflow_run(&summary);
+            Ok(())
         }
-        Commands::Emit(args) => run_emit(output, args),
-        Commands::FakeAgent(args) => fake_agent::run(args.command),
+        Commands::Emit(args) => run_emit(args),
         Commands::Ls => {
             let app = RalphApp::load(project_dir)?;
-            print_target_list(output, app.list_targets()?)
+            print_workflow_list(app.list_workflows()?);
+            Ok(())
         }
         Commands::Show(args) => {
-            match resolve_target_mode(args.target.as_deref(), args.prompt.as_deref())? {
-                TargetMode::Target(target) => {
-                    let app = RalphApp::load(project_dir)?;
-                    let review = app.review_target(target)?;
-                    print_target_review(output, &review, args.file.as_deref())
-                }
-                TargetMode::BarePrompt(prompt_path) => print_bare_file(output, &prompt_path),
-            }
+            let app = RalphApp::load(project_dir)?;
+            let workflow = app.load_workflow(&args.workflow_id)?;
+            print_workflow_definition(&workflow)
         }
         Commands::Edit(args) => {
             let app = RalphApp::load(project_dir)?;
-            match resolve_target_mode(args.target.as_deref(), args.prompt.as_deref())? {
-                TargetMode::Target(target) => {
-                    let prompt_path =
-                        app.resolve_target_edit_path(target, args.prompt.as_deref())?;
-                    edit_file(&prompt_path, app.config().editor_override.as_deref())
-                }
-                TargetMode::BarePrompt(prompt_path) => {
-                    edit_file(&prompt_path, app.config().editor_override.as_deref())
-                }
-            }
+            let path = app.resolve_workflow_edit_path(&args.workflow_id)?;
+            edit_file(&path, app.config().editor_override.as_deref())
         }
-        Commands::Agent(command) => run_agent_command(project_dir, output, command),
-        Commands::Config(command) => run_config_command(project_dir, output, command),
+        Commands::Agent(command) => run_agent_command(project_dir, command),
+        Commands::Config(command) => run_config_command(project_dir, command),
         Commands::Init(args) => run_init(project_dir, args),
         Commands::Doctor => run_doctor(project_dir),
     }
 }
 
-fn run_agent_command(
-    project_dir: Utf8PathBuf,
-    output: OutputArg,
-    command: AgentCommands,
-) -> Result<()> {
+fn run_agent_command(project_dir: Utf8PathBuf, command: AgentCommands) -> Result<()> {
     match command {
         AgentCommands::List => {
             let app = RalphApp::load(project_dir)?;
             let rows = agent_list_rows(app.all_agents());
-            print_agent_list(output, &rows)
+            print_agent_list(&rows);
+            Ok(())
         }
         AgentCommands::Current => {
             let app = RalphApp::load(project_dir.clone())?;
@@ -168,7 +162,8 @@ fn run_agent_command(
                 effective_agent: format!("{} ({})", app.agent_name(), app.agent_id()),
                 project_dir: project_dir.to_string(),
             };
-            print_agent_current(output, &row)
+            print_agent_current(&row);
+            Ok(())
         }
         AgentCommands::Set(args) => {
             AppConfig::persist_scoped_coding_agent(&project_dir, args.scope.into(), &args.agent)
@@ -176,11 +171,7 @@ fn run_agent_command(
     }
 }
 
-fn run_config_command(
-    project_dir: Utf8PathBuf,
-    output: OutputArg,
-    command: ConfigCommands,
-) -> Result<()> {
+fn run_config_command(project_dir: Utf8PathBuf, command: ConfigCommands) -> Result<()> {
     match command {
         ConfigCommands::Show(args) => {
             let app = RalphApp::load(project_dir.clone())?;
@@ -201,16 +192,12 @@ fn run_config_command(
         ConfigCommands::Path => {
             let user = AppConfig::user_config_path()?.map(|path| path.to_string());
             let project = AppConfig::project_config_path(&project_dir).to_string();
-            let text = format!(
+            println!(
                 "user={}\nproject={}",
-                user.clone().unwrap_or_else(|| "<unavailable>".to_owned()),
+                user.unwrap_or_else(|| "<unavailable>".to_owned()),
                 project
             );
-            print_json_or_text(
-                output,
-                &serde_json::json!({ "user": user, "project": project }),
-                text,
-            )
+            Ok(())
         }
     }
 }
@@ -219,12 +206,12 @@ fn run_config_command(
 struct EmitContext {
     run_id: String,
     project_dir: Utf8PathBuf,
-    target_dir: Utf8PathBuf,
+    run_dir: Utf8PathBuf,
     prompt_path: Utf8PathBuf,
     prompt_name: String,
 }
 
-fn run_emit(output: OutputArg, args: EmitArgs) -> Result<()> {
+fn run_emit(args: EmitArgs) -> Result<()> {
     let event = args.event.trim().to_owned();
     if event.is_empty() {
         return Err(anyhow!("event name cannot be empty"));
@@ -233,10 +220,10 @@ fn run_emit(output: OutputArg, args: EmitArgs) -> Result<()> {
     let body = args.body.join(" ");
     let context = emit_context_from_env()?;
     validate_emit_args(&event, &body, &context)?;
-    let wal_target_dir = context.target_dir.clone();
+    let wal_run_dir = context.run_dir.clone();
 
     append_agent_event(
-        &wal_target_dir,
+        &wal_run_dir,
         &AgentEventRecord {
             v: 1,
             ts_unix_ms: current_unix_timestamp_ms(),
@@ -244,21 +231,22 @@ fn run_emit(output: OutputArg, args: EmitArgs) -> Result<()> {
             event: event.clone(),
             body,
             project_dir: context.project_dir,
-            target_dir: context.target_dir,
+            run_dir: context.run_dir,
             prompt_path: context.prompt_path,
             prompt_name: context.prompt_name,
             pid: std::process::id(),
         },
     )?;
 
-    print_emitted_event(output, &event)
+    print_emitted_event(&event);
+    Ok(())
 }
 
 fn emit_context_from_env() -> Result<EmitContext> {
     Ok(EmitContext {
         run_id: required_env("RALPH_RUN_ID")?,
         project_dir: env_utf8_path("RALPH_PROJECT_DIR")?,
-        target_dir: env_utf8_path("RALPH_TARGET_DIR")?,
+        run_dir: env_utf8_path("RALPH_RUN_DIR")?,
         prompt_path: env_utf8_path("RALPH_PROMPT_PATH")?,
         prompt_name: required_env("RALPH_PROMPT_NAME")?,
     })
@@ -279,29 +267,27 @@ fn validate_emit_args(event: &str, body: &str, context: &EmitContext) -> Result<
 fn validate_loop_route_body(body: &str, context: &EmitContext) -> Result<()> {
     let trimmed = body.trim();
     if trimmed.is_empty() {
-        return Err(anyhow!(invalid_route_message(trimmed, &context.target_dir)));
+        return Err(anyhow!(invalid_route_message(
+            trimmed,
+            &available_routes(context)?
+        )));
     }
     if trimmed.contains('/') || trimmed.contains('\\') {
-        return Err(anyhow!(invalid_route_message(trimmed, &context.target_dir)));
+        return Err(anyhow!(invalid_route_message(
+            trimmed,
+            &available_routes(context)?
+        )));
     }
-    if !trimmed.ends_with(".md") {
-        return Err(anyhow!(invalid_route_message(trimmed, &context.target_dir)));
-    }
-
-    let routes = list_prompt_names_in_dir(&context.target_dir)?;
+    let routes = available_routes(context)?;
     if routes.iter().any(|route| route == trimmed) {
         return Ok(());
     }
-    Err(anyhow!(invalid_route_message(trimmed, &context.target_dir)))
+    Err(anyhow!(invalid_route_message(trimmed, &routes)))
 }
 
-fn invalid_route_message(route: &str, target_dir: &Utf8Path) -> String {
-    let routes = list_prompt_names_in_dir(target_dir).unwrap_or_default();
+fn invalid_route_message(route: &str, routes: &[String]) -> String {
     if routes.is_empty() {
-        format!(
-            "\"{route}\" is not a valid event body for `loop-route`.\nNo routes are available in {}.",
-            target_dir
-        )
+        format!("\"{route}\" is not a valid event body for `loop-route`.\nNo routes are available.")
     } else {
         format!(
             "\"{route}\" is not a valid event body for `loop-route`.\nChoose among the available routes:\n{}",
@@ -332,6 +318,49 @@ fn current_unix_timestamp_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn resolve_workflow_request_input(args: &cli::RunArgs) -> Result<WorkflowRequestInput> {
+    build_request_input(&args.request_args)
+}
+
+fn build_request_input(request_args: &RequestArgs) -> Result<WorkflowRequestInput> {
+    let stdin = read_stdin_if_piped()?;
+
+    Ok(WorkflowRequestInput {
+        argv: request_args.argv_text(),
+        stdin,
+        request_file: request_args.request_file.clone(),
+    })
+}
+
+fn read_stdin_if_piped() -> Result<Option<String>> {
+    if io::stdin().is_terminal() {
+        return Ok(None);
+    }
+
+    let mut buffer = String::new();
+    io::stdin()
+        .read_to_string(&mut buffer)
+        .context("failed to read stdin request")?;
+    Ok(Some(buffer))
+}
+
+fn resolve_project_relative_path(project_dir: &Utf8Path, path: &Utf8Path) -> Utf8PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_dir.join(path)
+    }
+}
+
+fn available_routes(context: &EmitContext) -> Result<Vec<String>> {
+    let workflow = load_workflow_from_path(&context.prompt_path)?;
+    Ok(workflow
+        .prompt_ids()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>())
 }
 
 fn run_init(project_dir: Utf8PathBuf, args: InitArgs) -> Result<()> {
@@ -375,6 +404,7 @@ fn run_init(project_dir: Utf8PathBuf, args: InitArgs) -> Result<()> {
 fn run_doctor(project_dir: Utf8PathBuf) -> Result<()> {
     AppConfig::validate_scoped_config(&project_dir, ConfigFileScope::User)?;
     AppConfig::validate_scoped_config(&project_dir, ConfigFileScope::Project)?;
+    seed_builtin_workflows_if_missing()?;
     fs::create_dir_all(project_dir.join(".ralph"))
         .with_context(|| format!("failed to write under {}", project_dir))?;
 
@@ -396,36 +426,6 @@ fn run_doctor(project_dir: Utf8PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn resolve_target_mode<'a>(
-    target: Option<&'a str>,
-    prompt: Option<&str>,
-) -> Result<TargetMode<'a>> {
-    match target {
-        Some(target) => Ok(TargetMode::Target(target)),
-        None => resolve_bare_prompt_path(prompt).map(TargetMode::BarePrompt),
-    }
-}
-
-fn resolve_bare_prompt_path(prompt: Option<&str>) -> Result<Utf8PathBuf> {
-    let prompt =
-        prompt.ok_or_else(|| anyhow!("requires --prompt <file> when TARGET is omitted"))?;
-    let path = Utf8PathBuf::from(prompt);
-    if path.is_absolute() {
-        return Ok(path);
-    }
-    let cwd = Utf8PathBuf::from_path_buf(env::current_dir().context("failed to read cwd")?)
-        .map_err(|_| anyhow!("current directory is not valid UTF-8"))?;
-    Ok(cwd.join(path))
-}
-
-fn create_bare_prompt_file(path: &camino::Utf8Path, scaffold: ScaffoldId) -> Result<()> {
-    if path.exists() {
-        return Err(anyhow!("prompt file already exists at {}", path));
-    }
-    atomic_write(path, bare_prompt_template(scaffold))
-        .with_context(|| format!("failed to write prompt file {}", path))
-}
-
 fn resolve_project_dir(project_dir: Option<Utf8PathBuf>) -> Result<Utf8PathBuf> {
     match project_dir {
         Some(path) => Ok(path),
@@ -444,65 +444,121 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
-
-    #[test]
-    fn target_mode_prefers_target_when_present() {
-        let mode = resolve_target_mode(Some("demo"), Some("ignored.md")).unwrap();
-        assert_eq!(mode, TargetMode::Target("demo"));
-    }
-
-    #[test]
-    fn target_mode_requires_prompt_for_bare_mode() {
-        let error = resolve_target_mode(None, None).unwrap_err().to_string();
-        assert_eq!(error, "requires --prompt <file> when TARGET is omitted");
-    }
-
-    #[test]
-    fn bare_prompt_paths_are_resolved_from_cwd() {
-        let cwd = Utf8PathBuf::from_path_buf(env::current_dir().unwrap()).unwrap();
-        let resolved = resolve_bare_prompt_path(Some("notes/prompt.md")).unwrap();
-        assert_eq!(resolved, cwd.join("notes/prompt.md"));
-    }
-
-    fn emit_context(target_dir: Utf8PathBuf, prompt_name: &str) -> EmitContext {
-        EmitContext {
-            run_id: "run-1".to_owned(),
-            project_dir: Utf8PathBuf::from("/tmp/project"),
-            target_dir: target_dir.clone(),
-            prompt_path: target_dir.join(prompt_name),
-            prompt_name: prompt_name.to_owned(),
-        }
-    }
+    use std::fs;
 
     #[test]
     fn loop_route_validation_lists_available_routes() {
         let temp = tempfile::tempdir().unwrap();
-        let target_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        fs::write(target_dir.join("0_plan.md"), "# plan\n").unwrap();
-        fs::write(target_dir.join("1_build.md"), "# build\n").unwrap();
+        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("plan-build.yml")).unwrap();
+        fs::write(
+            workflow_path.as_std_path(),
+            r#"
+version: 1
+workflow_id: plan-build
+title: Plan Build
+entrypoint: plan
+prompts:
+  plan:
+    title: Plan
+    is_interactive: false
+    fallback-route: no-route-error
+    prompt: hello
+  build:
+    title: Build
+    is_interactive: false
+    fallback-route: no-route-error
+    prompt: world
+"#,
+        )
+        .unwrap();
 
-        let error = validate_loop_route_body("1_bud.md", &emit_context(target_dir, "0_plan.md"))
+        let context = EmitContext {
+            run_id: "run-1".to_owned(),
+            project_dir: Utf8PathBuf::from("/tmp/project"),
+            run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+            prompt_path: workflow_path,
+            prompt_name: "plan".to_owned(),
+        };
+        let error = validate_loop_route_body("broken", &context)
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("\"1_bud.md\" is not a valid event body for `loop-route`."));
-        assert!(error.contains("0_plan.md"));
-        assert!(error.contains("1_build.md"));
+        assert!(error.contains("\"broken\" is not a valid event body for `loop-route`."));
+        assert!(error.contains("plan"));
+        assert!(error.contains("build"));
+    }
+
+    #[test]
+    fn loop_route_validation_accepts_yaml_prompt_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = Utf8PathBuf::from_path_buf(temp.path().join("run")).unwrap();
+        fs::create_dir_all(run_dir.as_std_path()).unwrap();
+        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("plan-build.yml")).unwrap();
+        fs::write(
+            workflow_path.as_std_path(),
+            r#"
+version: 1
+workflow_id: plan-build
+title: Plan Build
+entrypoint: plan
+prompts:
+  plan:
+    title: Plan
+    is_interactive: false
+    fallback-route: no-route-error
+    prompt: hello
+  build:
+    title: Build
+    is_interactive: false
+    fallback-route: no-route-error
+    prompt: world
+"#,
+        )
+        .unwrap();
+
+        let context = EmitContext {
+            run_id: "run-1".to_owned(),
+            project_dir: Utf8PathBuf::from("/tmp/project"),
+            run_dir,
+            prompt_path: workflow_path,
+            prompt_name: "plan".to_owned(),
+        };
+
+        validate_loop_route_body("build", &context).unwrap();
     }
 
     #[test]
     fn unsupported_loop_events_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        let target_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        fs::write(target_dir.join("prompt_main.md"), "# prompt\n").unwrap();
+        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("plan-build.yml")).unwrap();
+        fs::write(
+            workflow_path.as_std_path(),
+            r#"
+version: 1
+workflow_id: plan-build
+title: Plan Build
+entrypoint: plan
+prompts:
+  plan:
+    title: Plan
+    is_interactive: false
+    fallback-route: no-route-error
+    prompt: hello
+"#,
+        )
+        .unwrap();
 
         let error = validate_emit_args(
             "loop-pause",
             "later",
-            &emit_context(target_dir, "prompt_main.md"),
+            &EmitContext {
+                run_id: "run-1".to_owned(),
+                project_dir: Utf8PathBuf::from("/tmp/project"),
+                run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+                prompt_path: workflow_path,
+                prompt_name: "plan".to_owned(),
+            },
         )
         .unwrap_err()
         .to_string();
@@ -515,13 +571,34 @@ mod tests {
     #[test]
     fn non_loop_events_are_allowed_without_validation() {
         let temp = tempfile::tempdir().unwrap();
-        let target_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        fs::write(target_dir.join("prompt_main.md"), "# prompt\n").unwrap();
+        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("plan-build.yml")).unwrap();
+        fs::write(
+            workflow_path.as_std_path(),
+            r#"
+version: 1
+workflow_id: plan-build
+title: Plan Build
+entrypoint: plan
+prompts:
+  plan:
+    title: Plan
+    is_interactive: false
+    fallback-route: no-route-error
+    prompt: hello
+"#,
+        )
+        .unwrap();
 
         validate_emit_args(
             "note",
             "free form",
-            &emit_context(target_dir, "prompt_main.md"),
+            &EmitContext {
+                run_id: "run-1".to_owned(),
+                project_dir: Utf8PathBuf::from("/tmp/project"),
+                run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+                prompt_path: workflow_path,
+                prompt_name: "plan".to_owned(),
+            },
         )
         .unwrap();
     }

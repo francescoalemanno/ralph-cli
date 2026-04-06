@@ -5,9 +5,11 @@ use camino::{Utf8Path, Utf8PathBuf};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentConfig, atomic_write, builtin_agents, store::ARTIFACT_DIR_NAME};
+use crate::{AgentConfig, atomic_write, builtin_agents};
 
+pub const ARTIFACT_DIR_NAME: &str = ".ralph";
 const PROJECT_CONFIG_FILE_NAME: &str = "config.toml";
+const RALPH_CONFIG_HOME_ENV: &str = "RALPH_CONFIG_HOME";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFileScope {
@@ -70,7 +72,7 @@ impl AppConfig {
 
         let mut config = Self::default();
 
-        if let Some(user_path) = user_config_path()?
+        if let Some(user_path) = Self::user_config_path()?
             && user_path.exists()
         {
             config = merge_config(config, read_partial_config(&user_path)?);
@@ -139,7 +141,7 @@ impl AppConfig {
     }
 
     pub fn user_config_path() -> Result<Option<Utf8PathBuf>> {
-        user_config_path()
+        global_config_dir().map(|path| Some(path.join(PROJECT_CONFIG_FILE_NAME)))
     }
 
     pub fn project_config_path(project_dir: &Utf8Path) -> Utf8PathBuf {
@@ -253,9 +255,7 @@ fn write_partial_config(path: &Utf8Path, config: &PartialAppConfig) -> Result<()
 }
 
 fn seed_user_config_if_missing() -> Result<()> {
-    let Some(path) = user_config_path()? else {
-        return Ok(());
-    };
+    let path = global_config_dir()?.join(PROJECT_CONFIG_FILE_NAME);
     if path.exists() {
         return Ok(());
     }
@@ -275,27 +275,47 @@ fn config_path_for_scope(
     scope: ConfigFileScope,
 ) -> Result<Option<Utf8PathBuf>> {
     match scope {
-        ConfigFileScope::User => user_config_path(),
+        ConfigFileScope::User => AppConfig::user_config_path(),
         ConfigFileScope::Project => Ok(Some(project_config_path(project_dir))),
     }
 }
 
-fn user_config_path() -> Result<Option<Utf8PathBuf>> {
-    let path = if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
-        std::path::PathBuf::from(config_home)
-            .join("ralph")
-            .join(PROJECT_CONFIG_FILE_NAME)
-    } else {
-        let Some(home) = home_dir() else {
-            return Ok(None);
-        };
-        home.join(".config")
-            .join("ralph")
-            .join(PROJECT_CONFIG_FILE_NAME)
+pub fn global_config_dir() -> Result<Utf8PathBuf> {
+    if let Some(path) = std::env::var_os(RALPH_CONFIG_HOME_ENV) {
+        return Utf8PathBuf::from_path_buf(path.into())
+            .map_err(|_| anyhow!("{RALPH_CONFIG_HOME_ENV} is not valid UTF-8"));
+    }
+
+    canonical_global_config_dir()
+}
+
+fn canonical_global_config_dir() -> Result<Utf8PathBuf> {
+    let Some(home) = home_dir() else {
+        return Err(anyhow!(
+            "failed to resolve the Ralph global config directory"
+        ));
     };
-    Utf8PathBuf::from_path_buf(path)
-        .map(Some)
-        .map_err(|_| anyhow!("user config path is not valid UTF-8"))
+    Utf8PathBuf::from_path_buf(home.join(".config").join("ralph"))
+        .map_err(|_| anyhow!("Ralph global config directory is not valid UTF-8"))
+}
+
+#[cfg(test)]
+pub(crate) fn configure_test_global_config_home() -> Utf8PathBuf {
+    use std::sync::OnceLock;
+
+    static TEST_CONFIG_HOME: OnceLock<Utf8PathBuf> = OnceLock::new();
+    let path = TEST_CONFIG_HOME.get_or_init(|| {
+        let path = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("ralph-test-config-{}", std::process::id())),
+        )
+        .unwrap();
+        fs::create_dir_all(&path).unwrap();
+        path
+    });
+    unsafe {
+        std::env::set_var(RALPH_CONFIG_HOME_ENV, path.as_str());
+    }
+    path.clone()
 }
 
 fn merge_config(mut base: AppConfig, partial: PartialAppConfig) -> AppConfig {
@@ -359,27 +379,14 @@ fn default_warning_color() -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::sync::OnceLock;
 
     use camino::Utf8PathBuf;
 
-    use super::{AppConfig, ConfigFileScope, PartialAppConfig, merge_config};
+    use super::{
+        AppConfig, ConfigFileScope, PartialAppConfig, configure_test_global_config_home,
+        merge_config,
+    };
     use crate::AgentConfig;
-
-    fn configure_test_user_config_home() {
-        static TEST_CONFIG_HOME: OnceLock<Utf8PathBuf> = OnceLock::new();
-        let path = TEST_CONFIG_HOME.get_or_init(|| {
-            let path = Utf8PathBuf::from_path_buf(
-                std::env::temp_dir().join(format!("ralph-test-config-{}", std::process::id())),
-            )
-            .unwrap();
-            fs::create_dir_all(&path).unwrap();
-            path
-        });
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", path.as_str());
-        }
-    }
 
     #[test]
     fn app_config_defaults_to_seeded_agents() {
@@ -407,7 +414,7 @@ mod tests {
 
     #[test]
     fn persisted_agent_switch_updates_project_agent_only() {
-        configure_test_user_config_home();
+        configure_test_global_config_home();
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
 
@@ -421,7 +428,7 @@ mod tests {
 
     #[test]
     fn user_config_is_seeded_with_builtin_agents() {
-        configure_test_user_config_home();
+        configure_test_global_config_home();
 
         let user_path = AppConfig::user_config_path().unwrap().unwrap();
         if user_path.exists() {
@@ -476,5 +483,11 @@ mod tests {
         );
         assert_eq!(merged.agents.len(), 1);
         assert_eq!(merged.agent_id(), "custom");
+    }
+
+    #[test]
+    fn canonical_global_config_dir_uses_dot_config() {
+        let path = super::canonical_global_config_dir().unwrap();
+        assert!(path.as_str().ends_with("/.config/ralph"));
     }
 }

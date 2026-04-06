@@ -2,23 +2,42 @@ use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 
 const RALPH_ENV_PROJECT_DIR: &str = "{ralph-env:PROJECT_DIR}";
-const RALPH_ENV_TARGET_DIR: &str = "{ralph-env:TARGET_DIR}";
+const RALPH_REQUEST: &str = "{ralph-request}";
 
-pub(crate) fn interpolate_prompt_env(
+pub(crate) fn interpolate_workflow_prompt(
     prompt_text: &str,
     project_dir: &Utf8Path,
-    target_dir: &Utf8Path,
+    request: Option<&str>,
 ) -> Result<String> {
-    let replacements = [
-        (RALPH_ENV_PROJECT_DIR, absolute_unix_path(project_dir)?),
-        (RALPH_ENV_TARGET_DIR, absolute_unix_path(target_dir)?),
-    ];
+    let replacements = [(RALPH_ENV_PROJECT_DIR, absolute_unix_path(project_dir)?)];
 
     let mut interpolated = prompt_text.to_owned();
     for (needle, value) in replacements {
         interpolated = interpolated.replace(needle, &value);
     }
+    if let Some(request) = request {
+        interpolated = interpolated.replace(RALPH_REQUEST, request);
+    }
     Ok(interpolated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interpolate_workflow_prompt;
+    use camino::Utf8Path;
+
+    #[test]
+    fn workflow_prompt_interpolates_only_project_dir_and_request() {
+        let rendered = interpolate_workflow_prompt(
+            "project={ralph-env:PROJECT_DIR}\nrequest={ralph-request}",
+            Utf8Path::new("/tmp/project"),
+            Some("ship it"),
+        )
+        .unwrap();
+
+        assert!(rendered.contains("project=/tmp/project"));
+        assert!(rendered.contains("request=ship it"));
+    }
 }
 
 fn absolute_unix_path(path: &Utf8Path) -> Result<String> {

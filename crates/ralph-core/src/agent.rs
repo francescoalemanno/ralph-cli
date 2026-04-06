@@ -304,9 +304,6 @@ impl RunnerConfig {
         match self.mode {
             CommandMode::Shell => true,
             CommandMode::Exec => self.program.as_deref().is_some_and(|program| {
-                if program.contains("{ralph_bin}") {
-                    return env::current_exe().ok().is_some_and(|path| path.is_file());
-                }
                 if Path::new(program).is_absolute() || program.contains(std::path::MAIN_SEPARATOR) {
                     return Path::new(program).is_file();
                 }
@@ -390,9 +387,7 @@ fn default_prompt_env_var() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use super::{AgentConfig, CodingAgent, CommandMode, PromptInput, RunnerConfig, builtin_agents};
+    use super::{CodingAgent, CommandMode, PromptInput, builtin_agents};
 
     #[test]
     fn builtin_agent_definitions_are_seeded() {
@@ -507,34 +502,5 @@ mod tests {
         );
         assert_eq!(droid.interactive.prompt_input, PromptInput::Argv);
         assert_eq!(droid.interactive.args, vec!["{prompt}"]);
-    }
-
-    #[test]
-    fn exec_agents_can_use_the_ralph_bin_placeholder() {
-        let agent = AgentConfig {
-            id: "fake".to_owned(),
-            name: "Fake".to_owned(),
-            builtin: false,
-            non_interactive: RunnerConfig {
-                mode: CommandMode::Exec,
-                program: Some("{ralph_bin}".to_owned()),
-                args: vec!["fake-agent".to_owned(), "run".to_owned()],
-                command: None,
-                prompt_input: PromptInput::File,
-                prompt_env_var: "PROMPT".to_owned(),
-                env: BTreeMap::new(),
-            },
-            interactive: RunnerConfig {
-                mode: CommandMode::Exec,
-                program: Some("{ralph_bin}".to_owned()),
-                args: vec!["fake-agent".to_owned(), "interactive".to_owned()],
-                command: None,
-                prompt_input: PromptInput::File,
-                prompt_env_var: "PROMPT".to_owned(),
-                env: BTreeMap::new(),
-            },
-        };
-
-        assert!(agent.is_available());
     }
 }

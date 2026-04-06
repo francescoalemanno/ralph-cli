@@ -18,7 +18,7 @@ pub struct AgentEventRecord {
     pub event: String,
     pub body: String,
     pub project_dir: Utf8PathBuf,
-    pub target_dir: Utf8PathBuf,
+    pub run_dir: Utf8PathBuf,
     pub prompt_path: Utf8PathBuf,
     pub prompt_name: String,
     pub pid: u32,
@@ -38,14 +38,14 @@ pub enum LoopControlDecision {
     Route(String),
 }
 
-pub fn agent_events_wal_path(target_dir: &Utf8Path) -> Utf8PathBuf {
-    target_dir
+pub fn agent_events_wal_path(run_dir: &Utf8Path) -> Utf8PathBuf {
+    run_dir
         .join(RUNTIME_DIR_NAME)
         .join(AGENT_EVENTS_WAL_FILE_NAME)
 }
 
-pub fn current_agent_events_offset(target_dir: &Utf8Path) -> Result<u64> {
-    let path = agent_events_wal_path(target_dir);
+pub fn current_agent_events_offset(run_dir: &Utf8Path) -> Result<u64> {
+    let path = agent_events_wal_path(run_dir);
     match fs::metadata(&path) {
         Ok(metadata) => Ok(metadata.len()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
@@ -53,8 +53,8 @@ pub fn current_agent_events_offset(target_dir: &Utf8Path) -> Result<u64> {
     }
 }
 
-pub fn append_agent_event(target_dir: &Utf8Path, record: &AgentEventRecord) -> Result<()> {
-    let wal_path = agent_events_wal_path(target_dir);
+pub fn append_agent_event(run_dir: &Utf8Path, record: &AgentEventRecord) -> Result<()> {
+    let wal_path = agent_events_wal_path(run_dir);
     if let Some(parent) = wal_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent))?;
     }
@@ -73,8 +73,8 @@ pub fn append_agent_event(target_dir: &Utf8Path, record: &AgentEventRecord) -> R
     Ok(())
 }
 
-pub fn read_agent_events_since(target_dir: &Utf8Path, offset: u64) -> Result<AgentEventLogRead> {
-    let wal_path = agent_events_wal_path(target_dir);
+pub fn read_agent_events_since(run_dir: &Utf8Path, offset: u64) -> Result<AgentEventLogRead> {
+    let wal_path = agent_events_wal_path(run_dir);
     let file = match std::fs::File::open(&wal_path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -162,19 +162,19 @@ mod tests {
             event: event.to_owned(),
             body: body.to_owned(),
             project_dir: Utf8PathBuf::from("/tmp/project"),
-            target_dir: Utf8PathBuf::from("/tmp/project/.ralph/targets/demo"),
-            prompt_path: Utf8PathBuf::from("/tmp/project/.ralph/targets/demo/prompt_main.md"),
-            prompt_name: "prompt_main.md".to_owned(),
+            run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/task-based/run-1"),
+            prompt_path: Utf8PathBuf::from("/tmp/.config/ralph/workflows/task-based.yml"),
+            prompt_name: "task".to_owned(),
             pid: 123,
         }
     }
 
     #[test]
-    fn wal_path_lives_under_target_runtime_dir() {
-        let target_dir = Utf8PathBuf::from("/tmp/project/.ralph/targets/demo");
+    fn wal_path_lives_under_run_runtime_dir() {
+        let run_dir = Utf8PathBuf::from("/tmp/project/.ralph/runs/task-based/run-1");
         assert_eq!(
-            agent_events_wal_path(&target_dir),
-            target_dir
+            agent_events_wal_path(&run_dir),
+            run_dir
                 .join(RUNTIME_DIR_NAME)
                 .join(AGENT_EVENTS_WAL_FILE_NAME)
         );
@@ -183,15 +183,15 @@ mod tests {
     #[test]
     fn append_and_read_events_round_trip() {
         let temp = tempfile::tempdir().unwrap();
-        let target_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let run_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let first = sample_record("note", "hello", "run-1");
         let second = sample_record("loop-stop:ok", "done", "run-1");
 
-        append_agent_event(&target_dir, &first).unwrap();
-        let offset = current_agent_events_offset(&target_dir).unwrap();
-        append_agent_event(&target_dir, &second).unwrap();
+        append_agent_event(&run_dir, &first).unwrap();
+        let offset = current_agent_events_offset(&run_dir).unwrap();
+        append_agent_event(&run_dir, &second).unwrap();
 
-        let read = read_agent_events_since(&target_dir, offset).unwrap();
+        let read = read_agent_events_since(&run_dir, offset).unwrap();
         assert_eq!(read.records, vec![second]);
         assert!(read.next_offset >= offset);
     }
@@ -205,17 +205,17 @@ mod tests {
         ];
 
         assert_eq!(
-            reduce_loop_control(&records, "prompt_main.md"),
+            reduce_loop_control(&records, "task"),
             Some(LoopControlDecision::StopError("blocked".to_owned()))
         );
     }
 
     #[test]
     fn route_to_current_prompt_collapses_to_continue() {
-        let records = vec![sample_record("loop-route", "prompt_main.md", "run-1")];
+        let records = vec![sample_record("loop-route", "task", "run-1")];
 
         assert_eq!(
-            reduce_loop_control(&records, "prompt_main.md"),
+            reduce_loop_control(&records, "task"),
             Some(LoopControlDecision::Continue)
         );
     }

@@ -1,0 +1,545 @@
+use std::{collections::BTreeMap, fs};
+
+use anyhow::{Context, Result, anyhow};
+use camino::{Utf8Path, Utf8PathBuf};
+use serde::{Deserialize, Serialize};
+
+use crate::{atomic_write, config::global_config_dir};
+
+const WORKFLOW_VERSION: u8 = 1;
+const REQUEST_TOKEN: &str = "{ralph-request}";
+const PROJECT_DIR_TOKEN: &str = "{ralph-env:PROJECT_DIR}";
+const REMOVED_RUN_DIR_TOKEN: &str = "{ralph-env:RUN_DIR}";
+
+pub const NO_ROUTE_OK: &str = "no-route-ok";
+pub const NO_ROUTE_ERROR: &str = "no-route-error";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowDefinition {
+    pub version: u8,
+    pub workflow_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    pub entrypoint: String,
+    #[serde(default)]
+    pub request: Option<WorkflowRequestDefinition>,
+    pub prompts: BTreeMap<String, WorkflowPromptDefinition>,
+    #[serde(skip)]
+    source_path: Option<Utf8PathBuf>,
+}
+
+impl WorkflowDefinition {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != WORKFLOW_VERSION {
+            return Err(anyhow!(
+                "workflow '{}' uses unsupported version {}; expected {}",
+                self.workflow_id,
+                self.version,
+                WORKFLOW_VERSION
+            ));
+        }
+        if self.workflow_id.trim().is_empty() {
+            return Err(anyhow!("workflow_id cannot be empty"));
+        }
+        if self.entrypoint.trim().is_empty() {
+            return Err(anyhow!(
+                "workflow '{}' must define a non-empty entrypoint",
+                self.workflow_id
+            ));
+        }
+        if self.prompts.is_empty() {
+            return Err(anyhow!(
+                "workflow '{}' must define at least one prompt",
+                self.workflow_id
+            ));
+        }
+        if !self.prompts.contains_key(&self.entrypoint) {
+            return Err(anyhow!(
+                "workflow '{}' entrypoint '{}' is not defined under prompts",
+                self.workflow_id,
+                self.entrypoint
+            ));
+        }
+
+        for (prompt_id, prompt) in &self.prompts {
+            if prompt_id.trim().is_empty() {
+                return Err(anyhow!(
+                    "workflow '{}' contains an empty prompt id",
+                    self.workflow_id
+                ));
+            }
+            if matches!(prompt_id.as_str(), NO_ROUTE_OK | NO_ROUTE_ERROR) {
+                return Err(anyhow!(
+                    "workflow '{}' uses reserved prompt id '{}'",
+                    self.workflow_id,
+                    prompt_id
+                ));
+            }
+            if prompt.fallback_route.trim().is_empty() {
+                return Err(anyhow!(
+                    "workflow '{}' prompt '{}' must define fallback-route",
+                    self.workflow_id,
+                    prompt_id
+                ));
+            }
+            if !self.is_valid_route(&prompt.fallback_route) {
+                return Err(anyhow!(
+                    "workflow '{}' prompt '{}' fallback-route '{}' is not a known prompt id or sentinel",
+                    self.workflow_id,
+                    prompt_id,
+                    prompt.fallback_route
+                ));
+            }
+            if prompt.prompt.contains(REMOVED_RUN_DIR_TOKEN) {
+                return Err(anyhow!(
+                    "workflow '{}' prompt '{}' uses unsupported interpolation '{}'; use '{}' or plain project-relative paths instead",
+                    self.workflow_id,
+                    prompt_id,
+                    REMOVED_RUN_DIR_TOKEN,
+                    PROJECT_DIR_TOKEN
+                ));
+            }
+        }
+
+        let request_sources = self
+            .request
+            .as_ref()
+            .map(WorkflowRequestDefinition::source_count)
+            .unwrap_or(0);
+        if self.request.is_some() && request_sources != 1 {
+            return Err(anyhow!(
+                "workflow '{}' request must declare exactly one of runtime, file, or inline",
+                self.workflow_id
+            ));
+        }
+        if self.uses_request_token() && self.request.is_none() {
+            return Err(anyhow!(
+                "workflow '{}' uses {REQUEST_TOKEN} but does not define a request block",
+                self.workflow_id
+            ));
+        }
+
+        if let Some(request) = &self.request {
+            if let Some(runtime) = &request.runtime
+                && !runtime.argv
+                && !runtime.stdin
+                && !runtime.file_flag
+            {
+                return Err(anyhow!(
+                    "workflow '{}' request.runtime must enable at least one of argv, stdin, or file_flag",
+                    self.workflow_id
+                ));
+            }
+            if let Some(file) = &request.file
+                && file.path.as_str().trim().is_empty()
+            {
+                return Err(anyhow!(
+                    "workflow '{}' request.file.path cannot be empty",
+                    self.workflow_id
+                ));
+            }
+            if let Some(inline) = &request.inline
+                && inline.trim().is_empty()
+            {
+                return Err(anyhow!(
+                    "workflow '{}' request.inline cannot be empty",
+                    self.workflow_id
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn prompt(&self, prompt_id: &str) -> Option<&WorkflowPromptDefinition> {
+        self.prompts.get(prompt_id)
+    }
+
+    pub fn prompt_ids(&self) -> Vec<&str> {
+        self.prompts.keys().map(String::as_str).collect()
+    }
+
+    pub fn uses_request_token(&self) -> bool {
+        self.prompts
+            .values()
+            .any(|prompt| prompt.prompt.contains(REQUEST_TOKEN))
+    }
+
+    pub fn has_interactive_prompts(&self) -> bool {
+        self.prompts.values().any(|prompt| prompt.is_interactive)
+    }
+
+    pub fn source_path(&self) -> Option<&Utf8Path> {
+        self.source_path.as_deref()
+    }
+
+    fn is_valid_route(&self, route: &str) -> bool {
+        matches!(route, NO_ROUTE_OK | NO_ROUTE_ERROR) || self.prompts.contains_key(route)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowPromptDefinition {
+    pub title: String,
+    pub is_interactive: bool,
+    #[serde(rename = "fallback-route")]
+    pub fallback_route: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRequestDefinition {
+    #[serde(default)]
+    pub runtime: Option<WorkflowRuntimeRequest>,
+    #[serde(default)]
+    pub file: Option<WorkflowFileRequest>,
+    #[serde(default)]
+    pub inline: Option<String>,
+}
+
+impl WorkflowRequestDefinition {
+    fn source_count(&self) -> usize {
+        usize::from(self.runtime.is_some())
+            + usize::from(self.file.is_some())
+            + usize::from(self.inline.is_some())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkflowRuntimeRequest {
+    #[serde(default)]
+    pub argv: bool,
+    #[serde(default)]
+    pub stdin: bool,
+    #[serde(default)]
+    pub file_flag: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowFileRequest {
+    pub path: Utf8PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkflowSummary {
+    pub workflow_id: String,
+    pub title: String,
+    pub description: String,
+    pub path: Utf8PathBuf,
+}
+
+pub fn workflow_config_dir() -> Result<Utf8PathBuf> {
+    Ok(global_config_dir()?.join("workflows"))
+}
+
+pub fn seed_builtin_workflows_if_missing() -> Result<()> {
+    let workflow_dir = workflow_config_dir()?;
+    fs::create_dir_all(workflow_dir.as_std_path())
+        .with_context(|| format!("failed to create workflow directory {}", workflow_dir))?;
+
+    for builtin in builtin_workflows() {
+        let path = workflow_dir.join(builtin.file_name);
+        if path.exists() {
+            continue;
+        }
+        atomic_write(&path, builtin.contents)
+            .with_context(|| format!("failed to seed builtin workflow {}", path))?;
+    }
+
+    Ok(())
+}
+
+pub fn load_workflow(workflow_id: &str) -> Result<WorkflowDefinition> {
+    seed_builtin_workflows_if_missing()?;
+
+    let mut matches = Vec::new();
+    for path in workflow_paths()? {
+        let workflow = load_workflow_from_path(&path)?;
+        if workflow.workflow_id == workflow_id {
+            matches.push(workflow);
+        }
+    }
+
+    match matches.len() {
+        0 => Err(anyhow!(
+            "workflow '{}' was not found under {}",
+            workflow_id,
+            workflow_config_dir()?
+        )),
+        1 => Ok(matches.remove(0)),
+        _ => Err(anyhow!(
+            "workflow id '{}' is defined multiple times under {}",
+            workflow_id,
+            workflow_config_dir()?
+        )),
+    }
+}
+
+pub fn list_workflows() -> Result<Vec<WorkflowSummary>> {
+    seed_builtin_workflows_if_missing()?;
+    let mut workflows = workflow_paths()?
+        .into_iter()
+        .map(|path| {
+            let workflow = load_workflow_from_path(&path)?;
+            Ok(WorkflowSummary {
+                workflow_id: workflow.workflow_id,
+                title: workflow.title,
+                description: workflow.description,
+                path,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    workflows.sort_by(|left, right| left.workflow_id.cmp(&right.workflow_id));
+    Ok(workflows)
+}
+
+pub fn load_workflow_from_path(path: &Utf8Path) -> Result<WorkflowDefinition> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read workflow {}", path))?;
+    let mut workflow: WorkflowDefinition =
+        serde_yaml::from_str(&raw).with_context(|| format!("failed to parse workflow {}", path))?;
+    workflow.source_path = Some(path.to_path_buf());
+    workflow
+        .validate()
+        .with_context(|| format!("invalid workflow {}", path))?;
+    Ok(workflow)
+}
+
+fn workflow_paths() -> Result<Vec<Utf8PathBuf>> {
+    let workflow_dir = workflow_config_dir()?;
+    if !workflow_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut paths = fs::read_dir(workflow_dir.as_std_path())
+        .with_context(|| format!("failed to read workflow directory {}", workflow_dir))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.path()).ok())
+        .filter(|path| matches!(path.extension(), Some("yml" | "yaml")))
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
+struct BuiltinWorkflow {
+    file_name: &'static str,
+    contents: &'static str,
+}
+
+fn builtin_workflows() -> [BuiltinWorkflow; 4] {
+    [
+        BuiltinWorkflow {
+            file_name: "bare.yml",
+            contents: include_str!("../workflows/bare.yml"),
+        },
+        BuiltinWorkflow {
+            file_name: "plan-build.yml",
+            contents: include_str!("../workflows/plan-build.yml"),
+        },
+        BuiltinWorkflow {
+            file_name: "task-based.yml",
+            contents: include_str!("../workflows/task-based.yml"),
+        },
+        BuiltinWorkflow {
+            file_name: "pdd.yml",
+            contents: include_str!("../workflows/pdd.yml"),
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, fs, sync::Mutex};
+
+    use anyhow::Result;
+    use camino::Utf8PathBuf;
+
+    use super::{
+        NO_ROUTE_ERROR, WorkflowDefinition, WorkflowFileRequest, WorkflowPromptDefinition,
+        WorkflowRequestDefinition, WorkflowRuntimeRequest, list_workflows, load_workflow,
+        load_workflow_from_path, seed_builtin_workflows_if_missing, workflow_config_dir,
+    };
+    use crate::config::configure_test_global_config_home;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_test_workflow_home(test: impl FnOnce(Utf8PathBuf)) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = configure_test_global_config_home();
+        let workflow_dir = home.join("workflows");
+        if workflow_dir.exists() {
+            fs::remove_dir_all(&workflow_dir).unwrap();
+        }
+        fs::create_dir_all(&workflow_dir).unwrap();
+        test(home);
+    }
+
+    #[test]
+    fn seeding_populates_builtin_workflows() {
+        with_test_workflow_home(|home| {
+            seed_builtin_workflows_if_missing().unwrap();
+
+            let workflow_dir = home.join("workflows");
+            assert!(workflow_dir.join("bare.yml").exists());
+            assert!(workflow_dir.join("plan-build.yml").exists());
+            assert!(workflow_dir.join("task-based.yml").exists());
+            assert!(workflow_dir.join("pdd.yml").exists());
+        });
+    }
+
+    #[test]
+    fn list_workflows_reads_seeded_builtins() {
+        with_test_workflow_home(|_| {
+            let workflows = list_workflows().unwrap();
+            assert!(
+                workflows
+                    .iter()
+                    .any(|workflow| workflow.workflow_id == "bare")
+            );
+            assert!(
+                workflows
+                    .iter()
+                    .any(|workflow| workflow.workflow_id == "plan-build")
+            );
+            assert!(
+                workflows
+                    .iter()
+                    .any(|workflow| workflow.workflow_id == "task-based")
+            );
+            assert!(
+                workflows
+                    .iter()
+                    .any(|workflow| workflow.workflow_id == "pdd")
+            );
+        });
+    }
+
+    #[test]
+    fn load_workflow_matches_on_workflow_id() {
+        with_test_workflow_home(|home| {
+            let workflow_dir = home.join("workflows");
+            fs::create_dir_all(workflow_dir.as_std_path()).unwrap();
+            fs::write(
+                workflow_dir.join("custom-name.yml"),
+                r#"
+version: 1
+workflow_id: custom
+title: Custom
+entrypoint: main
+prompts:
+  main:
+    title: Main
+    is_interactive: false
+    fallback-route: no-route-error
+    prompt: hello
+"#,
+            )
+            .unwrap();
+
+            let workflow = load_workflow("custom").unwrap();
+            assert_eq!(workflow.workflow_id, "custom");
+        });
+    }
+
+    #[test]
+    fn request_token_requires_request_block() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("example.yml")).unwrap();
+        let error = load_workflow_from_path_for_test(
+            &path,
+            r#"
+version: 1
+workflow_id: broken
+title: Broken
+entrypoint: main
+prompts:
+  main:
+    title: Main
+    is_interactive: false
+    fallback-route: no-route-error
+    prompt: "{ralph-request}"
+"#,
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("does not define a request block"));
+    }
+
+    #[test]
+    fn validation_requires_exactly_one_request_source() {
+        let workflow = WorkflowDefinition {
+            version: 1,
+            workflow_id: "broken".to_owned(),
+            title: "Broken".to_owned(),
+            description: String::new(),
+            entrypoint: "main".to_owned(),
+            request: Some(WorkflowRequestDefinition {
+                runtime: Some(WorkflowRuntimeRequest {
+                    argv: true,
+                    stdin: false,
+                    file_flag: false,
+                }),
+                file: Some(WorkflowFileRequest {
+                    path: Utf8PathBuf::from("TASKS.md"),
+                }),
+                inline: None,
+            }),
+            prompts: BTreeMap::from([(
+                "main".to_owned(),
+                WorkflowPromptDefinition {
+                    title: "Main".to_owned(),
+                    is_interactive: false,
+                    fallback_route: NO_ROUTE_ERROR.to_owned(),
+                    prompt: "hello".to_owned(),
+                },
+            )]),
+            source_path: None,
+        };
+
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("exactly one of runtime, file, or inline"));
+    }
+
+    #[test]
+    fn validation_rejects_removed_run_dir_interpolation() {
+        let workflow = WorkflowDefinition {
+            version: 1,
+            workflow_id: "broken".to_owned(),
+            title: "Broken".to_owned(),
+            description: String::new(),
+            entrypoint: "main".to_owned(),
+            request: None,
+            prompts: BTreeMap::from([(
+                "main".to_owned(),
+                WorkflowPromptDefinition {
+                    title: "Main".to_owned(),
+                    is_interactive: false,
+                    fallback_route: NO_ROUTE_ERROR.to_owned(),
+                    prompt: "{ralph-env:RUN_DIR}/progress.txt".to_owned(),
+                },
+            )]),
+            source_path: None,
+        };
+
+        let error = workflow.validate().unwrap_err().to_string();
+        assert!(error.contains("unsupported interpolation"));
+        assert!(error.contains("{ralph-env:RUN_DIR}"));
+    }
+
+    #[test]
+    fn workflow_config_dir_uses_override_when_present() {
+        with_test_workflow_home(|home| {
+            assert_eq!(workflow_config_dir().unwrap(), home.join("workflows"));
+        });
+    }
+
+    fn load_workflow_from_path_for_test(
+        path: &Utf8PathBuf,
+        raw: &str,
+    ) -> Result<WorkflowDefinition> {
+        fs::write(path, raw).unwrap();
+        load_workflow_from_path(path)
+    }
+}

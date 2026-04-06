@@ -29,8 +29,9 @@ pub struct InteractiveSessionInvocation {
     pub session_name: String,
     pub initial_prompt: String,
     pub project_dir: Utf8PathBuf,
-    pub target_dir: Utf8PathBuf,
-    pub goal_path: Utf8PathBuf,
+    pub run_dir: Utf8PathBuf,
+    pub run_id: Option<String>,
+    pub prompt_path: Option<Utf8PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,10 +44,9 @@ struct TemplateContext {
     run_id: String,
     prompt_text: String,
     project_dir: Utf8PathBuf,
-    target_dir: Utf8PathBuf,
-    prompt_path: Utf8PathBuf,
+    run_dir: Utf8PathBuf,
+    prompt_path: Option<Utf8PathBuf>,
     prompt_name: String,
-    goal_path: Option<Utf8PathBuf>,
 }
 
 impl TemplateContext {
@@ -55,22 +55,20 @@ impl TemplateContext {
             run_id: invocation.run_id,
             prompt_text: invocation.prompt_text,
             project_dir: invocation.project_dir,
-            target_dir: invocation.target_dir,
-            prompt_path: invocation.prompt_path,
+            run_dir: invocation.run_dir,
+            prompt_path: Some(invocation.prompt_path),
             prompt_name: invocation.prompt_name,
-            goal_path: None,
         }
     }
 
     fn from_interactive(invocation: &InteractiveSessionInvocation) -> Self {
         Self {
-            run_id: String::new(),
+            run_id: invocation.run_id.clone().unwrap_or_default(),
             prompt_text: invocation.initial_prompt.clone(),
             project_dir: invocation.project_dir.clone(),
-            target_dir: invocation.target_dir.clone(),
-            prompt_path: invocation.goal_path.clone(),
+            run_dir: invocation.run_dir.clone(),
+            prompt_path: invocation.prompt_path.clone(),
             prompt_name: invocation.session_name.clone(),
-            goal_path: Some(invocation.goal_path.clone()),
         }
     }
 }
@@ -354,13 +352,10 @@ fn rendered_envs(
     if !ralph_bin.is_empty() {
         envs.push(("RALPH_BIN".to_owned(), ralph_bin));
     }
-    envs.push((
-        "RALPH_TARGET_DIR".to_owned(),
-        context.target_dir.to_string(),
-    ));
+    envs.push(("RALPH_RUN_DIR".to_owned(), context.run_dir.to_string()));
     envs.push((
         "RALPH_PROMPT_PATH".to_owned(),
-        context.prompt_path.to_string(),
+        resolved_prompt_path(context, prompt_file).to_owned(),
     ));
     envs.push(("RALPH_PROMPT_NAME".to_owned(), context.prompt_name.clone()));
     envs.push((
@@ -368,9 +363,6 @@ fn rendered_envs(
         invocation_mode(&context.prompt_name),
     ));
     envs.push(("RALPH_PROMPT_FILE".to_owned(), prompt_file.to_owned()));
-    if let Some(goal_path) = &context.goal_path {
-        envs.push(("RALPH_GOAL_PATH".to_owned(), goal_path.to_string()));
-    }
     if matches!(config.prompt_input, PromptInput::Env) {
         envs.push((config.prompt_env_var.clone(), context.prompt_text.clone()));
     }
@@ -545,23 +537,28 @@ impl Drop for ChildCleanupGuard {
 fn render_template(template: &str, context: &TemplateContext, prompt_file: &str) -> String {
     let mut rendered = template.to_owned();
     let mode = invocation_mode(&context.prompt_name);
-    let goal_path = context.goal_path.as_ref().unwrap_or(&context.prompt_path);
-    let ralph_bin = current_binary_path();
+    let prompt_path = resolved_prompt_path(context, prompt_file);
     let replacements = [
         ("{project_dir}", context.project_dir.as_str()),
-        ("{target_dir}", context.target_dir.as_str()),
+        ("{run_dir}", context.run_dir.as_str()),
         ("{prompt_name}", context.prompt_name.as_str()),
         ("{mode}", mode.as_str()),
-        ("{prompt_path}", context.prompt_path.as_str()),
-        ("{goal_path}", goal_path.as_str()),
+        ("{prompt_path}", prompt_path),
         ("{prompt}", context.prompt_text.as_str()),
         ("{prompt_file}", prompt_file),
-        ("{ralph_bin}", ralph_bin.as_str()),
     ];
     for (needle, value) in replacements {
         rendered = rendered.replace(needle, value);
     }
     rendered
+}
+
+fn resolved_prompt_path<'a>(context: &'a TemplateContext, _prompt_file: &'a str) -> &'a str {
+    context
+        .prompt_path
+        .as_deref()
+        .map(|path| path.as_str())
+        .unwrap_or(context.project_dir.as_str())
 }
 
 fn current_binary_path() -> String {
@@ -606,7 +603,6 @@ fn shell_std_command() -> StdCommand {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
 
     use camino::Utf8PathBuf;
     use ralph_core::{CodingAgent, CommandMode, PromptInput, RunnerInvocation};
@@ -615,8 +611,8 @@ mod tests {
 
     #[test]
     fn mode_uses_prompt_stem_for_file_backed_prompts() {
-        assert_eq!(super::invocation_mode("prompt_main.md"), "prompt_main");
-        assert_eq!(super::invocation_mode("0_plan.md"), "0_plan");
+        assert_eq!(super::invocation_mode("task-based.yml"), "task-based");
+        assert_eq!(super::invocation_mode("plan-build.yml"), "plan-build");
         assert_eq!(
             super::invocation_mode("plan_driven_build"),
             "plan_driven_build"
@@ -629,32 +625,30 @@ mod tests {
             run_id: "run-1".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
-            target_dir: "/tmp/project/.ralph/targets/demo".into(),
-            prompt_path: "/tmp/project/.ralph/targets/demo/prompt_main.md".into(),
-            prompt_name: "prompt_main.md".to_owned(),
+            run_dir: "/tmp/project/.ralph/runs/task-based/run-1".into(),
+            prompt_path: "/tmp/.config/ralph/workflows/task-based.yml".into(),
+            prompt_name: "task".to_owned(),
         });
 
         let rendered = render_template("{prompt_name}|{mode}", &context, "/tmp/prompt.txt");
 
-        assert_eq!(rendered, "prompt_main.md|prompt_main");
+        assert_eq!(rendered, "task|task");
     }
 
     #[test]
-    fn interactive_context_exposes_goal_path() {
+    fn interactive_context_uses_project_dir_for_prompt_path() {
         let context = TemplateContext::from_interactive(&InteractiveSessionInvocation {
             session_name: "workflow_goal_interview".to_owned(),
             initial_prompt: "hello".to_owned(),
             project_dir: Utf8PathBuf::from("/tmp/project"),
-            target_dir: Utf8PathBuf::from("/tmp/project/.ralph/targets/demo"),
-            goal_path: Utf8PathBuf::from("/tmp/project/.ralph/targets/demo/GOAL.md"),
+            run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/pdd/run-1"),
+            run_id: None,
+            prompt_path: None,
         });
 
-        let rendered = render_template("{goal_path}|{prompt_file}", &context, "/tmp/prompt.txt");
+        let rendered = render_template("{prompt_path}|{prompt_file}", &context, "/tmp/prompt.txt");
 
-        assert_eq!(
-            rendered,
-            "/tmp/project/.ralph/targets/demo/GOAL.md|/tmp/prompt.txt"
-        );
+        assert_eq!(rendered, "/tmp/project|/tmp/prompt.txt");
     }
 
     #[test]
@@ -676,27 +670,12 @@ mod tests {
             run_id: "run-1".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
-            target_dir: "/tmp/project/.ralph/targets/demo".into(),
-            prompt_path: "/tmp/project/.ralph/targets/demo/prompt_main.md".into(),
-            prompt_name: "prompt_main.md".to_owned(),
+            run_dir: "/tmp/project/.ralph/runs/task-based/run-1".into(),
+            prompt_path: "/tmp/.config/ralph/workflows/task-based.yml".into(),
+            prompt_name: "task".to_owned(),
         });
         let rendered = render_template("X={prompt} Y={prompt_file}", &context, "/tmp/prompt.txt");
         assert_eq!(rendered, "X=hello Y=/tmp/prompt.txt");
-    }
-
-    #[test]
-    fn render_template_exposes_current_binary_placeholder() {
-        let context = TemplateContext::from_invocation(RunnerInvocation {
-            run_id: "run-1".to_owned(),
-            prompt_text: "hello".to_owned(),
-            project_dir: "/tmp/project".into(),
-            target_dir: "/tmp/project/.ralph/targets/demo".into(),
-            prompt_path: "/tmp/project/.ralph/targets/demo/prompt_main.md".into(),
-            prompt_name: "prompt_main.md".to_owned(),
-        });
-        let rendered = render_template("{ralph_bin}", &context, "/tmp/prompt.txt");
-        assert!(!rendered.is_empty());
-        assert!(PathBuf::from(rendered).is_absolute());
     }
 
     #[test]
@@ -705,9 +684,9 @@ mod tests {
             run_id: "run-1".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
-            target_dir: "/tmp/project/.ralph/targets/demo".into(),
-            prompt_path: "/tmp/project/.ralph/targets/demo/prompt_main.md".into(),
-            prompt_name: "prompt_main.md".to_owned(),
+            run_dir: "/tmp/project/.ralph/runs/task-based/run-1".into(),
+            prompt_path: "/tmp/.config/ralph/workflows/task-based.yml".into(),
+            prompt_name: "task".to_owned(),
         });
         let config = ralph_core::RunnerConfig {
             mode: CommandMode::Shell,
@@ -720,13 +699,15 @@ mod tests {
         };
 
         let envs = super::rendered_envs(&config, &context, "/tmp/prompt.txt");
-        let ralph_bin = envs
-            .iter()
-            .find(|(key, _)| key == "RALPH_BIN")
-            .map(|(_, value)| PathBuf::from(value))
-            .expect("RALPH_BIN must be present");
-
-        assert!(ralph_bin.is_absolute());
+        assert!(
+            envs.iter().any(|(key, value)| {
+                key == "RALPH_BIN" && std::path::Path::new(value).is_absolute()
+            }),
+            "RALPH_BIN must be present as an absolute path"
+        );
+        assert!(envs.iter().any(|(key, value)| {
+            key == "RALPH_RUN_DIR" && value == "/tmp/project/.ralph/runs/task-based/run-1"
+        }));
     }
 
     #[test]

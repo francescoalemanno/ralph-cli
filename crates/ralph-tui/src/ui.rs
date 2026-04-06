@@ -9,11 +9,9 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode,
     },
 };
-use ralph_core::LastRunStatus;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
@@ -48,26 +46,6 @@ pub(crate) fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdou
     Ok(())
 }
 
-pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let popup = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup[1])[1]
-}
-
 pub(crate) fn styled_title(
     title: &str,
     subtitle: &str,
@@ -85,10 +63,6 @@ pub(crate) fn styled_title(
     ])
 }
 
-pub(crate) fn key_style(color: Color) -> Style {
-    Style::default().fg(color).add_modifier(Modifier::BOLD)
-}
-
 pub(crate) fn normalize_terminal_text(text: &str) -> Vec<u8> {
     let mut normalized = Vec::with_capacity(text.len() + 16);
     let mut previous = None;
@@ -100,42 +74,6 @@ pub(crate) fn normalize_terminal_text(text: &str) -> Vec<u8> {
         previous = Some(byte);
     }
     normalized
-}
-
-pub(crate) fn status_badge(status: LastRunStatus) -> &'static str {
-    match status {
-        LastRunStatus::NeverRun => "○",
-        LastRunStatus::Completed => "✓",
-        LastRunStatus::MaxIterations => "◉",
-        LastRunStatus::Failed => "!",
-        LastRunStatus::Canceled => "×",
-    }
-}
-
-pub(crate) fn status_label(status: LastRunStatus) -> &'static str {
-    match status {
-        LastRunStatus::NeverRun => "never run",
-        LastRunStatus::Completed => "completed",
-        LastRunStatus::MaxIterations => "max iterations",
-        LastRunStatus::Failed => "failed",
-        LastRunStatus::Canceled => "canceled",
-    }
-}
-
-pub(crate) fn status_style(
-    status: LastRunStatus,
-    accent: Color,
-    success: Color,
-    warning: Color,
-    muted: Color,
-) -> Style {
-    match status {
-        LastRunStatus::NeverRun => Style::default().fg(muted),
-        LastRunStatus::Completed => Style::default().fg(Color::Black).bg(success),
-        LastRunStatus::MaxIterations => Style::default().fg(Color::Black).bg(warning),
-        LastRunStatus::Failed => Style::default().fg(Color::White).bg(Color::Red),
-        LastRunStatus::Canceled => Style::default().fg(accent),
-    }
 }
 
 pub(crate) fn resolved_accent_color(name: &str) -> Color {

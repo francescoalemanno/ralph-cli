@@ -29,89 +29,12 @@ impl LastRunStatus {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ScaffoldId {
-    #[default]
-    SinglePrompt,
-    PlanBuild,
-}
-
-impl ScaffoldId {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::SinglePrompt => "single_prompt",
-            Self::PlanBuild => "plan_build",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TargetConfig {
-    pub id: String,
-    #[serde(default)]
-    pub scaffold: Option<ScaffoldId>,
-    #[serde(default)]
-    pub created_at: Option<u64>,
-    #[serde(default)]
-    pub max_iterations: Option<usize>,
-    #[serde(default)]
-    pub last_prompt: Option<String>,
-    #[serde(default)]
-    pub last_run_status: LastRunStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TargetPaths {
-    pub dir: Utf8PathBuf,
-    pub config_path: Utf8PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PromptFile {
-    pub name: String,
-    pub path: Utf8PathBuf,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TargetFile {
-    pub name: String,
-    pub path: Utf8PathBuf,
-    pub is_prompt: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TargetSummary {
-    pub id: String,
-    pub dir: Utf8PathBuf,
-    pub prompt_files: Vec<PromptFile>,
-    pub files: Vec<TargetFile>,
-    pub scaffold: Option<ScaffoldId>,
-    pub created_at: Option<u64>,
-    pub last_prompt: Option<String>,
-    pub last_run_status: LastRunStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TargetReview {
-    pub summary: TargetSummary,
-    pub files: Vec<TargetFileContents>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TargetFileContents {
-    pub name: String,
-    pub path: Utf8PathBuf,
-    pub contents: String,
-    pub is_prompt: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerInvocation {
     pub run_id: String,
     pub prompt_text: String,
     pub project_dir: Utf8PathBuf,
-    pub target_dir: Utf8PathBuf,
+    pub run_dir: Utf8PathBuf,
     pub prompt_path: Utf8PathBuf,
     pub prompt_name: String,
 }
@@ -120,6 +43,16 @@ pub struct RunnerInvocation {
 pub struct RunnerResult {
     pub output: String,
     pub exit_code: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunSummary {
+    pub workflow_id: String,
+    pub run_id: String,
+    pub final_prompt_id: String,
+    pub run_dir: Utf8PathBuf,
+    pub workflow_path: Utf8PathBuf,
+    pub status: LastRunStatus,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -155,7 +88,7 @@ impl RunControl {
 
 #[cfg(test)]
 mod tests {
-    use super::{LastRunStatus, RunControl, ScaffoldId};
+    use super::{LastRunStatus, RunControl};
 
     #[test]
     fn cancel_marks_control_as_canceled() {
@@ -176,9 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn status_and_scaffold_have_stable_labels() {
+    fn status_labels_are_stable() {
         assert_eq!(LastRunStatus::Completed.label(), "completed");
-        assert_eq!(ScaffoldId::SinglePrompt.as_str(), "single_prompt");
-        assert_eq!(ScaffoldId::PlanBuild.as_str(), "plan_build");
     }
 }
