@@ -25,7 +25,7 @@ prompts:
   plan:
     title: Plan
     is_interactive: false
-    fallback-route: no-route-error
+    fallback-route: plan
     prompt: |
       # Execution policy
       1. Study `{ralph-option:specs-glob}`.
@@ -58,7 +58,7 @@ prompts:
   build:
     title: Build
     is_interactive: false
-    fallback-route: no-route-error
+    fallback-route: build
     prompt: |
       # Execution policy
       1. Study `{ralph-option:specs-glob}`.

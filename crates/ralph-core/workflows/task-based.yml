@@ -17,7 +17,7 @@ prompts:
   main:
     title: Task Based
     is_interactive: false
-    fallback-route: no-route-error
+    fallback-route: main
     prompt: |
       # Execution policy
       1. Study `{ralph-option:progress-file}`.
