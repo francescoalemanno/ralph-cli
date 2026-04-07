@@ -467,10 +467,10 @@ mod tests {
     fn persisted_agent_switch_updates_project_agent_only() {
         let _guard = global_config_test_lock();
         configure_test_global_config_home();
-        if let Some(user_path) = AppConfig::user_config_path().unwrap() {
-            if user_path.exists() {
-                fs::remove_file(&user_path).unwrap();
-            }
+        if let Some(user_path) = AppConfig::user_config_path().unwrap()
+            && user_path.exists()
+        {
+            fs::remove_file(&user_path).unwrap();
         }
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
