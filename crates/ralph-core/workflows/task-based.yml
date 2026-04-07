@@ -26,7 +26,7 @@ prompts:
          - If none found, run `$RALPH_BIN emit loop-stop:ok found-no-open-task`, goto 7. Stop.
       4. Execute ONLY the chosen high-priority item.
       5. Update `{ralph-option:progress-file}` with completed work and new findings such that the next worker can continue seamlessly.
-      6. After finishing 6: run `$RALPH_BIN emit loop-continue handoff-to-next-worker`, goto 7. Stop.
+      6. After finishing 4 and 5: run `$RALPH_BIN emit loop-continue handoff-to-next-worker`, goto 7. Stop.
       7. Stop.
 
       # Constraints
