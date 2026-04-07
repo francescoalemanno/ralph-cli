@@ -112,7 +112,7 @@ impl AppConfig {
     pub fn available_agents(&self) -> Vec<&AgentConfig> {
         self.agents
             .iter()
-            .filter(|agent| agent.is_available())
+            .filter(|agent| !agent.hidden && agent.is_available())
             .collect()
     }
 
@@ -449,6 +449,18 @@ mod tests {
         assert!(config.agent_definition("opencode").is_some());
         assert!(config.agent_definition("pi").is_some());
         assert!(config.agent_definition("raijin").is_some());
+        assert!(config.agent_definition("__test_shell").is_some());
+    }
+
+    #[test]
+    fn available_agents_exclude_hidden_builtins() {
+        let config = AppConfig::default();
+        assert!(
+            config
+                .available_agents()
+                .into_iter()
+                .all(|agent| agent.id != "__test_shell")
+        );
     }
 
     #[test]
@@ -550,6 +562,7 @@ mod tests {
                     id: "custom".to_owned(),
                     name: "Custom".to_owned(),
                     builtin: false,
+                    hidden: false,
                     non_interactive: crate::CodingAgent::Codex.definition().non_interactive,
                     interactive: crate::CodingAgent::Codex.definition().interactive,
                 }]),
@@ -594,6 +607,7 @@ mod tests {
                     id: "custom".to_owned(),
                     name: "Custom".to_owned(),
                     builtin: false,
+                    hidden: false,
                     non_interactive: crate::CodingAgent::Codex.definition().non_interactive,
                     interactive: crate::CodingAgent::Codex.definition().interactive,
                 }]),
