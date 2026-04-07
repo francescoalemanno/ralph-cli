@@ -7,7 +7,7 @@ use clap::{
     error::{Error, ErrorKind},
 };
 use ralph_app::RalphApp;
-use ralph_core::{ConfigFileScope, load_workflow, workflow_option_flag};
+use ralph_core::{ConfigFileScope, list_all_workflows, load_workflow, workflow_option_flag};
 
 const ROOT_ABOUT: &str = "Workflow runner for Ralph";
 const ROOT_LONG_ABOUT: &str = "\
@@ -461,7 +461,7 @@ fn build_run_command() -> Result<Command> {
                 .help(RUN_MAX_ITERATIONS_HELP),
         );
 
-    for workflow in ralph_core::list_workflows()? {
+    for workflow in list_all_workflows()? {
         let definition = load_workflow(&workflow.workflow_id)
             .with_context(|| format!("failed to load workflow '{}'", workflow.workflow_id))?;
         command = command.subcommand(build_workflow_run_command(&definition)?);
@@ -477,7 +477,9 @@ fn build_workflow_run_command(workflow: &ralph_core::WorkflowDefinition) -> Resu
         workflow.description.clone()
     };
 
-    let mut command = Command::new(leak(workflow.workflow_id.clone())).about(leak(about));
+    let mut command = Command::new(leak(workflow.workflow_id.clone()))
+        .about(leak(about))
+        .hide(workflow.hidden);
 
     for option_id in workflow.option_ids() {
         let definition = workflow
@@ -641,7 +643,7 @@ fn leak(value: String) -> &'static str {
 mod tests {
     use clap::error::ErrorKind;
 
-    use super::{Cli, Commands};
+    use super::{Cli, Commands, build_cli_command};
     use crate::test_support::with_test_workflow_home;
 
     #[test]
@@ -763,6 +765,27 @@ mod tests {
             assert_eq!(error.kind(), ErrorKind::DisplayHelp);
             assert!(rendered.contains("--progressfile"));
             assert!(rendered.contains("progress.txt"));
+        });
+    }
+
+    #[test]
+    fn hidden_workflows_stay_out_of_help_but_remain_invocable_by_id() {
+        with_test_workflow_home(|| {
+            let mut command = build_cli_command().unwrap();
+            let error = command
+                .try_get_matches_from_mut(["ralph", "run", "--help"])
+                .unwrap_err();
+            let rendered = error.to_string();
+
+            assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+            assert!(!rendered.contains("test-workflow"));
+
+            let cli = Cli::try_parse_from(["ralph", "run", "test-workflow"]).unwrap();
+            let Commands::Run(args) = cli.command else {
+                panic!("expected run subcommand");
+            };
+            assert_eq!(args.workflow, "test-workflow");
+            assert!(args.request_args.request.is_empty());
         });
     }
 
