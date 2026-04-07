@@ -96,10 +96,23 @@ pub(crate) fn print_workflow_definition(workflow: &WorkflowDefinition) -> Result
 pub(crate) fn agent_list_rows(agents: &[AgentConfig]) -> Vec<AgentListRow> {
     agents
         .iter()
+        .filter(|agent| !agent.hidden)
         .map(|agent| AgentListRow {
             agent: format!("{} ({})", agent.name, agent.id),
             detected: agent.is_available(),
             command: agent.non_interactive.command_preview(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agent_list_rows;
+
+    #[test]
+    fn agent_list_rows_hide_internal_agents() {
+        let agents = ralph_core::builtin_agents();
+        let rows = agent_list_rows(&agents);
+        assert!(rows.iter().all(|row| !row.agent.contains("__test_shell")));
+    }
 }
