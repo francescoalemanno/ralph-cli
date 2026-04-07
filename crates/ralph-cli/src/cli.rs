@@ -639,55 +639,10 @@ fn leak(value: String) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Mutex};
-
-    use camino::Utf8PathBuf;
     use clap::error::ErrorKind;
 
     use super::{Cli, Commands};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_test_workflow_home(test: impl FnOnce()) {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temp = tempfile::tempdir().unwrap();
-        let config_home = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        fs::create_dir_all(config_home.join("workflows").as_std_path()).unwrap();
-        fs::write(
-            config_home.join("workflows/task-based.yml").as_std_path(),
-            r#"
-version: 1
-workflow_id: task-based
-title: Task Based
-entrypoint: main
-options:
-  progress-file:
-    default: progress.txt
-request:
-  runtime:
-    argv: true
-    file_flag: true
-prompts:
-  main:
-    title: Main
-    is_interactive: false
-    fallback-route: no-route-error
-    prompt: |
-      progress={ralph-option:progress-file}
-      request={ralph-request}
-"#,
-        )
-        .unwrap();
-        unsafe {
-            std::env::set_var("RALPH_CONFIG_HOME", config_home.as_str());
-        }
-        test();
-        unsafe {
-            std::env::remove_var("RALPH_CONFIG_HOME");
-        }
-    }
+    use crate::test_support::with_test_workflow_home;
 
     #[test]
     fn root_cli_requires_a_subcommand() {

@@ -486,15 +486,25 @@ fn init_tracing() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cli::{RunArgs, RuntimeArgs};
-    use std::{fs, sync::Mutex};
+pub(crate) mod test_support {
+    use std::{
+        fs,
+        sync::{Mutex, OnceLock},
+    };
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use camino::Utf8PathBuf;
 
-    fn with_test_workflow_home(test: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap();
+    const RALPH_CONFIG_HOME_ENV: &str = "RALPH_CONFIG_HOME";
+
+    fn env_lock() -> &'static Mutex<()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    pub(crate) fn with_test_workflow_home(test: impl FnOnce()) {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let config_home = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         fs::create_dir_all(config_home.join("workflows").as_std_path()).unwrap();
@@ -524,13 +534,21 @@ prompts:
         )
         .unwrap();
         unsafe {
-            std::env::set_var("RALPH_CONFIG_HOME", config_home.as_str());
+            std::env::set_var(RALPH_CONFIG_HOME_ENV, config_home.as_str());
         }
         test();
         unsafe {
-            std::env::remove_var("RALPH_CONFIG_HOME");
+            std::env::remove_var(RALPH_CONFIG_HOME_ENV);
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{RunArgs, RuntimeArgs};
+    use crate::test_support::with_test_workflow_home;
+    use std::fs;
 
     #[test]
     fn loop_route_validation_lists_available_routes() {
