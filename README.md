@@ -10,7 +10,7 @@ Think of it as the Ralph Wiggum technique packaged into named workflows: study d
 
 - Iteration beats one-shot prompting. Ralph is for repeated loops that tighten the repository over time, not for hoping one giant prompt gets everything right.
 - One item per loop. The built-in workflows deliberately try to pick one high-leverage item, or send the agent back to planning when the work is still ambiguous.
-- Durable memory beats bloated context. Files such as `progress.txt`, `IMPLEMENTATION_PLAN.md`, `AGENTS.md`, and `specs/*` are the stable memory each loop reloads.
+- Durable memory beats bloated context. Files such as `PLAN.md`, `progress.txt`, and design docs under `docs/` are the stable memory each loop reloads.
 - Failures are data. A bad search result, broken build, or stale plan is usually a signal to tune the workflow inputs or guardrails.
 - Backpressure matters. Ralph works best when each loop can run the checks that reject placeholders and shallow implementations.
 - Operator skill still matters. Ralph automates the loop, not engineering judgment; you still need to define success clearly and tune the artifacts when the loop drifts.
@@ -19,7 +19,7 @@ Think of it as the Ralph Wiggum technique packaged into named workflows: study d
 
 - Well-defined engineering work with observable success criteria
 - Greenfield work or bounded refactors where automated checks can provide fast feedback
-- Repositories where `specs/*`, `IMPLEMENTATION_PLAN.md`, `AGENTS.md`, or `progress.txt` can stay current
+- Repositories where `PLAN.md`, `progress.txt`, or design docs can stay current
 - Long-running or unattended iteration where you want auditable handoffs between loops
 
 ## When Ralph Is A Bad Fit
@@ -82,8 +82,8 @@ ralph ls
 ## Choose The Right Workflow
 
 - `bare`: use this when your request already contains the exact loop discipline you want and you just need Ralph to run it durably.
+- `dbv`: use this when you want a durable plan in `PLAN.md`, one-item-at-a-time execution, and a final whole-project verification pass before declaring success.
 - `task-based`: use this when the work already lives in a request list or `progress.txt` and you want one right-sized item completed per loop.
-- `plan-build`: use this when the work still needs spec repair, plan repair, and one-item-at-a-time execution against a durable plan.
 - `pdd`: use this when the idea is still rough and you need an interactive path to research, design, and an implementation plan before autonomous loops.
 
 ## Core Concepts
@@ -91,10 +91,9 @@ ralph ls
 - Workflow: a YAML definition selected with `ralph run <workflow-id> ...`
 - Agent: the coding tool Ralph launches underneath the workflow
 - Request: the task text for the workflow
-- Specs: the durable description of what should exist, usually under `specs/*`
-- Plan file: a prioritized list of right-sized build items, usually `IMPLEMENTATION_PLAN.md`
+- Design docs/specs: optional durable reference material when the request needs them
+- Plan file: a prioritized list of right-sized build items, usually `PLAN.md`
 - Progress file: the handoff memory for the next loop, usually `progress.txt`
-- Agent guidance file: durable operational notes for future loops, usually `AGENTS.md`
 - User config: `~/.config/ralph/config.toml`
 - Workflow registry: `~/.config/ralph/workflows/`
 - Project config: `.ralph/config.toml`
@@ -109,7 +108,7 @@ These open the runner UI:
 
 ```bash
 ralph run task-based "fix the failing tests"
-ralph run plan-build "ship the auth refactor"
+ralph run dbv "ship the auth refactor"
 ralph run pdd --file rough-idea.md
 ```
 
@@ -144,8 +143,8 @@ If you provide more than one, Ralph exits with a usage error.
 ## Writing Better Ralph Requests
 
 - Define success criteria in observable terms: what should work, what should pass, and what files or docs should be updated.
-- Keep the active loop narrow. If the work is broad or ambiguous, start with `pdd` or `plan-build` so Ralph can turn it into right-sized items first.
-- Point Ralph at durable memory such as `specs/*`, `IMPLEMENTATION_PLAN.md`, `AGENTS.md`, or `progress.txt`.
+- Keep the active loop narrow. If the work is broad or ambiguous, start with `pdd` to design it first or `dbv` to repair the plan before building.
+- Point Ralph at durable memory such as `PLAN.md`, design docs, or `progress.txt`.
 - Tell Ralph to study the code before deciding something is missing. This is one of the most common failure modes in agentic loops.
 - Ask for the relevant checks after each change so the loop has real backpressure.
 - Treat plan and progress files as living control surfaces. If they get stale, rewrite them and keep looping.
@@ -155,8 +154,8 @@ If you provide more than one, Ralph exits with a usage error.
 | Workflow | What it does | Useful options |
 | --- | --- | --- |
 | `bare` | Minimal wrapper when your request already contains the loop discipline you want. | None |
+| `dbv` | Uses a durable `PLAN.md` as the control surface, decomposes when needed, builds one item per loop, and performs whole-project verification when the plan is complete. | `--planfile` (default: `PLAN.md`) |
 | `task-based` | Reads the request list, chooses one high-priority right-sized item, executes it, and updates a handoff file for the next loop. | `--progressfile` (default: `progress.txt`) |
-| `plan-build` | Alternates between repairing `specs/*` and `IMPLEMENTATION_PLAN.md` and executing one build item at a time. | `--specsglob` (default: `specs/*`), `--planfile` (default: `IMPLEMENTATION_PLAN.md`), `--agentsfile` (default: `AGENTS.md`) |
 | `pdd` | Interactive prompt-driven development for turning a rough idea into research, design, and an implementation plan. | None |
 
 List them at any time with:
@@ -170,7 +169,7 @@ ralph ls
 - If Ralph keeps grabbing work that is too large, shrink the plan items until one loop can finish one item completely.
 - If Ralph duplicates code that already exists, strengthen the instruction to study the codebase first and keep specs aligned with reality.
 - If Ralph compiles but does shallow work, tighten the success criteria and require the checks that would fail on placeholders.
-- If `progress.txt` or `IMPLEMENTATION_PLAN.md` turns into noise, rewrite it into a shorter prioritized list and continue the loop.
+- If `progress.txt` or `PLAN.md` turns into noise, rewrite it into a shorter prioritized list and continue the loop.
 - Use `--max-iterations` as a safety net when you are testing a workflow or running unattended.
 
 ## Common Commands
@@ -178,10 +177,10 @@ ralph ls
 ```bash
 ralph --help
 ralph run --help
-ralph run plan-build --help
+ralph run dbv --help
 ralph ls
-ralph show plan-build
-ralph edit plan-build
+ralph show dbv
+ralph edit dbv
 ralph agent list
 ralph agent current
 ralph agent set claude --scope user
@@ -278,7 +277,7 @@ Examples:
 
 - `progress-file` becomes `--progressfile`
 - `plan-file` becomes `--planfile`
-- `specs-glob` becomes `--specsglob`
+- `pdd-dir` becomes `--pdddir`
 
 That is why the workflow-specific help output looks slightly different from the YAML option ids.
 
@@ -292,10 +291,10 @@ That is why the workflow-specific help output looks slightly different from the 
 
 Files Ralph commonly reads or updates as part of the workflow itself:
 
+- `PLAN.md`: durable execution plan for `dbv`
 - `progress.txt`: task handoff memory for `task-based`
-- `IMPLEMENTATION_PLAN.md`: prioritized right-sized work for `plan-build`
-- `AGENTS.md`: durable run/debug guidance learned during `plan-build`
-- `specs/*`: implementation constraints and shared definitions for `plan-build`
+- `docs/planning/<project>/design/detailed-design.md`: design output from `pdd`
+- `docs/planning/<project>/implementation/plan.md`: execution-ready plan output from `pdd`
 
 ## Advanced: `ralph emit`
 
@@ -318,10 +317,10 @@ If the work is still fuzzy, start with `pdd` and turn the idea into durable docs
 ralph run pdd --file rough-idea.md
 ```
 
-If the work is implementation-ready but the plan and specs need to stay honest, use `plan-build`:
+If the work is implementation-ready but the plan may still need repair before coding, use `dbv`:
 
 ```bash
-ralph run plan-build "add SSO to the admin app"
+ralph run dbv "add SSO to the admin app"
 ```
 
 If you already have a request list and want one-item handoffs, use `task-based` with a maintained `progress.txt`:
@@ -333,5 +332,5 @@ ralph run task-based "work through the next highest-priority backlog item"
 If you want plain terminal output instead of the UI, or you are scripting a run:
 
 ```bash
-ralph run --cli plan-build "add SSO to the admin app"
+ralph run --cli dbv "add SSO to the admin app"
 ```
