@@ -119,11 +119,14 @@ where
             let wal_offset = current_agent_events_offset(&run_dir)?;
             let exit_code = if prompt.is_interactive {
                 self.run_interactive_workflow_prompt(
-                    &workflow_path,
-                    &current_prompt_id,
-                    prompt_text,
-                    &run_dir,
-                    &run_id,
+                    InteractiveSessionInvocation {
+                        session_name: current_prompt_id.clone(),
+                        initial_prompt: prompt_text,
+                        project_dir: self.project_dir.clone(),
+                        run_dir: run_dir.clone(),
+                        run_id: Some(run_id.clone()),
+                        prompt_path: Some(workflow_path.clone()),
+                    },
                     &control,
                     delegate,
                 )
@@ -153,13 +156,15 @@ where
                 delegate.on_event(RunEvent::Note(message.clone())).await?;
                 return finish_workflow(
                     delegate,
-                    &workflow.workflow_id,
-                    workflow_path,
-                    run_dir,
-                    current_prompt_id,
-                    LastRunStatus::Failed,
-                    &format_summary("Workflow failed", &message),
-                    run_id,
+                    WorkflowRunSummary {
+                        workflow_id: workflow.workflow_id.clone(),
+                        run_id,
+                        final_prompt_id: current_prompt_id,
+                        run_dir,
+                        workflow_path,
+                        status: LastRunStatus::Failed,
+                    },
+                    format_summary("Workflow failed", &message),
                 )
                 .await;
             }
@@ -176,26 +181,30 @@ where
                 Some(LoopControlDecision::StopOk(body)) => {
                     return finish_workflow(
                         delegate,
-                        &workflow.workflow_id,
-                        workflow_path,
-                        run_dir,
-                        current_prompt_id,
-                        LastRunStatus::Completed,
-                        &format_summary("Workflow complete", &body),
-                        run_id,
+                        WorkflowRunSummary {
+                            workflow_id: workflow.workflow_id.clone(),
+                            run_id,
+                            final_prompt_id: current_prompt_id,
+                            run_dir,
+                            workflow_path,
+                            status: LastRunStatus::Completed,
+                        },
+                        format_summary("Workflow complete", &body),
                     )
                     .await;
                 }
                 Some(LoopControlDecision::StopError(body)) => {
                     return finish_workflow(
                         delegate,
-                        &workflow.workflow_id,
-                        workflow_path,
-                        run_dir,
-                        current_prompt_id,
-                        LastRunStatus::Failed,
-                        &format_summary("Workflow failed", &body),
-                        run_id,
+                        WorkflowRunSummary {
+                            workflow_id: workflow.workflow_id.clone(),
+                            run_id,
+                            final_prompt_id: current_prompt_id,
+                            run_dir,
+                            workflow_path,
+                            status: LastRunStatus::Failed,
+                        },
+                        format_summary("Workflow failed", &body),
                     )
                     .await;
                 }
@@ -214,26 +223,30 @@ where
                 NextStep::FinishOk(summary) => {
                     return finish_workflow(
                         delegate,
-                        &workflow.workflow_id,
-                        workflow_path,
-                        run_dir,
-                        current_prompt_id,
-                        LastRunStatus::Completed,
-                        &summary,
-                        run_id,
+                        WorkflowRunSummary {
+                            workflow_id: workflow.workflow_id.clone(),
+                            run_id,
+                            final_prompt_id: current_prompt_id,
+                            run_dir,
+                            workflow_path,
+                            status: LastRunStatus::Completed,
+                        },
+                        summary,
                     )
                     .await;
                 }
                 NextStep::FinishError(summary) => {
                     return finish_workflow(
                         delegate,
-                        &workflow.workflow_id,
-                        workflow_path,
-                        run_dir,
-                        current_prompt_id,
-                        LastRunStatus::Failed,
-                        &summary,
-                        run_id,
+                        WorkflowRunSummary {
+                            workflow_id: workflow.workflow_id.clone(),
+                            run_id,
+                            final_prompt_id: current_prompt_id,
+                            run_dir,
+                            workflow_path,
+                            status: LastRunStatus::Failed,
+                        },
+                        summary,
                     )
                     .await;
                 }
@@ -242,16 +255,18 @@ where
 
         finish_workflow(
             delegate,
-            &workflow.workflow_id,
-            workflow_path,
-            run_dir,
-            current_prompt_id,
-            LastRunStatus::MaxIterations,
-            &format!(
+            WorkflowRunSummary {
+                workflow_id: workflow.workflow_id.clone(),
+                run_id,
+                final_prompt_id: current_prompt_id,
+                run_dir,
+                workflow_path,
+                status: LastRunStatus::MaxIterations,
+            },
+            format!(
                 "Reached max iterations for workflow {}",
                 workflow.workflow_id
             ),
-            run_id,
         )
         .await
     }
@@ -464,11 +479,7 @@ where
 
     async fn run_interactive_workflow_prompt<D>(
         &self,
-        workflow_path: &Utf8Path,
-        prompt_id: &str,
-        prompt_text: String,
-        run_dir: &Utf8Path,
-        run_id: &str,
+        invocation: InteractiveSessionInvocation,
         control: &RunControl,
         delegate: &mut D,
     ) -> Result<i32>
@@ -479,14 +490,6 @@ where
             return Err(anyhow!("operation canceled"));
         }
         let config = self.interactive_runner_config_for(control)?;
-        let invocation = InteractiveSessionInvocation {
-            session_name: prompt_id.to_owned(),
-            initial_prompt: prompt_text,
-            project_dir: self.project_dir.clone(),
-            run_dir: run_dir.to_path_buf(),
-            run_id: Some(run_id.to_owned()),
-            prompt_path: Some(workflow_path.to_path_buf()),
-        };
         let outcome = if let Some(outcome) = delegate
             .run_interactive_session(&config, &invocation)
             .await?
@@ -541,31 +544,19 @@ enum NextStep {
 
 async fn finish_workflow<D>(
     delegate: &mut D,
-    workflow_id: &str,
-    workflow_path: Utf8PathBuf,
-    run_dir: Utf8PathBuf,
-    final_prompt_id: String,
-    status: LastRunStatus,
-    summary: &str,
-    run_id: String,
+    run_summary: WorkflowRunSummary,
+    event_summary: String,
 ) -> Result<WorkflowRunSummary>
 where
     D: RunDelegate,
 {
     delegate
         .on_event(RunEvent::Finished {
-            status,
-            summary: summary.to_owned(),
+            status: run_summary.status,
+            summary: event_summary,
         })
         .await?;
-    Ok(WorkflowRunSummary {
-        workflow_id: workflow_id.to_owned(),
-        run_id,
-        final_prompt_id,
-        run_dir,
-        workflow_path,
-        status,
-    })
+    Ok(run_summary)
 }
 
 fn format_summary(prefix: &str, body: &str) -> String {
@@ -590,7 +581,7 @@ mod tests {
     use std::{
         collections::BTreeMap,
         fs,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, OnceLock},
     };
 
     use anyhow::Result;
@@ -600,17 +591,47 @@ mod tests {
     use ralph_runner::{
         InteractiveSessionInvocation, InteractiveSessionOutcome, RunnerAdapter, RunnerStreamEvent,
     };
-    use tokio::sync::mpsc::UnboundedSender;
+    use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, mpsc::UnboundedSender};
 
     use crate::{RalphApp, RunDelegate, RunEvent, WorkflowRequestInput, WorkflowRunInput};
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const RALPH_CONFIG_HOME_ENV: &str = "RALPH_CONFIG_HOME";
+    type WorkflowEvent = (String, String);
+    type WorkflowEventBatch = Vec<WorkflowEvent>;
+    type WorkflowEventQueue = Vec<WorkflowEventBatch>;
+
+    fn env_lock() -> &'static AsyncMutex<()> {
+        static ENV_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+        ENV_LOCK.get_or_init(|| AsyncMutex::new(()))
+    }
+
+    struct ScopedConfigHome {
+        _guard: AsyncMutexGuard<'static, ()>,
+    }
+
+    impl ScopedConfigHome {
+        async fn new(config_home: &std::path::Path) -> Self {
+            let guard = env_lock().lock().await;
+            unsafe {
+                std::env::set_var(RALPH_CONFIG_HOME_ENV, config_home);
+            }
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for ScopedConfigHome {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var(RALPH_CONFIG_HOME_ENV);
+            }
+        }
+    }
 
     #[derive(Clone, Default)]
     struct WorkflowSpyRunner {
         invocations: Arc<Mutex<Vec<RunnerInvocation>>>,
         interactive_invocations: Arc<Mutex<Vec<InteractiveSessionInvocation>>>,
-        events: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+        events: Arc<Mutex<WorkflowEventQueue>>,
     }
 
     #[async_trait]
@@ -695,14 +716,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_workflow_routes_between_prompts_and_uses_project_dir() -> Result<()> {
-        let _guard = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let config_home = temp.path().join("config-home");
         fs::create_dir_all(config_home.join("workflows")).unwrap();
-        unsafe {
-            std::env::set_var("RALPH_CONFIG_HOME", &config_home);
-        }
+        let _config_home = ScopedConfigHome::new(&config_home).await;
         fs::write(
             config_home.join("workflows/plan-build.yml"),
             r#"
@@ -767,23 +785,16 @@ prompts:
         assert!(invocations[0].prompt_text.contains("request=ship it"));
         assert!(invocations[1].prompt_text.contains(project_dir.as_str()));
         assert!(summary.run_dir.join("request.txt").exists());
-
-        unsafe {
-            std::env::remove_var("RALPH_CONFIG_HOME");
-        }
         Ok(())
     }
 
     #[tokio::test]
     async fn interactive_workflow_prompts_pass_run_id_and_prompt_path() -> Result<()> {
-        let _guard = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let config_home = temp.path().join("config-home");
         fs::create_dir_all(config_home.join("workflows")).unwrap();
-        unsafe {
-            std::env::set_var("RALPH_CONFIG_HOME", &config_home);
-        }
+        let _config_home = ScopedConfigHome::new(&config_home).await;
         fs::write(
             config_home.join("workflows/pdd.yml"),
             r#"
@@ -832,23 +843,16 @@ prompts:
         assert_eq!(invocation.run_id.as_deref(), Some(summary.run_id.as_str()));
         assert!(invocation.prompt_path.is_some());
         assert!(invocation.initial_prompt.contains("rough idea"));
-
-        unsafe {
-            std::env::remove_var("RALPH_CONFIG_HOME");
-        }
         Ok(())
     }
 
     #[tokio::test]
     async fn interactive_workflow_rejects_stdin_request_source() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let config_home = temp.path().join("config-home");
         fs::create_dir_all(config_home.join("workflows")).unwrap();
-        unsafe {
-            std::env::set_var("RALPH_CONFIG_HOME", &config_home);
-        }
+        let _config_home = ScopedConfigHome::new(&config_home).await;
         fs::write(
             config_home.join("workflows/pdd.yml"),
             r#"
@@ -894,21 +898,15 @@ prompts:
             .to_string();
 
         assert!(error.contains("cannot use stdin as the request source"));
-        unsafe {
-            std::env::remove_var("RALPH_CONFIG_HOME");
-        }
     }
 
     #[tokio::test]
     async fn run_workflow_interpolates_declared_option_values() -> Result<()> {
-        let _guard = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let config_home = temp.path().join("config-home");
         fs::create_dir_all(config_home.join("workflows")).unwrap();
-        unsafe {
-            std::env::set_var("RALPH_CONFIG_HOME", &config_home);
-        }
+        let _config_home = ScopedConfigHome::new(&config_home).await;
         fs::write(
             config_home.join("workflows/task-based.yml"),
             r#"
@@ -966,10 +964,6 @@ prompts:
                 .contains("progress=custom-progress.txt")
         );
         assert!(invocation.prompt_text.contains("request=ship it"));
-
-        unsafe {
-            std::env::remove_var("RALPH_CONFIG_HOME");
-        }
         Ok(())
     }
 
