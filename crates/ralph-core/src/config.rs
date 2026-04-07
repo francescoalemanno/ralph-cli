@@ -257,11 +257,50 @@ fn write_partial_config(path: &Utf8Path, config: &PartialAppConfig) -> Result<()
 fn seed_user_config_if_missing() -> Result<()> {
     let path = global_config_dir()?.join(PROJECT_CONFIG_FILE_NAME);
     if path.exists() {
+        refresh_seeded_user_config_if_needed(&path)?;
         return Ok(());
     }
     let raw = toml::to_string_pretty(&AppConfig::default())
         .context("failed to serialize default user config")?;
     atomic_write(&path, raw).with_context(|| format!("failed to seed user config at {path}"))
+}
+
+fn refresh_seeded_user_config_if_needed(path: &Utf8Path) -> Result<()> {
+    let partial = read_partial_config(path)?;
+    let Some(agents) = partial.agents.as_ref() else {
+        return Ok(());
+    };
+    if !is_builtin_registry_snapshot(agents) {
+        return Ok(());
+    }
+
+    let current_builtins = builtin_agents();
+    if agents == current_builtins.as_slice() {
+        return Ok(());
+    }
+
+    let mut updated = partial;
+    updated.agents = Some(current_builtins);
+    write_partial_config(path, &updated)
+}
+
+fn is_builtin_registry_snapshot(agents: &[AgentConfig]) -> bool {
+    if agents.is_empty() {
+        return false;
+    }
+
+    let current_builtins = builtin_agents();
+    let current_by_id = current_builtins
+        .iter()
+        .map(|agent| (agent.id.as_str(), agent))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    agents.iter().all(|agent| {
+        agent.builtin
+            && current_by_id
+                .get(agent.id.as_str())
+                .is_some_and(|builtin| builtin == &agent)
+    })
 }
 
 fn project_config_path(project_dir: &Utf8Path) -> Utf8PathBuf {
@@ -316,6 +355,17 @@ pub(crate) fn configure_test_global_config_home() -> Utf8PathBuf {
         std::env::set_var(RALPH_CONFIG_HOME_ENV, path.as_str());
     }
     path.clone()
+}
+
+#[cfg(test)]
+pub(crate) fn global_config_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static TEST_CONFIG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_CONFIG_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap()
 }
 
 fn merge_config(mut base: AppConfig, partial: PartialAppConfig) -> AppConfig {
@@ -384,7 +434,7 @@ mod tests {
 
     use super::{
         AppConfig, ConfigFileScope, PartialAppConfig, configure_test_global_config_home,
-        merge_config,
+        global_config_test_lock, merge_config, write_partial_config,
     };
     use crate::AgentConfig;
 
@@ -397,6 +447,7 @@ mod tests {
         assert!(config.agent_definition("droid").is_some());
         assert!(config.agent_definition("gemini").is_some());
         assert!(config.agent_definition("opencode").is_some());
+        assert!(config.agent_definition("pi").is_some());
         assert!(config.agent_definition("raijin").is_some());
     }
 
@@ -414,7 +465,13 @@ mod tests {
 
     #[test]
     fn persisted_agent_switch_updates_project_agent_only() {
+        let _guard = global_config_test_lock();
         configure_test_global_config_home();
+        if let Some(user_path) = AppConfig::user_config_path().unwrap() {
+            if user_path.exists() {
+                fs::remove_file(&user_path).unwrap();
+            }
+        }
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
 
@@ -428,6 +485,7 @@ mod tests {
 
     #[test]
     fn user_config_is_seeded_with_builtin_agents() {
+        let _guard = global_config_test_lock();
         configure_test_global_config_home();
 
         let user_path = AppConfig::user_config_path().unwrap().unwrap();
@@ -443,7 +501,69 @@ mod tests {
         assert!(raw.contains("id = \"droid\""));
         assert!(raw.contains("id = \"gemini\""));
         assert!(raw.contains("id = \"opencode\""));
+        assert!(raw.contains("id = \"pi\""));
         assert!(raw.contains("id = \"raijin\""));
+    }
+
+    #[test]
+    fn stale_seeded_user_config_is_refreshed_with_new_builtins() {
+        let _guard = global_config_test_lock();
+        configure_test_global_config_home();
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+
+        let user_path = AppConfig::user_config_path().unwrap().unwrap();
+        let old_builtins = crate::builtin_agents()
+            .into_iter()
+            .filter(|agent| agent.id != "pi")
+            .collect::<Vec<_>>();
+        write_partial_config(
+            &user_path,
+            &PartialAppConfig {
+                default_agent: Some("codex".to_owned()),
+                agents: Some(old_builtins),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let config = AppConfig::load(&project_dir).unwrap();
+        assert!(config.agent_definition("pi").is_some());
+
+        let raw = fs::read_to_string(user_path).unwrap();
+        assert!(raw.contains("id = \"pi\""));
+    }
+
+    #[test]
+    fn custom_user_agent_registry_is_not_rewritten_with_builtins() {
+        let _guard = global_config_test_lock();
+        configure_test_global_config_home();
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+
+        let user_path = AppConfig::user_config_path().unwrap().unwrap();
+        write_partial_config(
+            &user_path,
+            &PartialAppConfig {
+                default_agent: Some("custom".to_owned()),
+                agents: Some(vec![AgentConfig {
+                    id: "custom".to_owned(),
+                    name: "Custom".to_owned(),
+                    builtin: false,
+                    non_interactive: crate::CodingAgent::Codex.definition().non_interactive,
+                    interactive: crate::CodingAgent::Codex.definition().interactive,
+                }]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let config = AppConfig::load(&project_dir).unwrap();
+        assert!(config.agent_definition("custom").is_some());
+        assert!(config.agent_definition("pi").is_none());
+
+        let raw = fs::read_to_string(user_path).unwrap();
+        assert!(!raw.contains("id = \"pi\""));
     }
 
     #[test]

@@ -656,6 +656,7 @@ mod tests {
         for builtin in [
             CodingAgent::Codex.definition(),
             CodingAgent::Opencode.definition(),
+            CodingAgent::Pi.definition(),
             CodingAgent::Raijin.definition(),
         ] {
             if builtin.interactive.mode == CommandMode::Exec {

@@ -9,7 +9,7 @@ It gives you named, repeatable execution loops like "take the next highest-prior
 ## Why Use Ralph
 
 - Run the same request through a durable workflow instead of a one-off prompt.
-- Switch between supported agents such as Codex, Claude Code, Gemini CLI, OpenCode, Droid, and Raijin.
+- Switch between supported agents such as Codex, Claude Code, Gemini CLI, OpenCode, Droid, Pi Coding, and Raijin.
 - Keep user defaults and per-project overrides separate.
 - Inspect and edit workflow definitions from the CLI.
 - Keep run artifacts under `.ralph/` so work is auditable and inspectable.

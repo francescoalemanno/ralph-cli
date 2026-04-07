@@ -649,7 +649,9 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn with_test_workflow_home(test: impl FnOnce()) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let config_home = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         fs::create_dir_all(config_home.join("workflows").as_std_path()).unwrap();

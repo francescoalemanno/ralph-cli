@@ -29,6 +29,7 @@ pub enum CodingAgent {
     Claude,
     Droid,
     Gemini,
+    Pi,
     Raijin,
 }
 
@@ -46,6 +47,7 @@ impl CodingAgent {
             Self::Claude => "claude",
             Self::Droid => "droid",
             Self::Gemini => "gemini",
+            Self::Pi => "pi",
             Self::Raijin => "raijin",
         }
     }
@@ -57,6 +59,7 @@ impl CodingAgent {
             Self::Claude => "Claude Code",
             Self::Droid => "Droid",
             Self::Gemini => "Gemini CLI",
+            Self::Pi => "Pi Coding",
             Self::Raijin => "Raijin",
         }
     }
@@ -68,6 +71,7 @@ impl CodingAgent {
             Self::Claude => "claude",
             Self::Droid => "droid",
             Self::Gemini => "gemini",
+            Self::Pi => "pi",
             Self::Raijin => "raijin",
         }
     }
@@ -246,16 +250,44 @@ impl CodingAgent {
                     env: BTreeMap::new(),
                 },
             },
+            Self::Pi => AgentConfig {
+                id: self.id().to_owned(),
+                name: self.label().to_owned(),
+                builtin: true,
+                non_interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("pi".to_owned()),
+                    args: vec![
+                        "--no-session".to_owned(),
+                        "-p".to_owned(),
+                        "{prompt}".to_owned(),
+                    ],
+                    command: None,
+                    prompt_input: PromptInput::Argv,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::new(),
+                },
+                interactive: RunnerConfig {
+                    mode: CommandMode::Exec,
+                    program: Some("pi".to_owned()),
+                    args: vec!["--no-session".to_owned(), "{prompt}".to_owned()],
+                    command: None,
+                    prompt_input: PromptInput::Argv,
+                    prompt_env_var: default_prompt_env_var(),
+                    env: BTreeMap::new(),
+                },
+            },
         }
     }
 
-    fn all() -> [Self; 6] {
+    fn all() -> [Self; 7] {
         [
             Self::Opencode,
             Self::Codex,
             Self::Claude,
             Self::Droid,
             Self::Gemini,
+            Self::Pi,
             Self::Raijin,
         ]
     }
@@ -397,7 +429,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             builtin_ids,
-            vec!["opencode", "codex", "claude", "droid", "gemini", "raijin"]
+            vec![
+                "opencode", "codex", "claude", "droid", "gemini", "pi", "raijin"
+            ]
         );
     }
 
@@ -466,6 +500,18 @@ mod tests {
         assert_eq!(gemini.non_interactive.args, vec!["-y", "-p", "{prompt}"]);
         assert_eq!(gemini.interactive.prompt_input, PromptInput::Argv);
         assert_eq!(gemini.interactive.args, vec!["-y", "-i", "{prompt}"]);
+    }
+
+    #[test]
+    fn pi_builtin_commands_match_expected_shapes() {
+        let pi = CodingAgent::Pi.definition();
+        assert_eq!(pi.non_interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(
+            pi.non_interactive.args,
+            vec!["--no-session", "-p", "{prompt}"]
+        );
+        assert_eq!(pi.interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(pi.interactive.args, vec!["--no-session", "{prompt}"]);
     }
 
     #[test]
