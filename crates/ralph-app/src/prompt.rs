@@ -29,6 +29,18 @@ pub(crate) fn interpolate_workflow_prompt(
     Ok(interpolated)
 }
 
+fn absolute_unix_path(path: &Utf8Path) -> Result<String> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let cwd =
+            Utf8PathBuf::from_path_buf(std::env::current_dir().context("failed to read cwd")?)
+                .map_err(|_| anyhow!("current directory is not valid UTF-8"))?;
+        cwd.join(path)
+    };
+    Ok(absolute.as_str().replace('\\', "/"))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -50,16 +62,4 @@ mod tests {
         assert!(rendered.contains("request=ship it"));
         assert!(rendered.contains("progress=progress.txt"));
     }
-}
-
-fn absolute_unix_path(path: &Utf8Path) -> Result<String> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        let cwd =
-            Utf8PathBuf::from_path_buf(std::env::current_dir().context("failed to read cwd")?)
-                .map_err(|_| anyhow!("current directory is not valid UTF-8"))?;
-        cwd.join(path)
-    };
-    Ok(absolute.as_str().replace('\\', "/"))
 }
