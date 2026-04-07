@@ -1,8 +1,13 @@
 version: 1
 workflow_id: pdd
 title: Prompt-Driven Development
-description: Turn a rough idea into research, design, and an implementation plan through an interactive workflow.
+description: Turn a rough idea into research, design, and an implementation plan through an interactive workflow that stops before implementation.
 entrypoint: pdd
+options:
+  pdd-dir:
+    help: Planning directory template. Resolve `{project_name}` after choosing the final project name.
+    default: "docs/planning/{project_name}"
+    value_name: DIR
 request:
   runtime:
     argv: true
@@ -18,13 +23,13 @@ prompts:
 
       ## Overview
 
-      This sop guides you through the process of transforming a rough idea into a detailed design document with an implementation plan and todo list. It follows the Prompt-Driven Development methodology to systematically refine your idea, conduct necessary research, create a comprehensive design, and develop an actionable implementation plan. The process is designed to be iterative, allowing movement between requirements clarification and research as needed.
+      This sop guides you through the process of transforming a rough idea into a detailed design document with an implementation plan and todo list. It follows the Prompt-Driven Development methodology to systematically refine your idea, conduct necessary research, create a comprehensive design, and develop an actionable implementation plan. The process is designed to be iterative, allowing movement between requirements clarification and research as needed. This workflow is planning-only: it MUST stop after producing the planning artifacts and the follow-up Ralph command, and it MUST NOT implement the resulting plan itself.
 
       ## Parameters
 
       - **rough_idea** (required): The initial concept or idea you want to develop into a detailed design
       - **project_name** (optional): A short, descriptive name for the project. If not provided, will be generated from the rough idea
-      - **project_dir** (optional, default: "docs/planning/{project_name}"): The base directory where all project files will be stored
+      - **pdd_dir** (optional workflow parameter, default: `{ralph-option:pdd-dir}`): The planning directory template. If it contains `{project_name}`, you MUST substitute the final project name before using it.
 
       **Resolved runtime input:**
 
@@ -42,8 +47,10 @@ prompts:
       - You MUST confirm successful acquisition of all parameters before proceeding
       - If project_name is not provided, You MUST generate a short kebab-case name from the rough idea, prefixed with the current date in YYYY-MM-DD format (e.g., "2026-01-30-template-manager", "2026-01-30-auth-system")
       - You SHOULD save the acquired rough idea to a consistent location for use in subsequent steps
+      - You MUST resolve the planning directory from `{ralph-option:pdd-dir}` after determining the final `project_name`
+      - You MUST treat the resolved planning directory as the canonical project directory for all subsequent files and commands
       - You MUST NOT overwrite the existing project directory because this could destroy previous work and cause data loss
-      - You MUST ask for project_dir if it is not given and the generated default directory already exists and has contents from previous iteration
+      - You MUST ask the user for a different `project_name` if the resolved planning directory already exists and has contents from a previous iteration
 
       ## Steps
 
@@ -52,16 +59,16 @@ prompts:
       Set up a directory structure to organize all artifacts created during the process.
 
       **Constraints:**
-      - You MUST create the specified project directory if it doesn't already exist
+      - You MUST create the resolved planning directory from `{ralph-option:pdd-dir}` if it doesn't already exist
       - You MUST create the following files:
-        - {project_dir}/rough-idea.md (containing the provided rough idea)
-        - {project_dir}/idea-honing.md (for requirements clarification)
+        - {ralph-option:pdd-dir}/rough-idea.md (containing the provided rough idea)
+        - {ralph-option:pdd-dir}/idea-honing.md (for requirements clarification)
       - You MUST create the following subdirectories:
-        - {project_dir}/research/ (directory for research notes)
-        - {project_dir}/design/ (directory for design documents)
-        - {project_dir}/implementation/ (directory for implementation plans)
+        - {ralph-option:pdd-dir}/research/ (directory for research notes)
+        - {ralph-option:pdd-dir}/design/ (directory for design documents)
+        - {ralph-option:pdd-dir}/implementation/ (directory for implementation plans)
       - You MUST notify the user when the structure has been created
-      - You MUST prompt the user to add all project files to Kiro's context using the command: `/context add {project_dir}/**/*.md`
+      - You MUST prompt the user to add all project files to Kiro's context using the command: `/context add {ralph-option:pdd-dir}/**/*.md`
       - You MUST explain that this will ensure all project files remain in context throughout the process
 
       ### 2. Initial Process Planning
@@ -83,17 +90,17 @@ prompts:
       Guide the user through a series of questions to refine the initial idea and develop a thorough specification.
 
       **Constraints:**
-      - You MUST create an empty {project_dir}/idea-honing.md file if it doesn't already exist
+      - You MUST create an empty {ralph-option:pdd-dir}/idea-honing.md file if it doesn't already exist
       - You MUST ask ONLY ONE question at a time and wait for the user's response before asking the next question
       - You MUST NOT list multiple questions for the user to answer at once because this overwhelms users and leads to incomplete responses
       - You MUST NOT pre-populate answers to questions without user input because this assumes user preferences without confirmation
       - You MUST NOT write multiple questions and answers to the idea-honing.md file at once because this skips the interactive clarification process
       - You MUST follow this exact process for each question:
         1. Formulate a single question
-        2. Append the question to {project_dir}/idea-honing.md
+        2. Append the question to {ralph-option:pdd-dir}/idea-honing.md
         3. Present the question to the user in the conversation
         4. Wait for the user's complete response, which may require brief back-and-forth dialogue across multiple turns.
-        5. Once you have their complete response, append the user's answer (or final decision) to {project_dir}/idea-honing.md
+        5. Once you have their complete response, append the user's answer (or final decision) to {ralph-option:pdd-dir}/idea-honing.md
         6. Only then proceed to formulating the next question
       - You MAY suggest possible answers when asking a question, but MUST wait for the user's actual response
       - You MUST format the idea-honing.md document with clear question and answer sections
@@ -122,8 +129,8 @@ prompts:
         - Specific resources (files, websites, internal tools) the user recommends
         - Areas where the user has existing knowledge to contribute
       - You MUST incorporate user suggestions into the research plan
-      - You MUST document research findings in separate markdown files in the {project_dir}/research/ directory
-      - You SHOULD organize research by topic (e.g., {project_dir}/research/existing-code.md, {project_dir}/research/technologies.md)
+      - You MUST document research findings in separate markdown files in the {ralph-option:pdd-dir}/research/ directory
+      - You SHOULD organize research by topic (e.g., {ralph-option:pdd-dir}/research/existing-code.md, {ralph-option:pdd-dir}/research/technologies.md)
       - You MUST include mermaid diagrams when documenting system architectures, data flows, or component relationships in research
       - You MUST include links to relevant references and sources when research is based on external materials (websites, documentation, articles, etc.)
       - You MAY use tools like search_internal_code, read_internal_website, or fs_read to gather information
@@ -158,7 +165,7 @@ prompts:
       Develop a comprehensive design document based on the requirements and research.
 
       **Constraints:**
-      - You MUST create a detailed design document at {project_dir}/design/detailed-design.md
+      - You MUST create a detailed design document at {ralph-option:pdd-dir}/design/detailed-design.md
       - You MUST write the design as a standalone document that can be understood without reading other project files
       - You MUST include the following sections in the design document:
         - Overview
@@ -180,7 +187,7 @@ prompts:
       - You MUST ensure the design addresses all requirements identified during the clarification process
       - You SHOULD highlight design decisions and their rationales, referencing research findings where applicable
       - You MUST review the design with the user and iterate based on feedback
-      - You MUST explicitly ask the user if they are ready to proceed to implementation before moving to Step 7
+      - You MUST explicitly ask the user if they are ready to proceed to implementation planning before moving to Step 7
       - You MUST NOT proceed to the implementation plan step without explicit user confirmation because this could skip important design refinement
       - You MUST offer to return to requirements clarification or research if gaps are identified during design
 
@@ -189,8 +196,9 @@ prompts:
       Create a structured implementation plan with a series of steps for implementing the design.
 
       **Constraints:**
-      - You MUST create an implementation plan at {project_dir}/implementation/plan.md
+      - You MUST create an implementation plan at {ralph-option:pdd-dir}/implementation/plan.md
       - You MUST include a checklist at the beginning of the plan.md file to track implementation progress
+      - You MUST treat the implementation plan as a handoff artifact for a later `ralph run plan-build ...` execution, not as a license to start implementing during this workflow
       - You MUST use the following specific instructions when creating the implementation plan:
         ```
         Convert the design into a series of implementation steps that will build each component in a test-driven manner following agile best practices. Each step must result in a working, demoable increment of functionality. Prioritize best practices, incremental progress, and early testing, ensuring no big jumps in complexity at any stage. Make sure that each step builds on the previous steps, and ends with wiring things together. There should be no hanging or orphaned code that isn't integrated into a previous step.
@@ -216,16 +224,19 @@ prompts:
       - You MUST ensure the plan covers all aspects of the design
       - You SHOULD sequence steps to validate core functionality early
       - You MUST ensure the checklist items correspond directly to the steps in the implementation plan
+      - You MUST NOT implement any plan item or modify production code as part of this workflow; this step ends once the plan is documented
 
       ### 8. Summarize and Present Results
 
       Provide a summary of all artifacts created and next steps.
 
       **Constraints:**
-      - You MUST create a summary document at {project_dir}/summary.md
+      - You MUST create a summary document at {ralph-option:pdd-dir}/summary.md
       - You MUST list all artifacts created during the process
       - You MUST provide a brief overview of the design and implementation plan
       - You MUST suggest next steps for the user
+      - You MUST include in the summary document and in your final response the exact follow-up command `ralph run plan-build --specsglob "{ralph-option:pdd-dir}/design/*.md" --planfile "{ralph-option:pdd-dir}/implementation/plan.md" "Implement the planned work described in {ralph-option:pdd-dir}/design/detailed-design.md"`
+      - You MUST explain that the current `pdd` workflow has not implemented the plan and that the follow-up `plan-build` command is how Ralph should execute the planned work
       - You SHOULD highlight any areas that may need further refinement
       - You MUST present this summary to the user in the conversation
 
@@ -236,7 +247,7 @@ prompts:
       ```
       Rough idea: I want to build a feature for our team's internal tool that allows users to create and manage templates for common documents we produce. Users should be able to create, edit, and share templates, as well as use them to generate new documents with custom fields.
 
-      Project name: template-feature
+      Project name: {project_name}
       ```
 
       ### Example Output
@@ -256,10 +267,10 @@ prompts:
 
       # Project Summary
 
-      I've completed the transformation of your rough idea into a detailed design with an implementation plan. Here's what was created:
+      I've completed the transformation of your rough idea into a detailed design with an implementation plan. No implementation work has been performed in this workflow. Here's what was created:
 
       ## Directory Structure
-      - docs/planning/template-feature/
+      - {ralph-option:pdd-dir}/
         - rough-idea.md (your initial concept)
         - idea-honing.md (our Q&A requirements clarification)
         - research/
@@ -283,9 +294,9 @@ prompts:
       The implementation plan breaks down the work into 12 incremental steps, starting with core data models and building up to the complete feature set.
 
       ## Next Steps
-      1. Review the detailed design document at docs/planning/template-feature/design/detailed-design.md
-      2. Check the implementation plan and checklist at docs/planning/template-feature/implementation/plan.md
-      3. Begin implementation following the checklist in the implementation plan
+      1. Review the detailed design document at {ralph-option:pdd-dir}/design/detailed-design.md
+      2. Check the implementation plan and checklist at {ralph-option:pdd-dir}/implementation/plan.md
+      3. Run `ralph run plan-build --specsglob "{ralph-option:pdd-dir}/design/*.md" --planfile "{ralph-option:pdd-dir}/implementation/plan.md" "Implement the planned work described in {ralph-option:pdd-dir}/design/detailed-design.md"` to have Ralph execute the full planned work
 
       Would you like me to explain any specific part of the design or implementation plan in more detail?
       ```
@@ -310,5 +321,5 @@ prompts:
       If the design becomes too complex or unwieldy:
       - You SHOULD suggest breaking it down into smaller, more manageable components
       - You SHOULD focus on core functionality first
-      - You MAY suggest a phased approach to implementation
+      - You MAY suggest a phased approach to the implementation plan
       - You SHOULD return to requirements clarification to prioritize features if needed
