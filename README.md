@@ -1,18 +1,41 @@
 # Ralph
 
-Ralph is a workflow runner for coding agents.
+Ralph is a workflow runner for iterative coding-agent loops.
 
-It gives you named, repeatable execution loops like "take the next highest-priority task", "plan then build", or "turn this rough idea into a design and implementation plan". By default it opens a terminal UI; add `--cli` when you want a scriptable, plain-terminal run.
+Think of it as the Ralph Wiggum technique packaged into named workflows: study durable project memory, choose one high-leverage action, do the work, record what changed, and either loop again or stop. By default it opens a terminal UI; add `--cli` when you want a scriptable, plain-terminal run.
 
 ![Ralph TUI](tui.png)
 
-## Why Use Ralph
+## Ralph Philosophy
 
-- Run the same request through a durable workflow instead of a one-off prompt.
-- Switch between supported agents such as Codex, Claude Code, Gemini CLI, OpenCode, Droid, Pi Coding, and Raijin.
-- Keep user defaults and per-project overrides separate.
-- Inspect and edit workflow definitions from the CLI.
-- Keep run artifacts under `.ralph/` so work is auditable and inspectable.
+- Iteration beats one-shot prompting. Ralph is for repeated loops that tighten the repository over time, not for hoping one giant prompt gets everything right.
+- One item per loop. The built-in workflows deliberately try to pick one high-leverage item, or send the agent back to planning when the work is still ambiguous.
+- Durable memory beats bloated context. Files such as `progress.txt`, `IMPLEMENTATION_PLAN.md`, `AGENTS.md`, and `specs/*` are the stable memory each loop reloads.
+- Failures are data. A bad search result, broken build, or stale plan is usually a signal to tune the workflow inputs or guardrails.
+- Backpressure matters. Ralph works best when each loop can run the checks that reject placeholders and shallow implementations.
+- Operator skill still matters. Ralph automates the loop, not engineering judgment; you still need to define success clearly and tune the artifacts when the loop drifts.
+
+## When Ralph Works Best
+
+- Well-defined engineering work with observable success criteria
+- Greenfield work or bounded refactors where automated checks can provide fast feedback
+- Repositories where `specs/*`, `IMPLEMENTATION_PLAN.md`, `AGENTS.md`, or `progress.txt` can stay current
+- Long-running or unattended iteration where you want auditable handoffs between loops
+
+## When Ralph Is A Bad Fit
+
+- Tasks whose success is mostly taste, negotiation, or external approval
+- Huge vague requests that actually need design work first
+- Changes that cannot be validated with tests, linters, type checkers, or smoke tests
+- Repositories where nobody will maintain the plan/spec artifacts Ralph depends on
+
+## What Ralph Gives You
+
+- Named, repeatable loops instead of rebuilding the prompt stack every run
+- Built-in workflows that separate planning from building when needed
+- Agent portability across Codex, Claude Code, Gemini CLI, OpenCode, Droid, Pi Coding, and Raijin
+- User defaults and per-project overrides kept separate
+- Editable workflow definitions and auditable run artifacts under `.ralph/`
 
 ## Install
 
@@ -56,11 +79,22 @@ ralph ls
 
 `ralph doctor` validates config, seeds the built-in workflow registry if missing, ensures `.ralph/` can be created in the current project, and reports which supported agents were detected on `PATH`.
 
+## Choose The Right Workflow
+
+- `bare`: use this when your request already contains the exact loop discipline you want and you just need Ralph to run it durably.
+- `task-based`: use this when the work already lives in a request list or `progress.txt` and you want one right-sized item completed per loop.
+- `plan-build`: use this when the work still needs spec repair, plan repair, and one-item-at-a-time execution against a durable plan.
+- `pdd`: use this when the idea is still rough and you need an interactive path to research, design, and an implementation plan before autonomous loops.
+
 ## Core Concepts
 
 - Workflow: a YAML definition selected with `ralph run <workflow-id> ...`
 - Agent: the coding tool Ralph launches underneath the workflow
 - Request: the task text for the workflow
+- Specs: the durable description of what should exist, usually under `specs/*`
+- Plan file: a prioritized list of right-sized build items, usually `IMPLEMENTATION_PLAN.md`
+- Progress file: the handoff memory for the next loop, usually `progress.txt`
+- Agent guidance file: durable operational notes for future loops, usually `AGENTS.md`
 - User config: `~/.config/ralph/config.toml`
 - Workflow registry: `~/.config/ralph/workflows/`
 - Project config: `.ralph/config.toml`
@@ -107,20 +141,37 @@ Ralph accepts the workflow request in exactly one runtime form:
 
 If you provide more than one, Ralph exits with a usage error.
 
+## Writing Better Ralph Requests
+
+- Define success criteria in observable terms: what should work, what should pass, and what files or docs should be updated.
+- Keep the active loop narrow. If the work is broad or ambiguous, start with `pdd` or `plan-build` so Ralph can turn it into right-sized items first.
+- Point Ralph at durable memory such as `specs/*`, `IMPLEMENTATION_PLAN.md`, `AGENTS.md`, or `progress.txt`.
+- Tell Ralph to study the code before deciding something is missing. This is one of the most common failure modes in agentic loops.
+- Ask for the relevant checks after each change so the loop has real backpressure.
+- Treat plan and progress files as living control surfaces. If they get stale, rewrite them and keep looping.
+
 ## Built-In Workflows
 
 | Workflow | What it does | Useful options |
 | --- | --- | --- |
-| `bare` | Sends your request to the agent with no extra scaffolding. | None |
-| `task-based` | Executes one high-priority task at a time and updates a progress file for handoff. | `--progressfile` (default: `progress.txt`) |
-| `plan-build` | Alternates between planning and implementation against one goal. | `--specsglob` (default: `specs/*`), `--planfile` (default: `IMPLEMENTATION_PLAN.md`), `--agentsfile` (default: `AGENTS.md`) |
-| `pdd` | Interactive prompt-driven development: rough idea to research, design, and implementation plan. | None |
+| `bare` | Minimal wrapper when your request already contains the loop discipline you want. | None |
+| `task-based` | Reads the request list, chooses one high-priority right-sized item, executes it, and updates a handoff file for the next loop. | `--progressfile` (default: `progress.txt`) |
+| `plan-build` | Alternates between repairing `specs/*` and `IMPLEMENTATION_PLAN.md` and executing one build item at a time. | `--specsglob` (default: `specs/*`), `--planfile` (default: `IMPLEMENTATION_PLAN.md`), `--agentsfile` (default: `AGENTS.md`) |
+| `pdd` | Interactive prompt-driven development for turning a rough idea into research, design, and an implementation plan. | None |
 
 List them at any time with:
 
 ```bash
 ralph ls
 ```
+
+## Tuning The Loop
+
+- If Ralph keeps grabbing work that is too large, shrink the plan items until one loop can finish one item completely.
+- If Ralph duplicates code that already exists, strengthen the instruction to study the codebase first and keep specs aligned with reality.
+- If Ralph compiles but does shallow work, tighten the success criteria and require the checks that would fail on placeholders.
+- If `progress.txt` or `IMPLEMENTATION_PLAN.md` turns into noise, rewrite it into a shorter prioritized list and continue the loop.
+- Use `--max-iterations` as a safety net when you are testing a workflow or running unattended.
 
 ## Common Commands
 
@@ -239,6 +290,13 @@ That is why the workflow-specific help output looks slightly different from the 
 - `.ralph/runs/<workflow-id>/<run-id>/request.txt`: saved request text for a run
 - `.ralph/runs/<workflow-id>/<run-id>/.ralph-runtime/agent-events.wal.ndjson`: loop-control event log
 
+Files Ralph commonly reads or updates as part of the workflow itself:
+
+- `progress.txt`: task handoff memory for `task-based`
+- `IMPLEMENTATION_PLAN.md`: prioritized right-sized work for `plan-build`
+- `AGENTS.md`: durable run/debug guidance learned during `plan-build`
+- `specs/*`: implementation constraints and shared definitions for `plan-build`
+
 ## Advanced: `ralph emit`
 
 `ralph emit` is mainly for workflow authors and the agent processes Ralph launches. Most users can ignore it.
@@ -254,14 +312,25 @@ See the built-in workflow definitions with `ralph show <workflow-id>` if you wan
 
 ## A Good Daily Flow
 
+If the work is still fuzzy, start with `pdd` and turn the idea into durable docs:
+
 ```bash
-ralph doctor
-ralph agent set codex --scope user
-ralph init --agent codex --editor nvim
+ralph run pdd --file rough-idea.md
+```
+
+If the work is implementation-ready but the plan and specs need to stay honest, use `plan-build`:
+
+```bash
 ralph run plan-build "add SSO to the admin app"
 ```
 
-If you want plain terminal output instead of the UI:
+If you already have a request list and want one-item handoffs, use `task-based` with a maintained `progress.txt`:
+
+```bash
+ralph run task-based "work through the next highest-priority backlog item"
+```
+
+If you want plain terminal output instead of the UI, or you are scripting a run:
 
 ```bash
 ralph run --cli plan-build "add SSO to the admin app"
