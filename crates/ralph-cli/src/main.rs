@@ -594,15 +594,15 @@ pub(crate) mod test_support {
         let config_home = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         fs::create_dir_all(config_home.join("workflows").as_std_path()).unwrap();
         fs::write(
-            config_home.join("workflows/task-based.yml").as_std_path(),
+            config_home.join("workflows/fixture-flow.yml").as_std_path(),
             r#"
 version: 1
-workflow_id: task-based
-title: Task Based
+workflow_id: fixture-flow
+title: Fixture Flow
 entrypoint: main
 options:
-  progress-file:
-    default: progress.txt
+  state-file:
+    default: state.txt
 request:
   runtime:
     argv: true
@@ -613,7 +613,7 @@ prompts:
     is_interactive: false
     fallback-route: no-route-error
     prompt: |
-      progress={ralph-option:progress-file}
+      state={ralph-option:state-file}
       request={ralph-request}
 "#,
         )
@@ -638,22 +638,22 @@ mod tests {
     #[test]
     fn loop_route_validation_lists_available_routes() {
         let temp = tempfile::tempdir().unwrap();
-        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("plan-build.yml")).unwrap();
+        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("route-test.yml")).unwrap();
         fs::write(
             workflow_path.as_std_path(),
             r#"
 version: 1
-workflow_id: plan-build
-title: Plan Build
-entrypoint: plan
+workflow_id: route-test
+title: Route Test
+entrypoint: alpha
 prompts:
-  plan:
-    title: Plan
+  alpha:
+    title: Alpha
     is_interactive: false
     fallback-route: no-route-error
     prompt: hello
-  build:
-    title: Build
+  beta:
+    title: Beta
     is_interactive: false
     fallback-route: no-route-error
     prompt: world
@@ -664,17 +664,17 @@ prompts:
         let context = EmitContext {
             run_id: "run-1".to_owned(),
             project_dir: Utf8PathBuf::from("/tmp/project"),
-            run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+            run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
             prompt_path: Some(workflow_path),
-            prompt_name: "plan".to_owned(),
+            prompt_name: "alpha".to_owned(),
         };
         let error = validate_loop_route_body("broken", &context)
             .unwrap_err()
             .to_string();
 
         assert!(error.contains("\"broken\" is not a valid event body for `loop-route`."));
-        assert!(error.contains("plan"));
-        assert!(error.contains("build"));
+        assert!(error.contains("alpha"));
+        assert!(error.contains("beta"));
     }
 
     #[test]
@@ -682,22 +682,22 @@ prompts:
         let temp = tempfile::tempdir().unwrap();
         let run_dir = Utf8PathBuf::from_path_buf(temp.path().join("run")).unwrap();
         fs::create_dir_all(run_dir.as_std_path()).unwrap();
-        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("plan-build.yml")).unwrap();
+        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("route-test.yml")).unwrap();
         fs::write(
             workflow_path.as_std_path(),
             r#"
 version: 1
-workflow_id: plan-build
-title: Plan Build
-entrypoint: plan
+workflow_id: route-test
+title: Route Test
+entrypoint: alpha
 prompts:
-  plan:
-    title: Plan
+  alpha:
+    title: Alpha
     is_interactive: false
     fallback-route: no-route-error
     prompt: hello
-  build:
-    title: Build
+  beta:
+    title: Beta
     is_interactive: false
     fallback-route: no-route-error
     prompt: world
@@ -710,26 +710,26 @@ prompts:
             project_dir: Utf8PathBuf::from("/tmp/project"),
             run_dir,
             prompt_path: Some(workflow_path),
-            prompt_name: "plan".to_owned(),
+            prompt_name: "alpha".to_owned(),
         };
 
-        validate_loop_route_body("build", &context).unwrap();
+        validate_loop_route_body("beta", &context).unwrap();
     }
 
     #[test]
     fn unsupported_loop_events_are_rejected() {
         let temp = tempfile::tempdir().unwrap();
-        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("plan-build.yml")).unwrap();
+        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("route-test.yml")).unwrap();
         fs::write(
             workflow_path.as_std_path(),
             r#"
 version: 1
-workflow_id: plan-build
-title: Plan Build
-entrypoint: plan
+workflow_id: route-test
+title: Route Test
+entrypoint: alpha
 prompts:
-  plan:
-    title: Plan
+  alpha:
+    title: Alpha
     is_interactive: false
     fallback-route: no-route-error
     prompt: hello
@@ -743,9 +743,9 @@ prompts:
             &EmitContext {
                 run_id: "run-1".to_owned(),
                 project_dir: Utf8PathBuf::from("/tmp/project"),
-                run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+                run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
                 prompt_path: Some(workflow_path),
-                prompt_name: "plan".to_owned(),
+                prompt_name: "alpha".to_owned(),
             },
         )
         .unwrap_err()
@@ -759,17 +759,17 @@ prompts:
     #[test]
     fn non_loop_events_are_allowed_without_validation() {
         let temp = tempfile::tempdir().unwrap();
-        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("plan-build.yml")).unwrap();
+        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("route-test.yml")).unwrap();
         fs::write(
             workflow_path.as_std_path(),
             r#"
 version: 1
-workflow_id: plan-build
-title: Plan Build
-entrypoint: plan
+workflow_id: route-test
+title: Route Test
+entrypoint: alpha
 prompts:
-  plan:
-    title: Plan
+  alpha:
+    title: Alpha
     is_interactive: false
     fallback-route: no-route-error
     prompt: hello
@@ -783,9 +783,9 @@ prompts:
             &EmitContext {
                 run_id: "run-1".to_owned(),
                 project_dir: Utf8PathBuf::from("/tmp/project"),
-                run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+                run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
                 prompt_path: Some(workflow_path),
-                prompt_name: "plan".to_owned(),
+                prompt_name: "alpha".to_owned(),
             },
         )
         .unwrap();
@@ -794,7 +794,7 @@ prompts:
     #[test]
     fn emit_context_derives_run_id_and_project_dir_from_run_dir() {
         let context = build_emit_context(
-            Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+            Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
             None,
             None,
             None,
@@ -806,7 +806,7 @@ prompts:
         assert_eq!(context.project_dir, Utf8PathBuf::from("/tmp/project"));
         assert_eq!(
             context.run_dir,
-            Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1")
+            Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1")
         );
         assert!(context.prompt_path.is_none());
         assert!(context.prompt_name.is_empty());
@@ -815,7 +815,7 @@ prompts:
     #[test]
     fn emit_context_rejects_mismatched_run_id_and_run_dir() {
         let error = build_emit_context(
-            Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+            Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
             Some("run-2".to_owned()),
             None,
             None,
@@ -830,7 +830,7 @@ prompts:
     #[test]
     fn emit_context_rejects_mismatched_project_dir_and_run_dir() {
         let error = build_emit_context(
-            Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+            Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
             None,
             Some(Utf8PathBuf::from("/tmp/other-project")),
             None,
@@ -848,13 +848,13 @@ prompts:
     fn loop_route_requires_prompt_path_context() {
         let error = validate_emit_args(
             "loop-route",
-            "build",
+            "beta",
             &EmitContext {
                 run_id: "run-1".to_owned(),
                 project_dir: Utf8PathBuf::from("/tmp/project"),
-                run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+                run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
                 prompt_path: None,
-                prompt_name: "plan".to_owned(),
+                prompt_name: "alpha".to_owned(),
             },
         )
         .unwrap_err()
@@ -871,7 +871,7 @@ prompts:
             &RunArgs {
                 cli: false,
                 runtime: RuntimeArgs::default(),
-                workflow: "task-based".to_owned(),
+                workflow: "fixture-flow".to_owned(),
                 workflow_options: Default::default(),
                 request_args: RequestArgs::default(),
             },
@@ -891,7 +891,7 @@ prompts:
             &RunArgs {
                 cli: false,
                 runtime: RuntimeArgs::default(),
-                workflow: "task-based".to_owned(),
+                workflow: "fixture-flow".to_owned(),
                 workflow_options: Default::default(),
                 request_args: RequestArgs {
                     request_file: None,
@@ -901,7 +901,7 @@ prompts:
         )
         .unwrap();
 
-        assert_eq!(launch.preset_workflow.as_deref(), Some("task-based"));
+        assert_eq!(launch.preset_workflow.as_deref(), Some("fixture-flow"));
         let preload = launch.preloaded_request.expect("preloaded request");
         assert_eq!(preload.source, TuiRequestSource::Argv);
         assert_eq!(preload.text, "fix tests");
@@ -912,7 +912,7 @@ prompts:
     fn run_usage_errors_include_workflow_help() {
         with_test_workflow_home(|| {
             let error = maybe_with_run_help(
-                "task-based",
+                "fixture-flow",
                 anyhow!(
                     "opening the runner TUI requires both a workflow and a request; use `ralph run <workflow-id> \"your request\"` or `ralph run <workflow-id> --file REQ.md`"
                 ),
@@ -923,8 +923,8 @@ prompts:
                 rendered.contains("opening the runner TUI requires both a workflow and a request")
             );
             assert!(rendered.contains("Usage:"));
-            assert!(rendered.contains("ralph run task-based"));
-            assert!(rendered.contains("--progressfile"));
+            assert!(rendered.contains("ralph run fixture-flow"));
+            assert!(rendered.contains("--statefile"));
         });
     }
 }

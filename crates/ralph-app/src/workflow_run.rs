@@ -722,24 +722,24 @@ mod tests {
         fs::create_dir_all(config_home.join("workflows")).unwrap();
         let _config_home = ScopedConfigHome::new(&config_home).await;
         fs::write(
-            config_home.join("workflows/plan-build.yml"),
+            config_home.join("workflows/route-test.yml"),
             r#"
 version: 1
-workflow_id: plan-build
-title: Plan Build
-entrypoint: plan
+workflow_id: route-test
+title: Route Test
+entrypoint: alpha
 request:
   runtime:
     argv: true
 prompts:
-  plan:
-    title: Plan
+  alpha:
+    title: Alpha
     is_interactive: false
     fallback-route: no-route-error
     prompt: |
       request={ralph-request}
-  build:
-    title: Build
+  beta:
+    title: Beta
     is_interactive: false
     fallback-route: no-route-error
     prompt: |
@@ -749,7 +749,7 @@ prompts:
 
         let runner = WorkflowSpyRunner {
             events: Arc::new(Mutex::new(vec![
-                vec![("loop-route".to_owned(), "build".to_owned())],
+                vec![("loop-route".to_owned(), "beta".to_owned())],
                 vec![("loop-stop:ok".to_owned(), "done".to_owned())],
             ])),
             ..Default::default()
@@ -766,7 +766,7 @@ prompts:
 
         let summary = app
             .run_workflow(
-                "plan-build",
+                "route-test",
                 WorkflowRunInput {
                     request: WorkflowRequestInput {
                         argv: Some("ship it".to_owned()),
@@ -779,7 +779,7 @@ prompts:
             .await?;
 
         let invocations = runner.invocations.lock().unwrap().clone();
-        assert_eq!(summary.workflow_id, "plan-build");
+        assert_eq!(summary.workflow_id, "route-test");
         assert_eq!(summary.status, ralph_core::LastRunStatus::Completed);
         assert_eq!(invocations.len(), 2);
         assert!(invocations[0].prompt_text.contains("request=ship it"));
@@ -796,18 +796,18 @@ prompts:
         fs::create_dir_all(config_home.join("workflows")).unwrap();
         let _config_home = ScopedConfigHome::new(&config_home).await;
         fs::write(
-            config_home.join("workflows/pdd.yml"),
+            config_home.join("workflows/interactive-flow.yml"),
             r#"
 version: 1
-workflow_id: pdd
-title: Pdd
-entrypoint: pdd
+workflow_id: interactive-flow
+title: Interactive Flow
+entrypoint: main
 request:
   runtime:
     argv: true
 prompts:
-  pdd:
-    title: Pdd
+  main:
+    title: Main
     is_interactive: true
     fallback-route: no-route-ok
     prompt: |
@@ -820,7 +820,7 @@ prompts:
         let mut delegate = TestDelegate::default();
         let summary = app
             .run_workflow(
-                "pdd",
+                "interactive-flow",
                 WorkflowRunInput {
                     request: WorkflowRequestInput {
                         argv: Some("rough idea".to_owned()),
@@ -854,19 +854,19 @@ prompts:
         fs::create_dir_all(config_home.join("workflows")).unwrap();
         let _config_home = ScopedConfigHome::new(&config_home).await;
         fs::write(
-            config_home.join("workflows/pdd.yml"),
+            config_home.join("workflows/interactive-flow.yml"),
             r#"
 version: 1
-workflow_id: pdd
-title: Pdd
-entrypoint: pdd
+workflow_id: interactive-flow
+title: Interactive Flow
+entrypoint: main
 request:
   runtime:
     argv: true
     stdin: true
 prompts:
-  pdd:
-    title: Pdd
+  main:
+    title: Main
     is_interactive: true
     fallback-route: no-route-ok
     prompt: |
@@ -883,7 +883,7 @@ prompts:
         let mut delegate = TestDelegate::default();
         let error = app
             .run_workflow(
-                "pdd",
+                "interactive-flow",
                 WorkflowRunInput {
                     request: WorkflowRequestInput {
                         stdin: Some("rough idea".to_owned()),
@@ -908,15 +908,15 @@ prompts:
         fs::create_dir_all(config_home.join("workflows")).unwrap();
         let _config_home = ScopedConfigHome::new(&config_home).await;
         fs::write(
-            config_home.join("workflows/task-based.yml"),
+            config_home.join("workflows/option-flow.yml"),
             r#"
 version: 1
-workflow_id: task-based
-title: Task Based
+workflow_id: option-flow
+title: Option Flow
 entrypoint: main
 options:
-  progress-file:
-    default: progress.txt
+  state-file:
+    default: state.txt
 request:
   runtime:
     argv: true
@@ -926,7 +926,7 @@ prompts:
     is_interactive: false
     fallback-route: no-route-error
     prompt: |
-      progress={ralph-option:progress-file}
+      state={ralph-option:state-file}
       request={ralph-request}
 "#,
         )?;
@@ -942,15 +942,15 @@ prompts:
         let mut delegate = TestDelegate::default();
 
         app.run_workflow(
-            "task-based",
+            "option-flow",
             WorkflowRunInput {
                 request: WorkflowRequestInput {
                     argv: Some("ship it".to_owned()),
                     ..Default::default()
                 },
                 options: BTreeMap::from([(
-                    "progress-file".to_owned(),
-                    "custom-progress.txt".to_owned(),
+                    "state-file".to_owned(),
+                    "custom-state.txt".to_owned(),
                 )]),
             },
             &mut delegate,
@@ -961,7 +961,7 @@ prompts:
         assert!(
             invocation
                 .prompt_text
-                .contains("progress=custom-progress.txt")
+                .contains("state=custom-state.txt")
         );
         assert!(invocation.prompt_text.contains("request=ship it"));
         Ok(())

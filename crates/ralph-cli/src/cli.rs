@@ -660,12 +660,13 @@ mod tests {
     #[test]
     fn run_subcommand_parses_positional_workflow_and_request() {
         with_test_workflow_home(|| {
-            let cli = Cli::try_parse_from(["ralph", "run", "task-based", "fix", "tests"]).unwrap();
+            let cli =
+                Cli::try_parse_from(["ralph", "run", "fixture-flow", "fix", "tests"]).unwrap();
 
             let Commands::Run(args) = cli.command else {
                 panic!("expected run subcommand");
             };
-            assert_eq!(args.workflow, "task-based");
+            assert_eq!(args.workflow, "fixture-flow");
             assert_eq!(
                 args.request_args.request,
                 vec!["fix".to_owned(), "tests".to_owned()]
@@ -681,7 +682,7 @@ mod tests {
                 "run",
                 "--agent",
                 "claude",
-                "task-based",
+                "fixture-flow",
                 "ship",
                 "it",
             ])
@@ -690,7 +691,7 @@ mod tests {
             let Commands::Run(args) = cli.command else {
                 panic!("expected run subcommand");
             };
-            assert_eq!(args.workflow, "task-based");
+            assert_eq!(args.workflow, "fixture-flow");
             assert_eq!(args.runtime.agent.as_deref(), Some("claude"));
             assert_eq!(
                 args.request_args.request,
@@ -703,12 +704,12 @@ mod tests {
     fn run_subcommand_parses_request_file() {
         with_test_workflow_home(|| {
             let cli =
-                Cli::try_parse_from(["ralph", "run", "task-based", "--file", "REQ.md"]).unwrap();
+                Cli::try_parse_from(["ralph", "run", "fixture-flow", "--file", "REQ.md"]).unwrap();
 
             let Commands::Run(args) = cli.command else {
                 panic!("expected run subcommand");
             };
-            assert_eq!(args.workflow, "task-based");
+            assert_eq!(args.workflow, "fixture-flow");
             assert_eq!(
                 args.request_args.request_file,
                 Some(camino::Utf8PathBuf::from("REQ.md"))
@@ -719,14 +720,14 @@ mod tests {
     #[test]
     fn run_subcommand_parses_cli_flag() {
         with_test_workflow_home(|| {
-            let cli = Cli::try_parse_from(["ralph", "run", "--cli", "task-based", "fix", "tests"])
+            let cli = Cli::try_parse_from(["ralph", "run", "--cli", "fixture-flow", "fix", "tests"])
                 .unwrap();
 
             let Commands::Run(args) = cli.command else {
                 panic!("expected run subcommand");
             };
             assert!(args.cli);
-            assert_eq!(args.workflow, "task-based");
+            assert_eq!(args.workflow, "fixture-flow");
         });
     }
 
@@ -736,9 +737,9 @@ mod tests {
             let cli = Cli::try_parse_from([
                 "ralph",
                 "run",
-                "task-based",
-                "--progressfile",
-                "handoff.md",
+                "fixture-flow",
+                "--statefile",
+                "snapshot.md",
                 "fix",
                 "tests",
             ])
@@ -749,9 +750,9 @@ mod tests {
             };
             assert_eq!(
                 args.workflow_options
-                    .get("progress-file")
+                    .get("state-file")
                     .map(String::as_str),
-                Some("handoff.md")
+                Some("snapshot.md")
             );
         });
     }
@@ -759,12 +760,12 @@ mod tests {
     #[test]
     fn workflow_help_includes_declared_options() {
         with_test_workflow_home(|| {
-            let error = Cli::try_parse_from(["ralph", "run", "task-based", "--help"]).unwrap_err();
+            let error = Cli::try_parse_from(["ralph", "run", "fixture-flow", "--help"]).unwrap_err();
             let rendered = error.to_string();
 
             assert_eq!(error.kind(), ErrorKind::DisplayHelp);
-            assert!(rendered.contains("--progressfile"));
-            assert!(rendered.contains("progress.txt"));
+            assert!(rendered.contains("--statefile"));
+            assert!(rendered.contains("state.txt"));
         });
     }
 
@@ -794,7 +795,7 @@ mod tests {
         with_test_workflow_home(|| {
             assert!(Cli::try_parse_from(["ralph", "ls", "--agent", "claude"]).is_err());
             assert!(
-                Cli::try_parse_from(["ralph", "show", "--max-iterations", "3", "task-based"])
+                Cli::try_parse_from(["ralph", "show", "--max-iterations", "3", "fixture-flow"])
                     .is_err()
             );
         });

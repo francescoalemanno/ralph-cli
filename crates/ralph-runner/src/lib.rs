@@ -611,8 +611,8 @@ mod tests {
 
     #[test]
     fn mode_uses_prompt_stem_for_file_backed_prompts() {
-        assert_eq!(super::invocation_mode("task-based.yml"), "task-based");
-        assert_eq!(super::invocation_mode("plan-build.yml"), "plan-build");
+        assert_eq!(super::invocation_mode("fixture-flow.yml"), "fixture-flow");
+        assert_eq!(super::invocation_mode("review-loop.yml"), "review-loop");
         assert_eq!(
             super::invocation_mode("plan_driven_build"),
             "plan_driven_build"
@@ -620,19 +620,19 @@ mod tests {
     }
 
     #[test]
-    fn mode_template_is_distinct_from_prompt_name() {
+    fn mode_template_uses_prompt_name_stem() {
         let context = TemplateContext::from_invocation(RunnerInvocation {
             run_id: "run-1".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
-            run_dir: "/tmp/project/.ralph/runs/task-based/run-1".into(),
-            prompt_path: "/tmp/.config/ralph/workflows/task-based.yml".into(),
-            prompt_name: "task".to_owned(),
+            run_dir: "/tmp/project/.ralph/runs/fixture-flow/run-1".into(),
+            prompt_path: "/tmp/.config/ralph/workflows/fixture-flow.yml".into(),
+            prompt_name: "fixture-flow.yml".to_owned(),
         });
 
         let rendered = render_template("{prompt_name}|{mode}", &context, "/tmp/prompt.txt");
 
-        assert_eq!(rendered, "task|task");
+        assert_eq!(rendered, "fixture-flow.yml|fixture-flow");
     }
 
     #[test]
@@ -641,7 +641,7 @@ mod tests {
             session_name: "workflow_goal_interview".to_owned(),
             initial_prompt: "hello".to_owned(),
             project_dir: Utf8PathBuf::from("/tmp/project"),
-            run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/pdd/run-1"),
+            run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/interactive-flow/run-1"),
             run_id: None,
             prompt_path: None,
         });
@@ -671,8 +671,8 @@ mod tests {
             run_id: "run-1".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
-            run_dir: "/tmp/project/.ralph/runs/task-based/run-1".into(),
-            prompt_path: "/tmp/.config/ralph/workflows/task-based.yml".into(),
+            run_dir: "/tmp/project/.ralph/runs/fixture-flow/run-1".into(),
+            prompt_path: "/tmp/.config/ralph/workflows/fixture-flow.yml".into(),
             prompt_name: "task".to_owned(),
         });
         let rendered = render_template("X={prompt} Y={prompt_file}", &context, "/tmp/prompt.txt");
@@ -685,8 +685,8 @@ mod tests {
             run_id: "run-1".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
-            run_dir: "/tmp/project/.ralph/runs/task-based/run-1".into(),
-            prompt_path: "/tmp/.config/ralph/workflows/task-based.yml".into(),
+            run_dir: "/tmp/project/.ralph/runs/fixture-flow/run-1".into(),
+            prompt_path: "/tmp/.config/ralph/workflows/fixture-flow.yml".into(),
             prompt_name: "task".to_owned(),
         });
         let config = ralph_core::RunnerConfig {
@@ -707,7 +707,7 @@ mod tests {
             "RALPH_BIN must be present as an absolute path"
         );
         assert!(envs.iter().any(|(key, value)| {
-            key == "RALPH_RUN_DIR" && value == "/tmp/project/.ralph/runs/task-based/run-1"
+            key == "RALPH_RUN_DIR" && value == "/tmp/project/.ralph/runs/fixture-flow/run-1"
         }));
     }
 

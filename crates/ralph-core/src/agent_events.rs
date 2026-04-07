@@ -162,8 +162,8 @@ mod tests {
             event: event.to_owned(),
             body: body.to_owned(),
             project_dir: Utf8PathBuf::from("/tmp/project"),
-            run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/task-based/run-1"),
-            prompt_path: Utf8PathBuf::from("/tmp/.config/ralph/workflows/task-based.yml"),
+            run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/fixture-flow/run-1"),
+            prompt_path: Utf8PathBuf::from("/tmp/.config/ralph/workflows/fixture-flow.yml"),
             prompt_name: "task".to_owned(),
             pid: 123,
         }
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn wal_path_lives_under_run_runtime_dir() {
-        let run_dir = Utf8PathBuf::from("/tmp/project/.ralph/runs/task-based/run-1");
+        let run_dir = Utf8PathBuf::from("/tmp/project/.ralph/runs/fixture-flow/run-1");
         assert_eq!(
             agent_events_wal_path(&run_dir),
             run_dir
