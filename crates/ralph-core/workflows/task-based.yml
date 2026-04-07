@@ -1,0 +1,39 @@
+version: 1
+workflow_id: task-based
+title: Task Based
+description: Execute one high-priority task at a time against a supplied request list.
+entrypoint: main
+options:
+  progress-file:
+    help: Progress file to read before work and update before handing off.
+    default: progress.txt
+    value_name: FILE
+request:
+  runtime:
+    argv: true
+    stdin: true
+    file_flag: true
+prompts:
+  main:
+    title: Task Based
+    is_interactive: false
+    fallback-route: main
+    prompt: |
+      # Execution policy
+      1. Study `{ralph-option:progress-file}`.
+      2. Study the existing source code.
+      3. Find the single most high-leverage item in the requests.
+         - If none found, run `$RALPH_BIN emit loop-stop:ok found-no-open-task`, goto 7. Stop.
+      4. Execute ONLY the chosen high-priority item.
+      5. Update `{ralph-option:progress-file}` with completed work and new findings such that the next worker can continue seamlessly.
+      6. After finishing 4 and 5: run `$RALPH_BIN emit loop-continue handoff-to-next-worker`, goto 7. Stop.
+      7. Stop.
+
+      # Constraints
+      1. NEVER assume that something is not-implemented, study the source code.
+      2. YAGNI ruthlessly - no speculative features
+      3. ALWAYS classify the high priority item into RIGHT-SIZED <-> COMPLEX
+      4. ALWAYS check if item is COMPLEX, if it is: break it up into RIGHT-SIZED sub-items, you MUST ONLY execute the highest priority right-sized sub-task.
+
+      # REQUESTS
+      {ralph-request}

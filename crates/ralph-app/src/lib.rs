@@ -1,27 +1,22 @@
 mod console;
-mod interactive;
 mod prompt;
-mod prompt_run;
-mod run;
-mod workflow;
 mod workflow_run;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
-    AgentConfig, AppConfig, LastRunStatus, PromptFile, ScaffoldId, TargetReview, TargetStore,
-    TargetSummary,
+    AgentConfig, AppConfig, LastRunStatus, RunnerConfig, WorkflowDefinition, WorkflowSummary,
+    list_workflows, load_workflow,
 };
-use ralph_runner::CommandRunner;
-use workflow::PLAN_DRIVEN_GOAL_FILE;
+use ralph_runner::{
+    CommandRunner, InteractiveSessionInvocation, InteractiveSessionOutcome, RunnerAdapter,
+};
 
 pub use console::ConsoleDelegate;
-pub use workflow::{
-    WorkflowAction, WorkflowDerivedState, WorkflowKind, WorkflowRunAdvice, WorkflowStatus,
-};
+pub use workflow_run::{WorkflowRequestInput, WorkflowRunInput};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum RunEvent {
     IterationStarted {
         prompt_name: String,
@@ -53,12 +48,19 @@ pub fn format_iteration_banner(
 #[async_trait]
 pub trait RunDelegate: Send {
     async fn on_event(&mut self, event: RunEvent) -> Result<()>;
+
+    async fn run_interactive_session(
+        &mut self,
+        _config: &RunnerConfig,
+        _invocation: &InteractiveSessionInvocation,
+    ) -> Result<Option<InteractiveSessionOutcome>> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct RalphApp<R = CommandRunner> {
     project_dir: Utf8PathBuf,
-    store: TargetStore,
     config: AppConfig,
     runner: R,
 }
@@ -68,7 +70,6 @@ impl RalphApp<CommandRunner> {
         let project_dir = project_dir.into();
         let config = AppConfig::load(&project_dir)?;
         Ok(Self {
-            store: TargetStore::new(project_dir.clone()),
             project_dir,
             config,
             runner: CommandRunner,
@@ -80,7 +81,6 @@ impl<R> RalphApp<R> {
     #[cfg(test)]
     pub(crate) fn new(project_dir: Utf8PathBuf, config: AppConfig, runner: R) -> Self {
         Self {
-            store: TargetStore::new(project_dir.clone()),
             project_dir,
             config,
             runner,
@@ -133,114 +133,35 @@ impl<R> RalphApp<R> {
         &self.project_dir
     }
 
-    pub fn list_targets(&self) -> Result<Vec<TargetSummary>> {
-        self.store.list_targets()
+    pub fn list_workflows(&self) -> Result<Vec<WorkflowSummary>> {
+        list_workflows()
     }
 
-    pub fn create_target(
+    pub fn load_workflow(&self, workflow_id: &str) -> Result<WorkflowDefinition> {
+        load_workflow(workflow_id)
+    }
+
+    pub fn resolve_workflow_edit_path(&self, workflow_id: &str) -> Result<Utf8PathBuf> {
+        self.load_workflow(workflow_id)?
+            .source_path()
+            .map(Utf8Path::to_path_buf)
+            .ok_or_else(|| anyhow!("workflow '{}' does not have a source path", workflow_id))
+    }
+
+    pub fn read_utf8_file(&self, path: &Utf8Path) -> Result<String> {
+        std::fs::read_to_string(path).map_err(|error| anyhow!("failed to read {}: {error}", path))
+    }
+}
+
+impl<R> RalphApp<R>
+where
+    R: RunnerAdapter,
+{
+    pub fn run_interactive_session_with_config(
         &self,
-        target_id: &str,
-        scaffold: Option<ScaffoldId>,
-    ) -> Result<TargetSummary> {
-        self.store.create_target(target_id, scaffold)
-    }
-
-    pub fn review_target(&self, target: &str) -> Result<TargetReview> {
-        self.store.review_target(target)
-    }
-
-    pub fn delete_target(&self, target: &str) -> Result<()> {
-        self.store.delete_target(target)
-    }
-
-    pub fn resolve_target_edit_path(
-        &self,
-        target: &str,
-        requested_file: Option<&str>,
-    ) -> Result<Utf8PathBuf> {
-        let config = self.store.read_target_config(target)?;
-        let target_dir = self.store.target_paths(target)?.dir;
-
-        if config.uses_hidden_workflow() {
-            return match requested_file {
-                None | Some(PLAN_DRIVEN_GOAL_FILE) => Ok(target_dir.join(PLAN_DRIVEN_GOAL_FILE)),
-                Some(name) => Err(anyhow!(
-                    "workflow targets only expose {PLAN_DRIVEN_GOAL_FILE} for editing, got '{name}'"
-                )),
-            };
-        }
-
-        Ok(self.resolve_prompt(target, requested_file)?.path)
-    }
-
-    fn resolve_prompt(&self, target: &str, prompt_name: Option<&str>) -> Result<PromptFile> {
-        let target_summary = self.store.load_target(target)?;
-        self.select_prompt(&target_summary, prompt_name)
-    }
-
-    fn select_prompt(
-        &self,
-        target_summary: &TargetSummary,
-        prompt_name: Option<&str>,
-    ) -> Result<PromptFile> {
-        if target_summary.uses_hidden_workflow() {
-            return Err(anyhow!(
-                "target '{}' uses a workflow mode and does not expose runnable prompts",
-                target_summary.id
-            ));
-        }
-
-        if target_summary.prompt_files.is_empty() {
-            return Err(anyhow!(
-                "target '{}' has no runnable prompt files",
-                target_summary.id
-            ));
-        }
-
-        if let Some(prompt_name) = prompt_name {
-            return target_summary
-                .prompt_files
-                .iter()
-                .find(|prompt| prompt.name == prompt_name)
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "prompt '{prompt_name}' does not exist for '{}'",
-                        target_summary.id
-                    )
-                });
-        }
-
-        if let Some(last_prompt) = &target_summary.last_prompt
-            && let Some(prompt) = target_summary
-                .prompt_files
-                .iter()
-                .find(|prompt| &prompt.name == last_prompt)
-        {
-            return Ok(prompt.clone());
-        }
-
-        if let Some(prompt) = target_summary
-            .prompt_files
-            .iter()
-            .find(|prompt| prompt.name == "prompt_main.md")
-        {
-            return Ok(prompt.clone());
-        }
-
-        if target_summary.prompt_files.len() == 1 {
-            return Ok(target_summary.prompt_files[0].clone());
-        }
-
-        let available = target_summary
-            .prompt_files
-            .iter()
-            .map(|prompt| prompt.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        Err(anyhow!(
-            "target '{}' has multiple prompt files; choose one with --prompt ({available})",
-            target_summary.id
-        ))
+        config: &RunnerConfig,
+        invocation: &InteractiveSessionInvocation,
+    ) -> Result<InteractiveSessionOutcome> {
+        self.runner.run_interactive_session(config, invocation)
     }
 }

@@ -1,0 +1,17 @@
+version: 1
+workflow_id: bare
+title: Bare
+description: Loop the supplied request verbatim with no extra workflow scaffolding.
+entrypoint: main
+request:
+  runtime:
+    argv: true
+    stdin: true
+    file_flag: true
+prompts:
+  main:
+    title: Bare
+    is_interactive: false
+    fallback-route: main
+    prompt: |
+      {ralph-request}

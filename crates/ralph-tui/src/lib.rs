@@ -1,45 +1,71 @@
 mod editor;
 mod ui;
-mod view;
 
-use std::{
-    io,
-    sync::mpsc::{self, Receiver, Sender},
-    time::Duration,
-};
+use std::collections::BTreeMap;
+use std::io;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use camino::{Utf8Path, Utf8PathBuf};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent,
-        KeyEventKind, MouseEvent, MouseEventKind,
+        KeyEventKind, KeyModifiers,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 pub use editor::edit_file;
 use ralph_app::{
-    RalphApp, RunDelegate, RunEvent, WorkflowAction, WorkflowRunAdvice, WorkflowStatus,
+    RalphApp, RunDelegate, RunEvent, WorkflowRequestInput, WorkflowRunInput,
+    format_iteration_banner,
 };
 use ralph_core::{
-    LastRunStatus, RunControl, ScaffoldId, TargetReview, TargetSummary, WorkflowMode,
+    LastRunStatus, RunControl, RunnerConfig, WorkflowDefinition, WorkflowRunSummary,
+    WorkflowRuntimeRequest, atomic_write,
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
-use tokio::runtime::Handle;
-use ui::{normalize_terminal_text, resume_terminal, suspend_terminal};
+use ralph_runner::{InteractiveSessionInvocation, InteractiveSessionOutcome};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, Paragraph, Wrap},
+};
+use tokio::{runtime::Handle, sync::oneshot};
+use ui::{
+    normalize_terminal_text, resolved_accent_color, resolved_success_color, resolved_warning_color,
+    resume_terminal, styled_title, suspend_terminal,
+};
 
 const RUNNING_SCROLLBACK_LIMIT: usize = 100_000;
 
+#[derive(Debug, Clone, Default)]
+pub struct TuiLaunchOptions {
+    pub preset_workflow: Option<String>,
+    pub preloaded_request: Option<TuiPreloadedRequest>,
+    pub workflow_options: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TuiPreloadedRequest {
+    pub source: TuiRequestSource,
+    pub text: String,
+    pub file_path: Option<Utf8PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiRequestSource {
+    Argv,
+    File,
+}
+
 pub fn run_tui(app: RalphApp) -> Result<()> {
-    run_tui_with_target(app, None)
+    run_tui_with_options(app, TuiLaunchOptions::default())
 }
 
-pub fn run_tui_scoped(app: RalphApp, target: &str) -> Result<()> {
-    run_tui_with_target(app, Some(target.to_owned()))
-}
-
-fn run_tui_with_target(app: RalphApp, target: Option<String>) -> Result<()> {
+pub fn run_tui_with_options(app: RalphApp, launch: TuiLaunchOptions) -> Result<()> {
     let handle = Handle::current();
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("failed to create terminal backend")?;
@@ -61,7 +87,7 @@ fn run_tui_with_target(app: RalphApp, target: Option<String>) -> Result<()> {
         return Err(error);
     }
 
-    let result = TuiApp::new(app, handle, target).run(&mut terminal);
+    let result = TuiApp::new(app, handle, launch)?.run(&mut terminal);
 
     disable_raw_mode().ok();
     execute!(
@@ -75,50 +101,50 @@ fn run_tui_with_target(app: RalphApp, target: Option<String>) -> Result<()> {
 }
 
 enum UiEvent {
-    Tick,
     RunEvent(RunEvent),
-    RunDone(Result<TargetSummary, String>),
+    RunDone(Result<WorkflowRunSummary, String>),
+    InteractiveSession {
+        config: RunnerConfig,
+        invocation: InteractiveSessionInvocation,
+        reply: oneshot::Sender<Result<InteractiveSessionOutcome, String>>,
+    },
 }
 
-enum Screen {
-    Dashboard,
-    NewTarget,
-    Running,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    RequestText,
+    RequestFile,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ConfirmationAction {
-    DeleteTarget { target_id: String },
-    RebuildWorkflow { target_id: String },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestMode {
+    Text,
+    File,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ConfirmationDialog {
-    title: String,
-    body: String,
-    action: ConfirmationAction,
-    confirm_selected: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestOrigin {
+    None,
+    Typed,
+    Argv,
+    File,
+    Draft,
 }
 
-impl ConfirmationDialog {
-    fn new(title: impl Into<String>, body: impl Into<String>, action: ConfirmationAction) -> Self {
-        Self {
-            title: title.into(),
-            body: body.into(),
-            action,
-            confirm_selected: false,
+impl RequestOrigin {
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "missing",
+            Self::Typed => "typed",
+            Self::Argv => "argv",
+            Self::File => "file",
+            Self::Draft => "draft file",
         }
-    }
-
-    fn toggle_selection(&mut self) {
-        self.confirm_selected = !self.confirm_selected;
     }
 }
 
 struct RunningState {
-    target_id: String,
     prompt_name: String,
-    requested_prompt: Option<String>,
     iteration: usize,
     max_iterations: usize,
     control: RunControl,
@@ -129,21 +155,15 @@ struct RunningState {
     status: Option<LastRunStatus>,
     scroll: usize,
     follow: bool,
+    last_summary: String,
 }
 
 impl RunningState {
-    fn new(
-        target_id: String,
-        prompt_name: String,
-        requested_prompt: Option<String>,
-        control: RunControl,
-    ) -> Self {
+    fn new(control: RunControl) -> Self {
         let terminal_rows = 24;
         let terminal_cols = 80;
         Self {
-            target_id,
-            prompt_name,
-            requested_prompt,
+            prompt_name: String::new(),
             iteration: 0,
             max_iterations: 0,
             control,
@@ -154,11 +174,13 @@ impl RunningState {
             status: None,
             scroll: 0,
             follow: true,
+            last_summary: String::new(),
         }
     }
 
-    fn finish(&mut self, status: LastRunStatus) {
+    fn finish(&mut self, status: LastRunStatus, summary: impl Into<String>) {
         self.status = Some(status);
+        self.last_summary = summary.into();
     }
 
     fn is_finished(&self) -> bool {
@@ -192,340 +214,145 @@ impl RunningState {
 struct TuiApp {
     app: RalphApp,
     handle: Handle,
-    tx: Sender<UiEvent>,
-    rx: Receiver<UiEvent>,
-    targets: Vec<TargetSummary>,
-    selected_target_review: Option<TargetReview>,
-    selected_target: usize,
-    selected_prompt: usize,
-    screen: Screen,
-    new_target_name: String,
-    new_scaffold: ScaffoldId,
+    tx: std::sync::mpsc::Sender<UiEvent>,
+    rx: std::sync::mpsc::Receiver<UiEvent>,
+    workflow_id: String,
+    workflow: WorkflowDefinition,
+    focus: Focus,
+    request_mode: RequestMode,
+    request_text: String,
+    request_file: String,
+    request_origin: RequestOrigin,
+    workflow_options: BTreeMap<String, String>,
     message: String,
     running: Option<RunningState>,
-    confirmation: Option<ConfirmationDialog>,
-    tick_count: u64,
+    auto_start_run: bool,
 }
 
 impl TuiApp {
-    fn selected_target_uses_hidden_workflow(&self) -> bool {
-        self.selected_target()
-            .is_some_and(ralph_core::TargetSummary::uses_hidden_workflow)
-    }
-
-    fn selected_workflow_status(&self) -> Option<WorkflowStatus> {
-        let target = self.selected_target()?;
-        self.app.workflow_status(&target.id).ok().flatten()
-    }
-
-    fn new(app: RalphApp, handle: Handle, target: Option<String>) -> Self {
-        let (tx, rx) = mpsc::channel();
+    fn new(app: RalphApp, handle: Handle, launch: TuiLaunchOptions) -> Result<Self> {
+        let workflow_id = launch
+            .preset_workflow
+            .ok_or_else(|| anyhow!("opening the runner TUI requires a workflow id"))?;
+        let workflow = app.load_workflow(&workflow_id)?;
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut this = Self {
             app,
             handle,
             tx,
             rx,
-            targets: Vec::new(),
-            selected_target_review: None,
-            selected_target: 0,
-            selected_prompt: 0,
-            screen: Screen::Dashboard,
-            new_target_name: String::new(),
-            new_scaffold: ScaffoldId::TaskDriven,
+            workflow_id,
+            workflow,
+            focus: Focus::RequestText,
+            request_mode: RequestMode::Text,
+            request_text: String::new(),
+            request_file: String::new(),
+            request_origin: RequestOrigin::None,
+            workflow_options: launch.workflow_options,
             message: String::new(),
             running: None,
-            confirmation: None,
-            tick_count: 0,
+            auto_start_run: false,
         };
-        this.reload_targets();
-        if let Some(target) = target {
-            if let Some(index) = this.targets.iter().position(|summary| summary.id == target) {
-                this.selected_target = index;
-                this.refresh_selected_target_review();
-            } else {
-                this.message = format!("target '{target}' was not found");
-            }
+        let has_preloaded_request = launch.preloaded_request.is_some();
+        if let Some(preload) = launch.preloaded_request {
+            this.apply_preloaded_request(preload);
         }
-        this
+        this.sync_request_mode();
+        this.focus = this.request_focus().unwrap_or(Focus::RequestText);
+        this.auto_start_run = has_preloaded_request;
+        Ok(this)
     }
 
     fn run(mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            loop {
-                if tx.send(UiEvent::Tick).is_err() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(150));
-            }
-        });
+        if self.auto_start_run {
+            self.auto_start_run = false;
+            self.start_run()?;
+        }
 
         loop {
             terminal.draw(|frame| self.draw(frame))?;
-            if event::poll(Duration::from_millis(50)).context("failed while polling input")? {
+            if event::poll(std::time::Duration::from_millis(50))
+                .context("failed while polling input")?
+            {
                 match event::read().context("failed while reading input")? {
                     CEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                        self.handle_key(key, terminal)?;
-                        if matches!(key.code, KeyCode::Char('q'))
-                            && matches!(self.screen, Screen::Dashboard)
-                            && self.confirmation.is_none()
-                        {
-                            break;
+                        if !self.handle_key(key, terminal)? {
+                            return Ok(());
                         }
                     }
-                    CEvent::Mouse(mouse) => self.handle_mouse(mouse)?,
                     _ => {}
                 }
             }
-
             while let Ok(event) = self.rx.try_recv() {
-                self.handle_ui_event(event);
+                self.handle_ui_event(event, terminal)?;
             }
         }
-
-        Ok(())
     }
 
     fn handle_key(
         &mut self,
         key: KeyEvent,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> Result<()> {
-        match self.screen {
-            Screen::Dashboard => self.handle_dashboard_key(key, terminal),
-            Screen::NewTarget => self.handle_new_target_key(key, terminal),
-            Screen::Running => self.handle_running_key(key, terminal),
-        }
-    }
-
-    fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
-        if !matches!(self.screen, Screen::Running) {
-            return Ok(());
-        }
-
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.scroll_running(3),
-            MouseEventKind::ScrollDown => self.scroll_running(-3),
-            _ => {}
-        }
-
-        Ok(())
-    }
-
-    fn handle_dashboard_key(
-        &mut self,
-        key: KeyEvent,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> Result<()> {
-        if self.confirmation.is_some() {
-            return self.handle_confirmation_key(key);
+    ) -> Result<bool> {
+        if self.running.is_some() {
+            return self.handle_running_key(key, terminal);
         }
 
         match key.code {
-            KeyCode::Up => {
-                self.selected_target = self.selected_target.saturating_sub(1);
-                self.selected_prompt = 0;
-                self.refresh_selected_target_review();
-            }
-            KeyCode::Down => {
-                if self.selected_target + 1 < self.targets.len() {
-                    self.selected_target += 1;
-                    self.selected_prompt = 0;
-                    self.refresh_selected_target_review();
-                }
-            }
-            KeyCode::Left => {
-                self.selected_prompt = self.selected_prompt.saturating_sub(1);
-            }
-            KeyCode::Right => {
-                if let Some(target) = self.selected_target()
-                    && self.selected_prompt + 1 < target.prompt_files.len()
-                {
-                    self.selected_prompt += 1;
-                }
-            }
-            KeyCode::Char('n') => {
-                self.screen = Screen::NewTarget;
-                self.new_target_name.clear();
-                self.new_scaffold = ScaffoldId::TaskDriven;
-            }
+            KeyCode::Char('q') => return Ok(false),
+            KeyCode::Char('a') => self.cycle_agent(None)?,
             KeyCode::Char('r') => self.start_run()?,
-            KeyCode::Char('b') => self.start_workflow_build()?,
-            KeyCode::Char('e') => {
-                let prompt_path = match self.resolve_selected_edit_path() {
-                    Ok(path) => path,
-                    Err(error) => {
-                        self.message = error.to_string();
-                        return Ok(());
-                    }
-                };
-                let editor = self.app.config().editor_override.clone();
-                suspend_terminal(terminal)?;
-                let result = edit_file(&prompt_path, editor.as_deref());
-                resume_terminal(terminal)?;
-                result?;
-                self.refresh_selected_target_review();
-                self.message = format!("opened {}", prompt_path.file_name().unwrap_or("file"));
-            }
-            KeyCode::Char('i') => {
-                self.start_goal_interview(terminal)?;
-            }
-            KeyCode::Char('g') => {
-                self.start_workflow_rebase()?;
-            }
-            KeyCode::Char('x') => {
-                self.confirm_workflow_rebuild()?;
-            }
-            KeyCode::Char('d') => {
-                self.confirm_target_delete();
-            }
-            KeyCode::Char('a') => {
-                self.cycle_agent(None)?;
+            KeyCode::Char('e') => self.edit_request(terminal)?,
+            KeyCode::Left => self.request_mode_left(),
+            KeyCode::Right => self.request_mode_right(),
+            KeyCode::Enter => self.start_run()?,
+            KeyCode::Backspace => self.handle_backspace(),
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                self.handle_text_input(ch)
             }
             _ => {}
         }
-        Ok(())
-    }
 
-    fn handle_confirmation_key(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('n') => {
-                self.confirmation = None;
-            }
-            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
-                if let Some(dialog) = &mut self.confirmation {
-                    dialog.toggle_selection();
-                }
-            }
-            KeyCode::Char('y') => {
-                if let Some(dialog) = &mut self.confirmation {
-                    dialog.confirm_selected = true;
-                }
-            }
-            KeyCode::Enter => {
-                let Some(dialog) = self.confirmation.take() else {
-                    return Ok(());
-                };
-                if dialog.confirm_selected {
-                    self.execute_confirmation(dialog.action)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn handle_new_target_key(
-        &mut self,
-        key: KeyEvent,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> Result<()> {
-        match key.code {
-            KeyCode::Esc => {
-                self.screen = Screen::Dashboard;
-            }
-            KeyCode::Tab => {
-                self.new_scaffold = match self.new_scaffold {
-                    ScaffoldId::TaskDriven => ScaffoldId::PlanDriven,
-                    ScaffoldId::PlanDriven => ScaffoldId::SinglePrompt,
-                    ScaffoldId::SinglePrompt => ScaffoldId::PlanBuild,
-                    ScaffoldId::PlanBuild => ScaffoldId::TaskDriven,
-                };
-            }
-            KeyCode::Backspace => {
-                self.new_target_name.pop();
-            }
-            KeyCode::Enter => {
-                if self.new_target_name.trim().is_empty() {
-                    self.message = "target name cannot be empty".to_owned();
-                    return Ok(());
-                }
-                let scaffold = self.new_scaffold;
-                let summary = self
-                    .app
-                    .create_target(self.new_target_name.trim(), Some(scaffold))?;
-                self.reload_targets();
-                if let Some(index) = self.targets.iter().position(|item| item.id == summary.id) {
-                    self.selected_target = index;
-                    self.selected_prompt = 0;
-                    self.refresh_selected_target_review();
-                }
-                self.screen = Screen::Dashboard;
-                let opened_path =
-                    if matches!(scaffold, ScaffoldId::TaskDriven | ScaffoldId::PlanDriven) {
-                        Some(self.app.resolve_target_edit_path(&summary.id, None)?)
-                    } else {
-                        summary
-                            .prompt_files
-                            .first()
-                            .map(|prompt| prompt.path.clone())
-                    };
-                if let Some(opened_path) = opened_path {
-                    let editor = self.app.config().editor_override.clone();
-                    suspend_terminal(terminal)?;
-                    let result = edit_file(&opened_path, editor.as_deref());
-                    resume_terminal(terminal)?;
-                    result?;
-                    self.refresh_selected_target_review();
-                    self.message = format!(
-                        "created {} and opened {}",
-                        summary.id,
-                        opened_path.file_name().unwrap_or("file")
-                    );
-                } else {
-                    self.message = format!("created {}", summary.id);
-                }
-            }
-            KeyCode::Char(ch) => {
-                self.new_target_name.push(ch);
-            }
-            _ => {}
-        }
-        Ok(())
+        Ok(true)
     }
 
     fn handle_running_key(
         &mut self,
         key: KeyEvent,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let (is_finished, control) = match self.running.as_ref() {
+            Some(running) => (running.is_finished(), running.control.clone()),
+            None => return Ok(true),
+        };
+
         match key.code {
-            KeyCode::Esc => {
-                if self.running.as_ref().is_some_and(RunningState::is_finished) {
-                    self.running = None;
-                    self.screen = Screen::Dashboard;
-                }
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) && !is_finished => {
+                control.cancel();
+                self.message = "canceling run".to_owned();
             }
             KeyCode::Char('q') => {
-                if let Some(running) = &self.running {
-                    running.control.cancel();
+                if !is_finished {
+                    control.cancel();
                 }
+                return Ok(false);
             }
-            KeyCode::Char('r') => {
-                if let Some(running) = &self.running
-                    && running.is_finished()
-                {
-                    let target_id = running.target_id.clone();
-                    let requested_prompt = running.requested_prompt.clone();
-                    self.start_run_for(&target_id, requested_prompt.as_deref())?;
-                }
+            KeyCode::Char('r') if is_finished => {
+                self.start_run()?;
             }
             KeyCode::Char('a') => {
-                let running_control = self.running.as_ref().map(|running| running.control.clone());
-                self.cycle_agent(running_control)?;
+                self.cycle_agent(Some(control))?;
+                if !is_finished {
+                    self.message.push_str(" (applies next iteration)");
+                }
             }
             KeyCode::Char('e') => {
-                let prompt_path = self.resolve_running_edit_path()?;
-                let editor = self.app.config().editor_override.clone();
-                suspend_terminal(terminal)?;
-                let result = edit_file(&prompt_path, editor.as_deref());
-                resume_terminal(terminal)?;
-                result?;
-                self.refresh_selected_target_review();
-                self.message = format!(
-                    "opened {} for steering",
-                    prompt_path.file_name().unwrap_or("file")
-                );
+                self.edit_request(terminal)?;
+                if !is_finished {
+                    self.message = format!("{}; rerun to apply request edits", self.message);
+                }
             }
             KeyCode::Up => self.scroll_running(1),
             KeyCode::Down => self.scroll_running(-1),
@@ -533,29 +360,31 @@ impl TuiApp {
             KeyCode::PageDown => self.scroll_running(-10),
             KeyCode::Home => {
                 let max_scroll = self.max_running_scroll();
-                if let Some(running) = &mut self.running {
+                if let Some(running) = self.running.as_mut() {
                     running.follow = false;
                     running.scroll = max_scroll;
                 }
             }
-            KeyCode::End => {
-                if let Some(running) = &mut self.running {
+            KeyCode::End | KeyCode::Char('f') => {
+                if let Some(running) = self.running.as_mut() {
                     running.follow = true;
                     running.scroll = 0;
                 }
             }
             _ => {}
         }
-        Ok(())
+
+        Ok(true)
     }
 
-    fn handle_ui_event(&mut self, event: UiEvent) {
+    fn handle_ui_event(
+        &mut self,
+        event: UiEvent,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
         match event {
-            UiEvent::Tick => {
-                self.tick_count = self.tick_count.wrapping_add(1);
-            }
             UiEvent::RunEvent(event) => {
-                if let Some(running) = &mut self.running {
+                if let Some(running) = self.running.as_mut() {
                     match event {
                         RunEvent::IterationStarted {
                             prompt_name,
@@ -565,202 +394,228 @@ impl TuiApp {
                             running.prompt_name = prompt_name.clone();
                             running.iteration = iteration;
                             running.max_iterations = max_iterations;
-                            running.push_terminal_text(&format!(
-                                "{}\n",
-                                ralph_app::format_iteration_banner(
-                                    &prompt_name,
-                                    iteration,
-                                    max_iterations
-                                )
+                            running.push_terminal_text(&format_iteration_banner(
+                                &prompt_name,
+                                iteration,
+                                max_iterations,
                             ));
+                            running.push_terminal_text("\n");
                         }
-                        RunEvent::Output(chunk) => {
-                            running.push_terminal_text(&chunk);
-                        }
+                        RunEvent::Output(chunk) => running.push_terminal_text(&chunk),
                         RunEvent::Note(note) => {
-                            running.push_terminal_text(&format!("\n{note}\n"));
+                            self.message = note.clone();
+                            running.push_terminal_text(&format!("\n[{note}]\n"));
                         }
                         RunEvent::Finished { status, summary } => {
-                            running.finish(status);
-                            running.push_terminal_text(&format!(
-                                "\n{summary} ({})\nPress Esc to return.",
-                                status.label()
-                            ));
+                            self.message = summary.clone();
+                            running.finish(status, summary);
                         }
-                    }
-                    if running.follow {
-                        running.scroll = 0;
                     }
                 }
             }
             UiEvent::RunDone(result) => match result {
                 Ok(summary) => {
-                    if let Some(running) = &mut self.running
-                        && !running.is_finished()
+                    if let Some(running) = self.running.as_mut()
+                        && running.status().is_none()
                     {
-                        running.finish(summary.last_run_status);
-                        running.push_terminal_text(&format!(
-                            "\nRun ended with status: {}.\nPress Esc to return.",
-                            summary.last_run_status.label()
-                        ));
+                        running.finish(summary.status, summary.status.label());
                     }
-                    self.reload_targets();
-                    if let Some(index) = self.targets.iter().position(|item| item.id == summary.id)
-                    {
-                        self.selected_target = index;
-                        self.refresh_selected_target_review();
-                    }
+                    self.message = format!("{} [{}]", summary.workflow_id, summary.status.label());
                 }
                 Err(error) => {
-                    if let Some(running) = &mut self.running {
+                    if let Some(running) = self.running.as_mut() {
                         let status = if running.control.is_cancelled() {
                             LastRunStatus::Canceled
                         } else {
                             LastRunStatus::Failed
                         };
-                        running.finish(status);
-                        running.push_terminal_text(&format!(
-                            "\nerror: {error} ({})\nPress Esc to return.",
-                            status.label()
-                        ));
+                        running.finish(status, &error);
+                        running.push_terminal_text(&format!("\n[error] {error}\n"));
                     }
+                    self.message = error;
                 }
             },
-        }
-    }
-
-    fn reload_targets(&mut self) {
-        match self.app.list_targets() {
-            Ok(targets) => {
-                self.targets = targets;
-                if self.targets.is_empty() {
-                    self.selected_target = 0;
-                    self.selected_prompt = 0;
-                } else {
-                    self.selected_target = self.selected_target.min(self.targets.len() - 1);
-                    let prompt_count = self.targets[self.selected_target].prompt_files.len();
-                    self.selected_prompt = if prompt_count == 0 {
-                        0
-                    } else {
-                        self.selected_prompt.min(prompt_count - 1)
-                    };
+            UiEvent::InteractiveSession {
+                config,
+                invocation,
+                reply,
+            } => {
+                if let Some(running) = self.running.as_mut() {
+                    running.push_terminal_text(&format!(
+                        "\n[interactive session: {}]\n",
+                        invocation.session_name
+                    ));
                 }
-                self.refresh_selected_target_review();
+
+                let outcome =
+                    self.run_interactive_session_in_terminal(terminal, &config, &invocation);
+
+                if let Some(running) = self.running.as_mut() {
+                    match &outcome {
+                        Ok(result) => {
+                            running.push_terminal_text(&format!(
+                                "\n[interactive session exited with code {}]\n",
+                                result.exit_code.unwrap_or(-1)
+                            ));
+                        }
+                        Err(error) => {
+                            running.push_terminal_text(&format!(
+                                "\n[interactive session failed: {error}]\n"
+                            ));
+                        }
+                    }
+                }
+
+                let _ = reply.send(outcome);
             }
-            Err(error) => {
-                self.targets = Vec::new();
-                self.selected_target_review = None;
-                self.message = error.to_string();
+        }
+
+        Ok(())
+    }
+
+    fn run_interactive_session_in_terminal(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        config: &RunnerConfig,
+        invocation: &InteractiveSessionInvocation,
+    ) -> Result<InteractiveSessionOutcome, String> {
+        suspend_terminal(terminal).map_err(|error| error.to_string())?;
+        let outcome = self
+            .app
+            .run_interactive_session_with_config(config, invocation)
+            .map_err(|error| error.to_string());
+        let resume_result = resume_terminal(terminal).map_err(|error| error.to_string());
+
+        match (outcome, resume_result) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(resume_error)) => Err(format!("{error}; {resume_error}")),
+        }
+    }
+
+    fn apply_preloaded_request(&mut self, preload: TuiPreloadedRequest) {
+        self.request_text = preload.text;
+        if let Some(path) = preload.file_path {
+            self.request_file = path.to_string();
+        }
+        self.request_origin = match preload.source {
+            TuiRequestSource::Argv => RequestOrigin::Argv,
+            TuiRequestSource::File => RequestOrigin::File,
+        };
+        if matches!(preload.source, TuiRequestSource::File) {
+            self.request_mode = RequestMode::File;
+        }
+    }
+
+    fn request_focus(&self) -> Option<Focus> {
+        if self.can_edit_request_text() {
+            Some(Focus::RequestText)
+        } else if self.can_edit_request_file() {
+            Some(Focus::RequestFile)
+        } else {
+            None
+        }
+    }
+
+    fn sync_request_mode(&mut self) {
+        let Some(runtime) = self.runtime_request() else {
+            return;
+        };
+
+        match (runtime.argv, runtime.file_flag) {
+            (true, false) => self.request_mode = RequestMode::Text,
+            (false, true) => self.request_mode = RequestMode::File,
+            (true, true) => {
+                if matches!(
+                    self.request_origin,
+                    RequestOrigin::File | RequestOrigin::Draft
+                ) && !self.request_file.trim().is_empty()
+                {
+                    self.request_mode = RequestMode::File;
+                } else if self.request_file.trim().is_empty() && !self.request_text.is_empty() {
+                    self.request_mode = RequestMode::Text;
+                }
+            }
+            _ => {}
+        }
+
+        if self.request_focus().is_none() {
+            self.focus = Focus::RequestText;
+        }
+    }
+
+    fn request_mode_left(&mut self) {
+        if self.focus == Focus::RequestFile {
+            self.request_mode = RequestMode::Text;
+            if let Some(focus) = self.request_focus() {
+                self.focus = focus;
             }
         }
     }
 
-    fn selected_target(&self) -> Option<&TargetSummary> {
-        self.targets.get(self.selected_target)
+    fn request_mode_right(&mut self) {
+        if self.focus == Focus::RequestText {
+            self.request_mode = RequestMode::File;
+            if let Some(focus) = self.request_focus() {
+                self.focus = focus;
+            }
+        }
     }
 
-    fn selected_target_review(&self) -> Option<&TargetReview> {
-        self.selected_target_review.as_ref()
+    fn handle_backspace(&mut self) {
+        match self.focus {
+            Focus::RequestText if self.can_edit_request_text() => {
+                self.request_text.pop();
+                if !self.request_text.is_empty() {
+                    self.request_origin = RequestOrigin::Typed;
+                }
+            }
+            Focus::RequestFile if self.can_edit_request_file() => {
+                self.request_file.pop();
+            }
+            _ => {}
+        }
     }
 
-    fn selected_prompt(&self) -> Option<&ralph_core::PromptFile> {
-        self.selected_target()
-            .and_then(|target| target.prompt_files.get(self.selected_prompt))
-    }
-
-    fn selected_target_and_prompt(&self) -> Option<(String, String)> {
-        let target = self.selected_target()?;
-        let prompt = self.selected_prompt()?;
-        Some((target.id.clone(), prompt.name.clone()))
-    }
-
-    fn resolve_selected_edit_path(&self) -> Result<camino::Utf8PathBuf> {
-        let Some(target) = self.selected_target() else {
-            return Err(anyhow!("select a target first"));
-        };
-        let target_id = target.id.clone();
-        let prompt_name = if target.uses_hidden_workflow() {
-            None
-        } else {
-            self.selected_prompt().map(|prompt| prompt.name.clone())
-        };
-        self.app
-            .resolve_target_edit_path(&target_id, prompt_name.as_deref())
-    }
-
-    fn resolve_running_edit_path(&self) -> Result<camino::Utf8PathBuf> {
-        let Some(running) = self.running.as_ref() else {
-            return Err(anyhow!("no run in progress"));
-        };
-        self.app
-            .resolve_target_edit_path(&running.target_id, running.requested_prompt.as_deref())
+    fn handle_text_input(&mut self, ch: char) {
+        match self.focus {
+            Focus::RequestText if self.can_edit_request_text() => {
+                self.request_text.push(ch);
+                self.request_origin = RequestOrigin::Typed;
+            }
+            Focus::RequestFile if self.can_edit_request_file() => {
+                self.request_file.push(ch);
+                if !self.request_file.trim().is_empty() {
+                    self.request_origin = RequestOrigin::File;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn start_run(&mut self) -> Result<()> {
-        if self.selected_target_uses_hidden_workflow() {
-            let Some(target) = self.selected_target() else {
-                self.message = "select a target first".to_owned();
-                return Ok(());
-            };
-            let Some(status) = self.selected_workflow_status() else {
-                self.message = "failed to inspect workflow status".to_owned();
-                return Ok(());
-            };
-            let target_id = target.id.clone();
-            return match status.run_advice {
-                WorkflowRunAdvice::Build => {
-                    self.start_workflow_action_for(&target_id, WorkflowAction::Build, status)
-                }
-                WorkflowRunAdvice::Rebase => {
-                    self.start_workflow_action_for(&target_id, WorkflowAction::Rebase, status)
-                }
-                WorkflowRunAdvice::Choose => {
-                    self.message = match status.kind {
-                        ralph_app::WorkflowKind::PlanDriven => "stale plan detected; press B to build current plan, G to rebase it, X to rebuild from scratch, or I to refine GOAL".to_owned(),
-                        ralph_app::WorkflowKind::TaskDriven => "stale task backlog detected; press B to build current backlog, G to rebase it, X to rebuild from scratch, or I to refine GOAL".to_owned(),
-                    };
-                    Ok(())
-                }
-                WorkflowRunAdvice::NoWork => {
-                    self.message = "no workflow changes detected; press B to force the current derived state or edit GOAL/derived files".to_owned();
-                    Ok(())
-                }
-            };
-        }
-
-        let Some((target_id, prompt_name)) = self.selected_target_and_prompt() else {
-            self.message = "select a target and prompt first".to_owned();
-            return Ok(());
-        };
-
-        self.start_run_for(&target_id, Some(&prompt_name))
-    }
-
-    fn start_run_for(&mut self, target_id: &str, prompt_name: Option<&str>) -> Result<()> {
+        let request_input = self.request_input_for(&self.workflow)?;
+        let workflow_id = self.workflow.workflow_id.clone();
+        let control = RunControl::new();
         let tx = self.tx.clone();
         let app = self.app.clone();
-        let control = RunControl::new();
-        let run_control = control.clone();
-        let target_id = target_id.to_owned();
-        let requested_prompt = prompt_name.map(ToOwned::to_owned);
-        let display_prompt = requested_prompt
-            .clone()
-            .unwrap_or_else(|| "workflow_auto".to_owned());
-        self.running = Some(RunningState::new(
-            target_id.to_owned(),
-            display_prompt,
-            requested_prompt.clone(),
-            control,
-        ));
-        self.screen = Screen::Running;
+        let control_for_task = control.clone();
+        let workflow_options = self.workflow_options.clone();
+
+        self.message = format!("running workflow '{}'", workflow_id);
+        self.running = Some(RunningState::new(control));
 
         self.handle.spawn(async move {
-            let mut delegate = ChannelDelegate { tx: tx.clone() };
+            let mut delegate = TuiRunDelegate { tx: tx.clone() };
             let result = app
-                .run_target_with_control(
-                    &target_id,
-                    requested_prompt.as_deref(),
-                    run_control,
+                .run_workflow_with_control(
+                    &workflow_id,
+                    WorkflowRunInput {
+                        request: request_input,
+                        options: workflow_options,
+                    },
+                    control_for_task,
                     &mut delegate,
                 )
                 .await
@@ -771,201 +626,142 @@ impl TuiApp {
         Ok(())
     }
 
-    fn start_workflow_action_for(
-        &mut self,
-        target_id: &str,
-        action: WorkflowAction,
-        status: WorkflowStatus,
-    ) -> Result<()> {
-        let tx = self.tx.clone();
-        let app = self.app.clone();
-        let control = RunControl::new();
-        let run_control = control.clone();
-        let target_id = target_id.to_owned();
-        let display_prompt = format!("{}_{}", status.kind.label(), action.label());
-        self.running = Some(RunningState::new(
-            target_id.clone(),
-            display_prompt,
-            None,
-            control,
-        ));
-        self.screen = Screen::Running;
+    fn request_input_for(&self, workflow: &WorkflowDefinition) -> Result<WorkflowRequestInput> {
+        let Some(request) = workflow.request.as_ref() else {
+            return Ok(WorkflowRequestInput::default());
+        };
 
-        self.handle.spawn(async move {
-            let mut delegate = ChannelDelegate { tx: tx.clone() };
-            let result = app
-                .run_workflow_action_with_control(&target_id, action, run_control, &mut delegate)
-                .await
-                .map_err(|error| error.to_string());
-            let _ = tx.send(UiEvent::RunDone(result));
-        });
+        if request.runtime.is_none() {
+            return Ok(WorkflowRequestInput::default());
+        }
 
-        Ok(())
+        let runtime = request.runtime.as_ref().expect("checked is_some");
+        match self.request_mode {
+            RequestMode::Text if runtime.argv => Ok(WorkflowRequestInput {
+                argv: Some(self.request_text.clone()),
+                stdin: None,
+                request_file: None,
+            }),
+            RequestMode::File if runtime.file_flag => {
+                if self.request_file.trim().is_empty() {
+                    return Err(anyhow!("enter a request file path"));
+                }
+                Ok(WorkflowRequestInput {
+                    argv: None,
+                    stdin: None,
+                    request_file: Some(Utf8PathBuf::from(self.request_file.trim())),
+                })
+            }
+            RequestMode::Text if !runtime.argv && runtime.file_flag => Err(anyhow!(
+                "the selected workflow only accepts request files; switch the request source with the arrow keys"
+            )),
+            RequestMode::File if !runtime.file_flag && runtime.argv => Err(anyhow!(
+                "the selected workflow only accepts text requests; switch the request source with the arrow keys"
+            )),
+            _ => Err(anyhow!(
+                "the selected workflow requires a runtime request form that the TUI does not support"
+            )),
+        }
     }
 
-    fn start_workflow_build(&mut self) -> Result<()> {
-        let Some(target_id) = self.selected_target().map(|target| target.id.clone()) else {
-            self.message = "select a target first".to_owned();
-            return Ok(());
-        };
-        let Some(status) = self.selected_workflow_status() else {
-            self.message = "workflow build is only available for workflow targets".to_owned();
-            return Ok(());
-        };
-        self.start_workflow_action_for(&target_id, WorkflowAction::Build, status)
+    fn runtime_request(&self) -> Option<&WorkflowRuntimeRequest> {
+        self.workflow
+            .request
+            .as_ref()
+            .and_then(|request| request.runtime.as_ref())
     }
 
-    fn start_workflow_rebase(&mut self) -> Result<()> {
-        let Some(target_id) = self.selected_target().map(|target| target.id.clone()) else {
-            self.message = "select a target first".to_owned();
-            return Ok(());
-        };
-        let Some(status) = self.selected_workflow_status() else {
-            self.message = "workflow rebase is only available for workflow targets".to_owned();
-            return Ok(());
-        };
-        self.start_workflow_action_for(&target_id, WorkflowAction::Rebase, status)
+    fn can_edit_request_text(&self) -> bool {
+        self.runtime_request()
+            .is_some_and(|runtime| runtime.argv && self.request_mode == RequestMode::Text)
     }
 
-    fn start_goal_interview(
+    fn can_edit_request_file(&self) -> bool {
+        self.runtime_request()
+            .is_some_and(|runtime| runtime.file_flag && self.request_mode == RequestMode::File)
+    }
+
+    fn edit_request(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<()> {
-        let Some(target) = self.selected_target() else {
-            self.message = "select a target first".to_owned();
-            return Ok(());
-        };
-        if !target.uses_hidden_workflow() {
-            self.message = "AI goal refinement is only available for workflow targets".to_owned();
-            return Ok(());
-        }
-
-        let target_id = target.id.clone();
+        let path = self.resolve_request_edit_path()?;
+        self.prepare_request_edit_path(&path)?;
         suspend_terminal(terminal)?;
-        let result = self.app.run_workflow_goal_interview(&target_id);
+        let edit_result = edit_file(&path, self.app.config().editor_override.as_deref());
         resume_terminal(terminal)?;
-
-        match result {
-            Ok(outcome) => {
-                self.reload_targets();
-                if let Some(index) = self.targets.iter().position(|item| item.id == target_id) {
-                    self.selected_target = index;
-                    self.refresh_selected_target_review();
-                }
-                self.message = match (outcome.goal_changed, outcome.exit_code) {
-                    (true, Some(0)) => {
-                        "interactive goal session finished; GOAL.md updated".to_owned()
-                    }
-                    (false, Some(0)) => {
-                        "interactive goal session finished; GOAL.md unchanged".to_owned()
-                    }
-                    (true, Some(code)) => {
-                        format!("interactive goal session exited with code {code}; GOAL.md changed")
-                    }
-                    (false, Some(code)) => format!(
-                        "interactive goal session exited with code {code}; GOAL.md unchanged"
-                    ),
-                    (true, None) => {
-                        "interactive goal session ended by signal; GOAL.md changed".to_owned()
-                    }
-                    (false, None) => {
-                        "interactive goal session ended by signal; GOAL.md unchanged".to_owned()
-                    }
-                };
-                Ok(())
-            }
-            Err(error) => {
-                self.message = error.to_string();
-                Ok(())
-            }
-        }
-    }
-
-    fn start_workflow_rebuild_from_scratch(&mut self) -> Result<()> {
-        let Some(target) = self.selected_target() else {
-            self.message = "select a target first".to_owned();
-            return Ok(());
-        };
-        let target_id = target.id.clone();
-        let Some(status) = self.selected_workflow_status() else {
-            self.message = "scratch rebuild is only available for workflow targets".to_owned();
-            return Ok(());
-        };
-        match target.mode {
-            Some(WorkflowMode::PlanDriven) => {
-                self.app.rebuild_plan_driven_from_scratch(&target_id)?
-            }
-            Some(WorkflowMode::TaskDriven) => {
-                self.app.rebuild_task_driven_from_scratch(&target_id)?
-            }
-            None => {
-                self.message = "scratch rebuild is only available for workflow targets".to_owned();
-                return Ok(());
-            }
-        }
-        self.reload_targets();
-        if let Some(index) = self.targets.iter().position(|item| item.id == target_id) {
-            self.selected_target = index;
-            self.refresh_selected_target_review();
-        }
-        self.start_workflow_action_for(&target_id, WorkflowAction::Rebase, status)
-    }
-
-    fn confirm_target_delete(&mut self) {
-        let Some(target) = self.selected_target() else {
-            self.message = "select a target first".to_owned();
-            return;
-        };
-
-        self.confirmation = Some(ConfirmationDialog::new(
-            "Delete Target",
-            format!(
-                "Delete target `{}` and all files under its Ralph directory? This cannot be undone.",
-                target.id
-            ),
-            ConfirmationAction::DeleteTarget {
-                target_id: target.id.clone(),
-            },
-        ));
-    }
-
-    fn confirm_workflow_rebuild(&mut self) -> Result<()> {
-        let Some(target) = self.selected_target() else {
-            self.message = "select a target first".to_owned();
-            return Ok(());
-        };
-        if !target.uses_hidden_workflow() {
-            self.message = "scratch rebuild is only available for workflow targets".to_owned();
-            return Ok(());
-        }
-
-        self.confirmation = Some(ConfirmationDialog::new(
-            "Rebuild From Scratch",
-            format!(
-                "Archive the current derived workflow artifacts for `{}` and rebuild from GOAL.md? This replaces the active plan or backlog.",
-                target.id
-            ),
-            ConfirmationAction::RebuildWorkflow {
-                target_id: target.id.clone(),
-            },
-        ));
+        edit_result?;
+        self.refresh_request_from_path(&path)?;
+        self.message = format!(
+            "updated request from {}",
+            path.file_name().unwrap_or(path.as_str())
+        );
         Ok(())
     }
 
-    fn execute_confirmation(&mut self, action: ConfirmationAction) -> Result<()> {
-        match action {
-            ConfirmationAction::DeleteTarget { target_id } => {
-                self.app.delete_target(&target_id)?;
-                self.reload_targets();
-                self.message = format!("deleted {target_id}");
-                Ok(())
-            }
-            ConfirmationAction::RebuildWorkflow { target_id } => {
-                if let Some(index) = self.targets.iter().position(|item| item.id == target_id) {
-                    self.selected_target = index;
-                }
-                self.start_workflow_rebuild_from_scratch()
-            }
+    fn resolve_request_edit_path(&self) -> Result<Utf8PathBuf> {
+        if let Some(request) = &self.workflow.request
+            && let Some(file) = &request.file
+        {
+            return Ok(self.resolve_project_relative_path(&file.path));
+        }
+
+        if !self.request_file.trim().is_empty() {
+            return Ok(self.resolve_project_relative_path(Utf8Path::new(self.request_file.trim())));
+        }
+
+        if !self.request_text.trim().is_empty() || !self.request_file.trim().is_empty() {
+            return Ok(self
+                .app
+                .project_dir()
+                .join(".ralph")
+                .join("request-drafts")
+                .join(format!("{}.md", self.workflow_id)));
+        }
+
+        Err(anyhow!("no editable request is available"))
+    }
+
+    fn prepare_request_edit_path(&mut self, path: &Utf8Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent.as_std_path())
+                .with_context(|| format!("failed to create {}", parent))?;
+        }
+        if path.exists() {
+            return Ok(());
+        }
+
+        let mut contents = self.request_text.clone();
+        if !contents.ends_with('\n') {
+            contents.push('\n');
+        }
+        atomic_write(path, contents)
+            .with_context(|| format!("failed to create request draft {}", path))?;
+        Ok(())
+    }
+
+    fn refresh_request_from_path(&mut self, path: &Utf8Path) -> Result<()> {
+        self.request_text = self.app.read_utf8_file(path)?;
+        self.request_file = path.to_string();
+        self.request_origin = RequestOrigin::Draft;
+        if self
+            .workflow
+            .request
+            .as_ref()
+            .and_then(|request| request.runtime.as_ref())
+            .is_some_and(|runtime| runtime.file_flag)
+            && !self.request_file.trim().is_empty()
+        {
+            self.request_mode = RequestMode::File;
+        }
+        Ok(())
+    }
+
+    fn resolve_project_relative_path(&self, path: &Utf8Path) -> Utf8PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.app.project_dir().join(path)
         }
     }
 
@@ -986,7 +782,7 @@ impl TuiApp {
         let next_name = next.name.clone();
         self.app.persist_agent(&next_id)?;
         if let Some(control) = run_control {
-            control.set_agent_id(next_id.clone());
+            control.set_agent_id(next_id);
         }
         self.message = format!("agent={next_name}");
         Ok(())
@@ -1014,316 +810,635 @@ impl TuiApp {
         max
     }
 
-    fn refresh_selected_target_review(&mut self) {
-        self.selected_target_review = self
-            .selected_target()
-            .and_then(|target| self.app.review_target(&target.id).ok());
+    fn draw(&mut self, frame: &mut Frame<'_>) {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(self.background_color())),
+            frame.area(),
+        );
+
+        let has_notice = !self.message.trim().is_empty();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Length(if has_notice { 3 } else { 0 }),
+                Constraint::Min(1),
+                Constraint::Length(2),
+            ])
+            .split(frame.area());
+
+        self.draw_header(frame, chunks[0]);
+        if has_notice {
+            self.draw_notice(frame, chunks[1]);
+        }
+        if self.running.is_some() {
+            self.draw_running_body(frame, chunks[2]);
+        } else {
+            self.draw_idle_body(frame, chunks[2]);
+        }
+        self.draw_footer(frame, chunks[3]);
+    }
+
+    fn draw_header(&self, frame: &mut Frame<'_>, area: Rect) {
+        let iteration = self
+            .running
+            .as_ref()
+            .filter(|running| running.iteration > 0)
+            .map(|running| running.iteration.to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        let header = Paragraph::new(Text::from(vec![
+            Line::from(vec![
+                Span::styled(
+                    " RALPH ",
+                    Style::default()
+                        .fg(self.accent_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "◆",
+                    Style::default()
+                        .fg(self.warning_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" workflow: {} ", self.workflow_id),
+                    Style::default()
+                        .fg(self.text_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "◆",
+                    Style::default()
+                        .fg(self.warning_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" Agent {}", self.app.agent_name()),
+                    Style::default()
+                        .fg(self.text_color())
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled(" Iteration ", Style::default().fg(self.muted_color())),
+                Span::styled(iteration, Style::default().fg(self.text_color())),
+                Span::styled(" - ", Style::default().fg(self.muted_color())),
+                Span::styled(
+                    self.app.project_dir().to_string(),
+                    Style::default().fg(self.text_color()),
+                ),
+            ]),
+        ]))
+        .block(self.panel_block());
+        frame.render_widget(header, area);
+    }
+
+    fn draw_notice(&self, frame: &mut Frame<'_>, area: Rect) {
+        let (label, fg, bg) = self.notice_palette();
+        let banner = Paragraph::new(Line::from(vec![
+            Span::styled(
+                label,
+                Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                &self.message,
+                Style::default()
+                    .fg(self.text_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .block(self.panel_block());
+        frame.render_widget(banner, area);
+    }
+
+    fn draw_idle_body(&self, frame: &mut Frame<'_>, area: Rect) {
+        let main = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(8), Constraint::Min(1)])
+            .split(area);
+
+        self.draw_request_panel(frame, main[0]);
+        self.draw_idle_output_panel(frame, main[1]);
+    }
+
+    fn draw_running_body(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(6), Constraint::Min(1)])
+            .split(area);
+
+        self.draw_running_context(frame, sections[0]);
+        self.draw_output_panel(frame, sections[1]);
+    }
+
+    fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect) {
+        let footer = if let Some(running) = self.running.as_ref() {
+            if running.is_finished() {
+                "R rerun  •  E edit request  •  A cycle next agent  •  Q quit"
+            } else {
+                "Ctrl-C cancel run  •  A cycle next agent  •  E edit request  •  Q quit  •  F/End follow  •  PgUp/PgDn scroll"
+            }
+        } else {
+            "Enter/R run  •  ←/→ switch request source  •  E edit request  •  A cycle agent  •  Q quit"
+        };
+
+        let paragraph = Paragraph::new(footer)
+            .style(Style::default().fg(self.muted_color()))
+            .wrap(Wrap { trim: true });
+        frame.render_widget(paragraph, area);
+    }
+
+    fn draw_request_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let border_style = Style::default().fg(self.accent_color());
+        let text = self.request_panel_text();
+
+        let paragraph = Paragraph::new(text)
+            .block(
+                self.panel_block()
+                    .border_style(border_style)
+                    .title(self.title_line("Request", "Input")),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+    }
+
+    fn request_panel_text(&self) -> Text<'static> {
+        let Some(request) = self.workflow.request.as_ref() else {
+            return Text::from(vec![
+                Line::from("This workflow does not require a request."),
+                Line::from(""),
+                Line::from("Press Enter or R to run."),
+            ]);
+        };
+
+        if let Some(runtime) = &request.runtime {
+            return self.runtime_request_text(runtime);
+        }
+
+        if let Some(file) = &request.file {
+            return Text::from(vec![
+                Line::from("This workflow reads its request from a project file."),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("path ", Style::default().fg(self.subtle_color())),
+                    Span::styled(
+                        file.path.to_string(),
+                        Style::default().fg(self.text_color()),
+                    ),
+                ]),
+                Line::from(""),
+                Line::from("Press E to edit the file, then Enter or R to run."),
+            ]);
+        }
+
+        if let Some(inline) = &request.inline {
+            return Text::from(vec![
+                Line::from("This workflow has an inline request."),
+                Line::from(""),
+                Line::from(inline.clone()),
+            ]);
+        }
+
+        Text::from("Unsupported request configuration.")
+    }
+
+    fn draw_idle_output_panel(&self, frame: &mut Frame<'_>, area: Rect) {
+        let text = Text::from(vec![
+            Line::from(vec![
+                Span::styled("workflow ", Style::default().fg(self.subtle_color())),
+                Span::styled(
+                    self.workflow_id.clone(),
+                    Style::default().fg(self.text_color()),
+                ),
+            ]),
+            Line::from(""),
+            Line::from("Press Enter or R to start the run."),
+            Line::from("Use E to edit the request in a file-backed editor."),
+        ]);
+        let paragraph = Paragraph::new(text)
+            .block(
+                self.panel_block()
+                    .title(self.title_line("Runner Output", "Ready to run")),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+    }
+
+    fn runtime_request_text(&self, runtime: &WorkflowRuntimeRequest) -> Text<'static> {
+        let mut lines = Vec::new();
+
+        if runtime.argv && runtime.file_flag {
+            lines.push(Line::from(vec![
+                self.request_mode_span(RequestMode::Text),
+                Span::raw(" "),
+                self.request_mode_span(RequestMode::File),
+            ]));
+            lines.push(Line::from(""));
+        }
+
+        lines.push(Line::from(vec![
+            Span::styled("source ", Style::default().fg(self.subtle_color())),
+            Span::styled(
+                self.request_origin.label(),
+                Style::default().fg(self.text_color()),
+            ),
+            Span::styled("  •  accepted ", Style::default().fg(self.subtle_color())),
+            Span::styled(
+                self.allowed_runtime_sources(runtime),
+                Style::default().fg(self.text_color()),
+            ),
+        ]));
+        lines.push(Line::from(""));
+
+        match self.request_mode {
+            RequestMode::Text => {
+                let mut value = self.request_text.clone();
+                if self.focus == Focus::RequestText {
+                    value.push('█');
+                }
+                if value.is_empty() {
+                    value.push_str("Type a request here.");
+                }
+                lines.push(Line::from(value));
+            }
+            RequestMode::File => {
+                let mut path = self.request_file.clone();
+                if self.focus == Focus::RequestFile {
+                    path.push('█');
+                }
+                if path.is_empty() {
+                    path.push_str("Enter a request file path.");
+                }
+                lines.push(Line::from(vec![
+                    Span::styled("file ", Style::default().fg(self.subtle_color())),
+                    Span::styled(path, Style::default().fg(self.text_color())),
+                ]));
+                if !self.request_text.trim().is_empty() {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(self.request_preview()));
+                }
+            }
+        }
+
+        Text::from(lines)
+    }
+
+    fn request_mode_span(&self, mode: RequestMode) -> Span<'static> {
+        let (label, active) = match mode {
+            RequestMode::Text => ("[ Text ]", self.request_mode == RequestMode::Text),
+            RequestMode::File => ("[ File ]", self.request_mode == RequestMode::File),
+        };
+        if active {
+            Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(self.accent_color())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(label, Style::default().fg(self.muted_color()))
+        }
+    }
+
+    fn draw_running_context(&self, frame: &mut Frame<'_>, area: Rect) {
+        let prompt_name = self
+            .running
+            .as_ref()
+            .map(|running| running.prompt_name.as_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("<pending>");
+        let note = if self.running.as_ref().is_some_and(RunningState::is_finished) {
+            "E edits the request used for rerun."
+        } else {
+            "Agent switches apply on the next iteration only."
+        };
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("workflow ", Style::default().fg(self.subtle_color())),
+                Span::styled(
+                    self.workflow_id.clone(),
+                    Style::default().fg(self.text_color()),
+                ),
+                Span::styled("  •  prompt ", Style::default().fg(self.subtle_color())),
+                Span::styled(prompt_name, Style::default().fg(self.text_color())),
+            ]),
+            Line::from(vec![
+                Span::styled("request source ", Style::default().fg(self.subtle_color())),
+                Span::styled(
+                    self.request_origin.label(),
+                    Style::default().fg(self.text_color()),
+                ),
+            ]),
+        ];
+        if !self.request_file.trim().is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("request target ", Style::default().fg(self.subtle_color())),
+                Span::styled(
+                    self.request_file.clone(),
+                    Style::default().fg(self.text_color()),
+                ),
+            ]));
+        }
+        if !self.request_text.trim().is_empty() {
+            lines.push(Line::from(vec![
+                Span::styled("request summary ", Style::default().fg(self.subtle_color())),
+                Span::styled(
+                    self.request_summary(),
+                    Style::default().fg(self.text_color()),
+                ),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::styled("note ", Style::default().fg(self.subtle_color())),
+            Span::styled(note, Style::default().fg(self.text_color())),
+        ]));
+
+        let paragraph = Paragraph::new(Text::from(lines)).block(
+            self.panel_block()
+                .title(self.title_line("Context", "Current run")),
+        );
+        frame.render_widget(paragraph, area);
+    }
+
+    fn draw_output_panel(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        let block = self
+            .panel_block()
+            .title(self.title_line("Runner Output", "Live output"));
+        let inner = block.inner(area);
+        let output = if let Some(running) = &mut self.running {
+            running.ensure_terminal_size(inner.height.max(1), inner.width.max(1));
+            let scroll = if running.follow { 0 } else { running.scroll };
+            running.terminal.set_scrollback(scroll);
+            running.terminal.screen().contents()
+        } else {
+            String::new()
+        };
+        let paragraph = Paragraph::new(output)
+            .block(block)
+            .style(Style::default().fg(self.text_color()))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(paragraph, area);
+    }
+
+    fn allowed_runtime_sources(&self, runtime: &WorkflowRuntimeRequest) -> String {
+        let mut parts = Vec::new();
+        if runtime.argv {
+            parts.push("text");
+        }
+        if runtime.file_flag {
+            parts.push("file");
+        }
+        if runtime.stdin {
+            parts.push("stdin");
+        }
+        parts.join(", ")
+    }
+
+    fn request_preview(&self) -> String {
+        let preview = self
+            .request_text
+            .lines()
+            .take(6)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if preview.trim().is_empty() {
+            "<empty request>".to_owned()
+        } else {
+            preview
+        }
+    }
+
+    fn request_summary(&self) -> String {
+        let first = self
+            .request_text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("<empty>");
+        let mut summary = first.trim().to_owned();
+        if summary.len() > 80 {
+            summary.truncate(80);
+            summary.push_str("...");
+        }
+        summary
+    }
+
+    fn panel_block(&self) -> Block<'static> {
+        Block::default()
+            .borders(Borders::ALL)
+            .style(Style::default().bg(self.background_color()))
+    }
+
+    fn title_line(&self, title: &str, subtitle: &str) -> Line<'static> {
+        styled_title(
+            title,
+            subtitle,
+            self.text_color(),
+            self.subtle_color(),
+            self.muted_color(),
+        )
+    }
+
+    fn accent_color(&self) -> Color {
+        resolved_accent_color(&self.app.config().theme.accent_color)
+    }
+
+    fn success_color(&self) -> Color {
+        resolved_success_color(&self.app.config().theme.success_color)
+    }
+
+    fn warning_color(&self) -> Color {
+        resolved_warning_color(&self.app.config().theme.warning_color)
+    }
+
+    fn background_color(&self) -> Color {
+        Color::Black
+    }
+
+    fn text_color(&self) -> Color {
+        Color::White
+    }
+
+    fn muted_color(&self) -> Color {
+        Color::Gray
+    }
+
+    fn subtle_color(&self) -> Color {
+        Color::DarkGray
+    }
+
+    fn notice_palette(&self) -> (&'static str, Color, Color) {
+        if let Some(running) = self.running.as_ref() {
+            match running.status() {
+                Some(LastRunStatus::Completed) => (" DONE ", Color::Black, self.success_color()),
+                Some(LastRunStatus::Failed) => (" FAIL ", Color::White, Color::Red),
+                Some(LastRunStatus::Canceled) => (" CANCELED ", Color::Black, self.accent_color()),
+                Some(LastRunStatus::MaxIterations) => {
+                    (" LIMIT ", Color::Black, self.warning_color())
+                }
+                Some(LastRunStatus::NeverRun) | None => {
+                    (" INFO ", Color::Black, self.accent_color())
+                }
+            }
+        } else {
+            (" INFO ", Color::Black, self.accent_color())
+        }
     }
 }
 
-struct ChannelDelegate {
-    tx: Sender<UiEvent>,
+struct TuiRunDelegate {
+    tx: std::sync::mpsc::Sender<UiEvent>,
 }
 
 #[async_trait]
-impl RunDelegate for ChannelDelegate {
+impl RunDelegate for TuiRunDelegate {
     async fn on_event(&mut self, event: RunEvent) -> Result<()> {
         self.tx
             .send(UiEvent::RunEvent(event))
-            .map_err(|_| anyhow!("failed to send run event"))
+            .map_err(|_| anyhow!("TUI event channel closed"))?;
+        Ok(())
+    }
+
+    async fn run_interactive_session(
+        &mut self,
+        config: &RunnerConfig,
+        invocation: &InteractiveSessionInvocation,
+    ) -> Result<Option<InteractiveSessionOutcome>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(UiEvent::InteractiveSession {
+                config: config.clone(),
+                invocation: invocation.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("TUI event channel closed"))?;
+        let outcome = reply_rx
+            .await
+            .map_err(|_| anyhow!("interactive session reply channel closed"))?
+            .map_err(anyhow::Error::msg)?;
+        Ok(Some(outcome))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
+    use std::fs;
+
+    use super::{RequestOrigin, TuiApp, TuiLaunchOptions, TuiPreloadedRequest, TuiRequestSource};
     use camino::Utf8PathBuf;
-    use crossterm::event::{KeyCode, KeyEvent};
     use ralph_app::RalphApp;
-    use ralph_core::{LastRunStatus, ScaffoldId};
-    use std::sync::OnceLock;
-    use tempfile::TempDir;
-    use tokio::runtime::Runtime;
 
-    use super::{RunningState, TuiApp, UiEvent};
-
-    fn configure_test_user_config_home() {
-        static TEST_CONFIG_HOME: OnceLock<Utf8PathBuf> = OnceLock::new();
-        let path = TEST_CONFIG_HOME.get_or_init(|| {
-            let path = Utf8PathBuf::from_path_buf(
-                std::env::temp_dir().join(format!("ralph-test-config-{}", std::process::id())),
-            )
-            .unwrap();
-            std::fs::create_dir_all(&path).unwrap();
-            path
-        });
+    fn configure_test_config_home() -> Utf8PathBuf {
+        let path = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("ralph-tui-test-config-{}", std::process::id())),
+        )
+        .unwrap();
+        fs::create_dir_all(&path).unwrap();
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", path.as_str());
+            std::env::set_var("RALPH_CONFIG_HOME", path.as_str());
         }
+        path
     }
 
-    fn temp_project_dir() -> (TempDir, Utf8PathBuf) {
-        configure_test_user_config_home();
-        let temp = tempfile::tempdir().unwrap();
-        let path = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        (temp, path)
-    }
-
-    #[test]
-    fn selected_target_review_tracks_selection() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(project_dir.clone())?;
-        app.create_target("alpha", Some(ScaffoldId::SinglePrompt))?;
-        app.create_target("beta", Some(ScaffoldId::SinglePrompt))?;
-
-        let runtime = Runtime::new()?;
-        let mut tui = TuiApp::new(app, runtime.handle().clone(), None);
-
-        assert_eq!(
-            tui.selected_target_review()
-                .map(|review| review.summary.id.as_str()),
-            tui.selected_target().map(|target| target.id.as_str())
-        );
-
-        tui.selected_target = 1;
-        tui.refresh_selected_target_review();
-
-        assert_eq!(
-            tui.selected_target_review()
-                .map(|review| review.summary.id.as_str()),
-            tui.selected_target().map(|target| target.id.as_str())
-        );
-        Ok(())
+    fn temp_project_dir() -> tempfile::TempDir {
+        configure_test_config_home();
+        tempfile::tempdir().unwrap()
     }
 
     #[test]
-    fn selected_target_review_refreshes_after_file_changes() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(project_dir.clone())?;
-        let summary = app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
-        let prompt_path = summary.prompt_files[0].path.clone();
-
-        let runtime = Runtime::new()?;
-        let mut tui = TuiApp::new(app, runtime.handle().clone(), None);
-        let original_contents = tui
-            .selected_target_review()
-            .and_then(|review| {
-                review
-                    .files
-                    .iter()
-                    .find(|file| file.name == "prompt_main.md")
-            })
-            .map(|file| file.contents.clone());
-
-        std::fs::write(&prompt_path, "# Prompt\n\nUpdated\n")?;
-        tui.refresh_selected_target_review();
-
-        let refreshed_contents = tui
-            .selected_target_review()
-            .and_then(|review| {
-                review
-                    .files
-                    .iter()
-                    .find(|file| file.name == "prompt_main.md")
-            })
-            .map(|file| file.contents.clone());
-
-        assert_ne!(original_contents, refreshed_contents);
-        assert_eq!(refreshed_contents.as_deref(), Some("# Prompt\n\nUpdated\n"));
-        Ok(())
-    }
-
-    #[test]
-    fn workflow_targets_are_detected_from_mode_even_without_scaffold() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(project_dir.clone())?;
-        app.create_target("demo", Some(ScaffoldId::PlanDriven))?;
-        std::fs::write(
-            project_dir.join(".ralph/targets/demo/target.toml"),
-            "id = \"demo\"\nmode = \"plan_driven\"\nlast_run_status = \"never_run\"\n\n[workflow]\nphase = \"plan\"\n",
-        )?;
-
-        let runtime = Runtime::new()?;
-        let tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
-
-        assert!(tui.selected_target_uses_hidden_workflow());
-        Ok(())
-    }
-
-    #[test]
-    fn selected_prompt_edit_path_tracks_selected_tab() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(project_dir.clone())?;
-        let summary = app.create_target("demo", Some(ScaffoldId::PlanBuild))?;
-
-        let runtime = Runtime::new()?;
-        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
-        tui.selected_prompt = 1;
-
-        let edit_path = tui.resolve_selected_edit_path()?;
-
-        assert_eq!(edit_path, summary.prompt_files[1].path);
-        Ok(())
-    }
-
-    #[test]
-    fn running_prompt_edit_path_tracks_requested_prompt() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(project_dir)?;
-        let summary = app.create_target("demo", Some(ScaffoldId::PlanBuild))?;
-
-        let runtime = Runtime::new()?;
-        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
-        tui.running = Some(super::RunningState::new(
-            "demo".to_owned(),
-            "1_build.md".to_owned(),
-            Some("1_build.md".to_owned()),
-            ralph_core::RunControl::new(),
-        ));
-
-        let edit_path = tui.resolve_running_edit_path()?;
-
-        assert_eq!(edit_path, summary.prompt_files[1].path);
-        Ok(())
-    }
-
-    #[test]
-    fn running_terminal_resize_reflows_from_full_transcript() {
-        let mut running = super::RunningState::new(
-            "demo".to_owned(),
-            "prompt_main.md".to_owned(),
-            Some("prompt_main.md".to_owned()),
-            ralph_core::RunControl::new(),
-        );
-        let long_line = "abcdefghijklmnopqrstuvwxyz0123456789";
-
-        running.push_terminal_text(&format!("{long_line}\n"));
-        running.ensure_terminal_size(24, 10);
-        running.ensure_terminal_size(24, 80);
-
-        let output = running.terminal.screen().contents();
-        assert!(output.contains(long_line));
-    }
-
-    #[test]
-    fn run_done_marks_run_finished_even_without_finished_event() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(project_dir)?;
-        let mut summary = app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
-        summary.last_run_status = LastRunStatus::Completed;
-
-        let runtime = Runtime::new()?;
-        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
-        tui.running = Some(RunningState::new(
-            "demo".to_owned(),
-            "prompt_main.md".to_owned(),
-            Some("prompt_main.md".to_owned()),
-            ralph_core::RunControl::new(),
-        ));
-
-        tui.handle_ui_event(UiEvent::RunDone(Ok(summary)));
-
-        let running = tui.running.as_ref().expect("running state");
-        assert!(running.is_finished());
-        assert_eq!(running.status(), Some(LastRunStatus::Completed));
-        assert!(
-            running
-                .terminal
-                .screen()
-                .contents()
-                .contains("Run ended with status: completed.")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn run_done_error_marks_failed_or_canceled_runs_finished() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(project_dir.clone())?;
-        app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
-        app.create_target("cancelled", Some(ScaffoldId::SinglePrompt))?;
-        let runtime = Runtime::new()?;
-
-        let mut failed_tui = TuiApp::new(
-            app.clone(),
+    fn launch_options_preload_request_and_select_workflow() {
+        let temp = temp_project_dir();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let app = RalphApp::load(project_dir).unwrap();
+        let tui = TuiApp::new(
+            app,
             runtime.handle().clone(),
-            Some("demo".to_owned()),
-        );
-        failed_tui.running = Some(RunningState::new(
-            "demo".to_owned(),
-            "prompt_main.md".to_owned(),
-            Some("prompt_main.md".to_owned()),
-            ralph_core::RunControl::new(),
-        ));
-        failed_tui.handle_ui_event(UiEvent::RunDone(Err("boom".to_owned())));
-        assert_eq!(
-            failed_tui.running.as_ref().and_then(RunningState::status),
-            Some(LastRunStatus::Failed)
-        );
+            TuiLaunchOptions {
+                preset_workflow: Some("task-based".to_owned()),
+                preloaded_request: Some(TuiPreloadedRequest {
+                    source: TuiRequestSource::Argv,
+                    text: "ship it".to_owned(),
+                    file_path: None,
+                }),
+                workflow_options: Default::default(),
+            },
+        )
+        .unwrap();
 
-        let mut cancelled_tui =
-            TuiApp::new(app, runtime.handle().clone(), Some("cancelled".to_owned()));
-        let running = RunningState::new(
-            "cancelled".to_owned(),
-            "prompt_main.md".to_owned(),
-            Some("prompt_main.md".to_owned()),
-            ralph_core::RunControl::new(),
-        );
-        running.control.cancel();
-        cancelled_tui.running = Some(running);
-        cancelled_tui.handle_ui_event(UiEvent::RunDone(Err("operation canceled".to_owned())));
-        assert_eq!(
-            cancelled_tui
-                .running
-                .as_ref()
-                .and_then(RunningState::status),
-            Some(LastRunStatus::Canceled)
-        );
-        Ok(())
+        assert_eq!(tui.workflow_id, "task-based");
+        assert_eq!(tui.request_text, "ship it");
+        assert_eq!(tui.request_origin, RequestOrigin::Argv);
+        assert!(tui.auto_start_run);
     }
 
     #[test]
-    fn delete_target_requires_explicit_yes_confirmation() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(project_dir.clone())?;
-        app.create_target("demo", Some(ScaffoldId::SinglePrompt))?;
+    fn cycle_agent_persists_next_available_agent() {
+        let temp = temp_project_dir();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        fs::create_dir_all(project_dir.join(".ralph").as_std_path()).unwrap();
+        fs::write(
+            project_dir.join(".ralph/config.toml").as_std_path(),
+            r#"
+default_agent = "one"
+agent = "one"
 
-        let runtime = Runtime::new()?;
-        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+[[agents]]
+id = "one"
+name = "One"
+builtin = false
 
-        tui.confirm_target_delete();
-        assert!(tui.confirmation.is_some());
-        tui.handle_confirmation_key(KeyEvent::from(KeyCode::Enter))?;
-        assert!(tui.confirmation.is_none());
-        assert_eq!(tui.app.list_targets()?.len(), 1);
+[agents.non_interactive]
+mode = "shell"
+command = "echo ok"
+prompt_input = "argv"
+prompt_env_var = "PROMPT"
 
-        tui.confirm_target_delete();
-        tui.handle_confirmation_key(KeyEvent::from(KeyCode::Tab))?;
-        tui.handle_confirmation_key(KeyEvent::from(KeyCode::Enter))?;
-        assert!(tui.confirmation.is_none());
-        assert!(tui.app.list_targets()?.is_empty());
+[agents.interactive]
+mode = "shell"
+command = "echo ok"
+prompt_input = "argv"
+prompt_env_var = "PROMPT"
 
-        Ok(())
-    }
+[[agents]]
+id = "two"
+name = "Two"
+builtin = false
 
-    #[test]
-    fn workflow_rebuild_requires_explicit_yes_confirmation() -> Result<()> {
-        let (_temp, project_dir) = temp_project_dir();
-        let app = RalphApp::load(project_dir.clone())?;
-        app.create_target("demo", Some(ScaffoldId::PlanDriven))?;
-        let target_dir = project_dir.join(".ralph/targets/demo");
-        std::fs::write(target_dir.join("plan.toml"), "version = 1\n")?;
+[agents.non_interactive]
+mode = "shell"
+command = "echo ok"
+prompt_input = "argv"
+prompt_env_var = "PROMPT"
 
-        let runtime = Runtime::new()?;
-        let mut tui = TuiApp::new(app, runtime.handle().clone(), Some("demo".to_owned()));
+[agents.interactive]
+mode = "shell"
+command = "echo ok"
+prompt_input = "argv"
+prompt_env_var = "PROMPT"
+"#,
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let app = RalphApp::load(project_dir).unwrap();
 
-        tui.confirm_workflow_rebuild()?;
-        assert!(tui.confirmation.is_some());
-        tui.handle_confirmation_key(KeyEvent::from(KeyCode::Enter))?;
-        assert!(tui.confirmation.is_none());
-        assert!(target_dir.join("plan.toml").exists());
-        assert!(!target_dir.join(".history").exists());
+        let mut tui = TuiApp::new(
+            app,
+            runtime.handle().clone(),
+            TuiLaunchOptions {
+                preset_workflow: Some("bare".to_owned()),
+                preloaded_request: Some(TuiPreloadedRequest {
+                    source: TuiRequestSource::Argv,
+                    text: "ship it".to_owned(),
+                    file_path: None,
+                }),
+                workflow_options: Default::default(),
+            },
+        )
+        .unwrap();
+        tui.cycle_agent(None).unwrap();
 
-        Ok(())
+        assert_eq!(tui.app.agent_id(), "two");
     }
 }

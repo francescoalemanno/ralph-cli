@@ -23,9 +23,10 @@ ralph-app = { version = "0.2.1", path = "../ralph-app" }
 ralph-core = { version = "0.2.1", path = "../ralph-core" }
 ralph-tui = { version = "0.2.1", path = "../ralph-tui" }
 serde.workspace = true
-serde_json.workspace = true
-tempfile.workspace = true
+serde_yaml.workspace = true
 tokio.workspace = true
 toml.workspace = true
-tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

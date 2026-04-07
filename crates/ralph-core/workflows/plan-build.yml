@@ -1,0 +1,81 @@
+version: 1
+workflow_id: plan-build
+title: Plan And Build
+description: Iterate between planning and building against one request.
+entrypoint: plan
+options:
+  specs-glob:
+    help: Specs files or glob to inspect before planning or building.
+    default: specs/*
+    value_name: GLOB
+  plan-file:
+    help: Implementation plan file to refine and execute.
+    default: IMPLEMENTATION_PLAN.md
+    value_name: FILE
+  agents-file:
+    help: Agent guidance file to update when learning durable operational guidance.
+    default: AGENTS.md
+    value_name: FILE
+request:
+  runtime:
+    argv: true
+    stdin: true
+    file_flag: true
+prompts:
+  plan:
+    title: Plan
+    is_interactive: false
+    fallback-route: plan
+    prompt: |
+      # Execution policy
+      1. Study `{ralph-option:specs-glob}`.
+      2. Study `{ralph-option:plan-file}` if present in the repository root.
+      3. Study the codebase areas that appear to hold shared utilities, core modules, or reusable components.
+      4. Study the existing source code before deciding something is missing.
+      5. Decide whether `{ralph-option:specs-glob}`, `{ralph-option:plan-file}`, and the existing source code are fully aligned and implementation-ready.
+         - If they are fully aligned, continue to 6.
+         - If you found gaps, inconsistencies, ambiguities, missing specifications, or plan defects that still need repair, continue to 7.
+      6. Find the single most high-leverage remaining build item in `{ralph-option:plan-file}`.
+         - If no build item remains, you MUST run `$RALPH_BIN emit loop-stop:ok no-build-items-remaining`, and then goto 10. Stop.
+         - Else run `$RALPH_BIN emit loop-route build` and goto 10. Stop.
+      7. Reconcile `{ralph-option:specs-glob}`, `{ralph-option:plan-file}`, and the existing source code. Prefer shared, consolidated solutions already present in the codebase over ad hoc duplication.
+      8. Update `{ralph-option:specs-glob}` conservatively until a builder could implement without guessing.
+      9. Update `{ralph-option:plan-file}` in the repository root as a prioritized list of remaining work, where each bullet is one concrete, observable outcome small enough for one build loop to finish completely. Then run `$RALPH_BIN emit loop-continue iterating-on-plan`.
+      10. Stop.
+
+      # Constraints
+      0. NEVER implement, plan ONLY.
+      1. NEVER assume that something is not-implemented; study the source code.
+      2. YAGNI ruthlessly - no speculative features.
+      3. Prefer refining `{ralph-option:specs-glob}` over pushing guesses into implementation.
+      4. Order `{ralph-option:plan-file}` so earlier work unlocks later work and front-loads risk reduction, shared interfaces, migrations, and compatibility work.
+      5. Fold low-value chores into the item they validate; do not create standalone busywork items unless they materially unblock later work.
+      6. Prefer vertical-slice plan items over horizontal phase-based items whenever possible, because vertical slices reduce integration risk, surface hidden dependencies earlier, and leave the repository in a more verifiable working state after each build loop.
+      7. Consider missing elements and plan accordingly. If an element is missing, search first to confirm it does not already exist, then, if needed, author the specification under `{ralph-option:specs-glob}`.
+
+      # ULTIMATE GOAL
+      {ralph-request}
+  build:
+    title: Build
+    is_interactive: false
+    fallback-route: build
+    prompt: |
+      # Execution policy
+      1. Study `{ralph-option:specs-glob}`.
+      2. Study `{ralph-option:plan-file}` if present in the repository root.
+      3. Study the existing source code before deciding something is missing.
+      4. Check whether `{ralph-option:plan-file}` and `{ralph-option:specs-glob}` are sufficient to implement without guessing.
+         - If they are missing, stale, ambiguous, or materially inconsistent with the code, run `$RALPH_BIN emit loop-route plan` and goto 9. Stop.
+      5. Find the single most high-leverage open item in `{ralph-option:plan-file}`.
+         - If no open item remains, run `$RALPH_BIN emit loop-route plan` and goto 9. Stop.
+         - Else run `$RALPH_BIN emit loop-continue single-build-task-taken` and proceed.
+      6. Execute ONLY the chosen high-priority item completely against the specifications. Do not leave placeholders or partial implementations behind.
+      7. Run the checks relevant to the code you changed.
+      8. Update `{ralph-option:plan-file}` with completed work and new findings such that the next worker can continue seamlessly. Update `{ralph-option:agents-file}` only when you learn durable operational guidance about running or debugging the project.
+      9. Stop.
+
+      # Constraints
+      1. NEVER assume that something is not-implemented; study the source code.
+      2. YAGNI ruthlessly - no speculative features.
+      3. If the work requires materially reshaping specs or the plan, route back to `plan` instead of guessing.
+      4. Execute only one plan item per run.

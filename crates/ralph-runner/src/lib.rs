@@ -12,7 +12,7 @@ use ralph_core::{
 use tempfile::NamedTempFile;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
-    process::{Child as AsyncChild, Command as AsyncCommand},
+    process::Command as AsyncCommand,
     sync::mpsc::{self, UnboundedSender},
     task::JoinHandle,
     time::{Duration, sleep, timeout},
@@ -26,10 +26,12 @@ pub enum RunnerStreamEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractiveSessionInvocation {
+    pub session_name: String,
     pub initial_prompt: String,
     pub project_dir: Utf8PathBuf,
-    pub target_dir: Utf8PathBuf,
-    pub goal_path: Utf8PathBuf,
+    pub run_dir: Utf8PathBuf,
+    pub run_id: Option<String>,
+    pub prompt_path: Option<Utf8PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,34 +41,34 @@ pub struct InteractiveSessionOutcome {
 
 #[derive(Debug, Clone)]
 struct TemplateContext {
+    run_id: String,
     prompt_text: String,
     project_dir: Utf8PathBuf,
-    target_dir: Utf8PathBuf,
-    prompt_path: Utf8PathBuf,
+    run_dir: Utf8PathBuf,
+    prompt_path: Option<Utf8PathBuf>,
     prompt_name: String,
-    goal_path: Option<Utf8PathBuf>,
 }
 
 impl TemplateContext {
     fn from_invocation(invocation: RunnerInvocation) -> Self {
         Self {
+            run_id: invocation.run_id,
             prompt_text: invocation.prompt_text,
             project_dir: invocation.project_dir,
-            target_dir: invocation.target_dir,
-            prompt_path: invocation.prompt_path,
+            run_dir: invocation.run_dir,
+            prompt_path: Some(invocation.prompt_path),
             prompt_name: invocation.prompt_name,
-            goal_path: None,
         }
     }
 
     fn from_interactive(invocation: &InteractiveSessionInvocation) -> Self {
         Self {
+            run_id: invocation.run_id.clone().unwrap_or_default(),
             prompt_text: invocation.initial_prompt.clone(),
             project_dir: invocation.project_dir.clone(),
-            target_dir: invocation.target_dir.clone(),
-            prompt_path: invocation.goal_path.clone(),
-            prompt_name: "workflow_goal_interview".to_owned(),
-            goal_path: Some(invocation.goal_path.clone()),
+            run_dir: invocation.run_dir.clone(),
+            prompt_path: invocation.prompt_path.clone(),
+            prompt_name: invocation.session_name.clone(),
         }
     }
 }
@@ -80,6 +82,16 @@ pub trait RunnerAdapter: Send + Sync {
         control: &RunControl,
         stream: Option<UnboundedSender<RunnerStreamEvent>>,
     ) -> Result<RunnerResult>;
+
+    fn run_interactive_session(
+        &self,
+        _config: &RunnerConfig,
+        _invocation: &InteractiveSessionInvocation,
+    ) -> Result<InteractiveSessionOutcome> {
+        Err(anyhow!(
+            "interactive sessions are not supported by this runner"
+        ))
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -99,7 +111,6 @@ impl RunnerAdapter for CommandRunner {
         let prompt_file_path = prompt_file.path().to_string_lossy().to_string();
 
         let mut command = build_async_command(config, &context, &prompt_file_path)?;
-        configure_async_process_group(&mut command);
         command.current_dir(context.project_dir.as_std_path());
         command.kill_on_drop(true);
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -116,7 +127,6 @@ impl RunnerAdapter for CommandRunner {
         );
 
         let mut child = command.spawn().context("failed to spawn runner process")?;
-        let child_pid = child.id();
         let stdout = child
             .stdout
             .take()
@@ -146,32 +156,12 @@ impl RunnerAdapter for CommandRunner {
         let stderr_task = tokio::spawn(read_stream(stderr, chunk_tx));
 
         let mut output_buffer = String::new();
-        let mut sent_cancel_stage = 0_u8;
         let exit_code = loop {
-            let cancel_stage = control.cancel_stage();
-            if cancel_stage > sent_cancel_stage {
-                match cancel_stage {
-                    1 => interrupt_runner(&mut child, child_pid).await,
-                    _ => force_kill_runner(&mut child, child_pid).await,
-                }
-                sent_cancel_stage = cancel_stage;
-            }
-
-            if sent_cancel_stage >= 2 {
+            if control.is_cancelled() {
+                let _ = child.start_kill();
                 stdout_task.abort();
                 stderr_task.abort();
                 let _ = timeout(Duration::from_millis(250), child.wait()).await;
-                return Err(anyhow!("runner canceled"));
-            }
-
-            if sent_cancel_stage >= 1
-                && child
-                    .try_wait()
-                    .context("failed while polling canceled runner")?
-                    .is_some()
-            {
-                stdout_task.abort();
-                stderr_task.abort();
                 return Err(anyhow!("runner canceled"));
             }
 
@@ -207,6 +197,14 @@ impl RunnerAdapter for CommandRunner {
             output: output_buffer,
             exit_code,
         })
+    }
+
+    fn run_interactive_session(
+        &self,
+        config: &RunnerConfig,
+        invocation: &InteractiveSessionInvocation,
+    ) -> Result<InteractiveSessionOutcome> {
+        CommandRunner::run_interactive_session(self, config, invocation)
     }
 }
 
@@ -264,23 +262,16 @@ fn build_async_command(
 ) -> Result<AsyncCommand> {
     let command = match config.mode {
         CommandMode::Exec => {
-            let program = config
-                .program
-                .as_deref()
-                .ok_or_else(|| anyhow!("exec command is missing program"))?;
+            let (program, args) = rendered_exec_parts(config, context, prompt_file)?;
             let mut command = AsyncCommand::new(program);
-            for arg in &config.args {
-                command.arg(render_template(arg, context, prompt_file));
+            for arg in args {
+                command.arg(arg);
             }
             command
         }
         CommandMode::Shell => {
-            let template = config
-                .command
-                .as_deref()
-                .ok_or_else(|| anyhow!("shell command is missing command"))?;
             let mut command = shell_async_command();
-            command.arg(render_template(template, context, prompt_file));
+            command.arg(rendered_shell_command(config, context, prompt_file)?);
             command
         }
     };
@@ -294,27 +285,49 @@ fn build_std_command(
 ) -> Result<StdCommand> {
     let command = match config.mode {
         CommandMode::Exec => {
-            let program = config
-                .program
-                .as_deref()
-                .ok_or_else(|| anyhow!("exec command is missing program"))?;
+            let (program, args) = rendered_exec_parts(config, context, prompt_file)?;
             let mut command = StdCommand::new(program);
-            for arg in &config.args {
-                command.arg(render_template(arg, context, prompt_file));
+            for arg in args {
+                command.arg(arg);
             }
             command
         }
         CommandMode::Shell => {
-            let template = config
-                .command
-                .as_deref()
-                .ok_or_else(|| anyhow!("shell command is missing command"))?;
             let mut command = shell_std_command();
-            command.arg(render_template(template, context, prompt_file));
+            command.arg(rendered_shell_command(config, context, prompt_file)?);
             command
         }
     };
     Ok(command)
+}
+
+fn rendered_exec_parts(
+    config: &RunnerConfig,
+    context: &TemplateContext,
+    prompt_file: &str,
+) -> Result<(String, Vec<String>)> {
+    let program = config
+        .program
+        .as_deref()
+        .ok_or_else(|| anyhow!("exec command is missing program"))?;
+    let args = config
+        .args
+        .iter()
+        .map(|arg| render_template(arg, context, prompt_file))
+        .collect();
+    Ok((render_template(program, context, prompt_file), args))
+}
+
+fn rendered_shell_command(
+    config: &RunnerConfig,
+    context: &TemplateContext,
+    prompt_file: &str,
+) -> Result<String> {
+    let template = config
+        .command
+        .as_deref()
+        .ok_or_else(|| anyhow!("shell command is missing command"))?;
+    Ok(render_template(template, context, prompt_file))
 }
 
 fn rendered_envs(
@@ -332,13 +345,17 @@ fn rendered_envs(
         "RALPH_PROJECT_DIR".to_owned(),
         context.project_dir.to_string(),
     ));
-    envs.push((
-        "RALPH_TARGET_DIR".to_owned(),
-        context.target_dir.to_string(),
-    ));
+    if !context.run_id.is_empty() {
+        envs.push(("RALPH_RUN_ID".to_owned(), context.run_id.clone()));
+    }
+    let ralph_bin = current_binary_path();
+    if !ralph_bin.is_empty() {
+        envs.push(("RALPH_BIN".to_owned(), ralph_bin));
+    }
+    envs.push(("RALPH_RUN_DIR".to_owned(), context.run_dir.to_string()));
     envs.push((
         "RALPH_PROMPT_PATH".to_owned(),
-        context.prompt_path.to_string(),
+        resolved_prompt_path(context, prompt_file).to_owned(),
     ));
     envs.push(("RALPH_PROMPT_NAME".to_owned(), context.prompt_name.clone()));
     envs.push((
@@ -346,9 +363,6 @@ fn rendered_envs(
         invocation_mode(&context.prompt_name),
     ));
     envs.push(("RALPH_PROMPT_FILE".to_owned(), prompt_file.to_owned()));
-    if let Some(goal_path) = &context.goal_path {
-        envs.push(("RALPH_GOAL_PATH".to_owned(), goal_path.to_string()));
-    }
     if matches!(config.prompt_input, PromptInput::Env) {
         envs.push((config.prompt_env_var.clone(), context.prompt_text.clone()));
     }
@@ -385,24 +399,6 @@ where
 }
 
 #[cfg(unix)]
-fn configure_async_process_group(command: &mut AsyncCommand) {
-    use std::io;
-
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn configure_async_process_group(_command: &mut AsyncCommand) {}
-
-#[cfg(unix)]
 fn configure_std_process_group(command: &mut StdCommand) {
     use std::os::unix::process::CommandExt;
 
@@ -419,25 +415,6 @@ fn configure_std_process_group(command: &mut StdCommand) {
 
 #[cfg(not(unix))]
 fn configure_std_process_group(_command: &mut StdCommand) {}
-
-async fn interrupt_runner(child: &mut AsyncChild, child_pid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = child_pid {
-        let _ = signal_process_group(pid, libc::SIGINT);
-        return;
-    }
-
-    let _ = child.start_kill();
-}
-
-async fn force_kill_runner(child: &mut AsyncChild, child_pid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = child_pid {
-        let _ = signal_process_group(pid, libc::SIGKILL);
-    }
-
-    let _ = child.start_kill();
-}
 
 #[cfg(unix)]
 fn signal_process_group(pid: u32, signal: i32) -> Result<()> {
@@ -560,14 +537,13 @@ impl Drop for ChildCleanupGuard {
 fn render_template(template: &str, context: &TemplateContext, prompt_file: &str) -> String {
     let mut rendered = template.to_owned();
     let mode = invocation_mode(&context.prompt_name);
-    let goal_path = context.goal_path.as_ref().unwrap_or(&context.prompt_path);
+    let prompt_path = resolved_prompt_path(context, prompt_file);
     let replacements = [
         ("{project_dir}", context.project_dir.as_str()),
-        ("{target_dir}", context.target_dir.as_str()),
+        ("{run_dir}", context.run_dir.as_str()),
         ("{prompt_name}", context.prompt_name.as_str()),
         ("{mode}", mode.as_str()),
-        ("{prompt_path}", context.prompt_path.as_str()),
-        ("{goal_path}", goal_path.as_str()),
+        ("{prompt_path}", prompt_path),
         ("{prompt}", context.prompt_text.as_str()),
         ("{prompt_file}", prompt_file),
     ];
@@ -575,6 +551,21 @@ fn render_template(template: &str, context: &TemplateContext, prompt_file: &str)
         rendered = rendered.replace(needle, value);
     }
     rendered
+}
+
+fn resolved_prompt_path<'a>(context: &'a TemplateContext, _prompt_file: &'a str) -> &'a str {
+    context
+        .prompt_path
+        .as_deref()
+        .map(|path| path.as_str())
+        .unwrap_or(context.project_dir.as_str())
+}
+
+fn current_binary_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_default()
 }
 
 fn invocation_mode(prompt_name: &str) -> String {
@@ -620,8 +611,8 @@ mod tests {
 
     #[test]
     fn mode_uses_prompt_stem_for_file_backed_prompts() {
-        assert_eq!(super::invocation_mode("prompt_main.md"), "prompt_main");
-        assert_eq!(super::invocation_mode("0_plan.md"), "0_plan");
+        assert_eq!(super::invocation_mode("task-based.yml"), "task-based");
+        assert_eq!(super::invocation_mode("plan-build.yml"), "plan-build");
         assert_eq!(
             super::invocation_mode("plan_driven_build"),
             "plan_driven_build"
@@ -631,33 +622,33 @@ mod tests {
     #[test]
     fn mode_template_is_distinct_from_prompt_name() {
         let context = TemplateContext::from_invocation(RunnerInvocation {
+            run_id: "run-1".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
-            target_dir: "/tmp/project/.ralph/targets/demo".into(),
-            prompt_path: "/tmp/project/.ralph/targets/demo/prompt_main.md".into(),
-            prompt_name: "prompt_main.md".to_owned(),
+            run_dir: "/tmp/project/.ralph/runs/task-based/run-1".into(),
+            prompt_path: "/tmp/.config/ralph/workflows/task-based.yml".into(),
+            prompt_name: "task".to_owned(),
         });
 
         let rendered = render_template("{prompt_name}|{mode}", &context, "/tmp/prompt.txt");
 
-        assert_eq!(rendered, "prompt_main.md|prompt_main");
+        assert_eq!(rendered, "task|task");
     }
 
     #[test]
-    fn interactive_context_exposes_goal_path() {
+    fn interactive_context_uses_project_dir_for_prompt_path() {
         let context = TemplateContext::from_interactive(&InteractiveSessionInvocation {
+            session_name: "workflow_goal_interview".to_owned(),
             initial_prompt: "hello".to_owned(),
             project_dir: Utf8PathBuf::from("/tmp/project"),
-            target_dir: Utf8PathBuf::from("/tmp/project/.ralph/targets/demo"),
-            goal_path: Utf8PathBuf::from("/tmp/project/.ralph/targets/demo/GOAL.md"),
+            run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/pdd/run-1"),
+            run_id: None,
+            prompt_path: None,
         });
 
-        let rendered = render_template("{goal_path}|{prompt_file}", &context, "/tmp/prompt.txt");
+        let rendered = render_template("{prompt_path}|{prompt_file}", &context, "/tmp/prompt.txt");
 
-        assert_eq!(
-            rendered,
-            "/tmp/project/.ralph/targets/demo/GOAL.md|/tmp/prompt.txt"
-        );
+        assert_eq!(rendered, "/tmp/project|/tmp/prompt.txt");
     }
 
     #[test]
@@ -665,6 +656,7 @@ mod tests {
         for builtin in [
             CodingAgent::Codex.definition(),
             CodingAgent::Opencode.definition(),
+            CodingAgent::Pi.definition(),
             CodingAgent::Raijin.definition(),
         ] {
             if builtin.interactive.mode == CommandMode::Exec {
@@ -676,14 +668,47 @@ mod tests {
     #[test]
     fn env_templates_render_prompt_file_and_prompt() {
         let context = TemplateContext::from_invocation(RunnerInvocation {
+            run_id: "run-1".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
-            target_dir: "/tmp/project/.ralph/targets/demo".into(),
-            prompt_path: "/tmp/project/.ralph/targets/demo/prompt_main.md".into(),
-            prompt_name: "prompt_main.md".to_owned(),
+            run_dir: "/tmp/project/.ralph/runs/task-based/run-1".into(),
+            prompt_path: "/tmp/.config/ralph/workflows/task-based.yml".into(),
+            prompt_name: "task".to_owned(),
         });
         let rendered = render_template("X={prompt} Y={prompt_file}", &context, "/tmp/prompt.txt");
         assert_eq!(rendered, "X=hello Y=/tmp/prompt.txt");
+    }
+
+    #[test]
+    fn rendered_envs_include_current_binary_path() {
+        let context = TemplateContext::from_invocation(RunnerInvocation {
+            run_id: "run-1".to_owned(),
+            prompt_text: "hello".to_owned(),
+            project_dir: "/tmp/project".into(),
+            run_dir: "/tmp/project/.ralph/runs/task-based/run-1".into(),
+            prompt_path: "/tmp/.config/ralph/workflows/task-based.yml".into(),
+            prompt_name: "task".to_owned(),
+        });
+        let config = ralph_core::RunnerConfig {
+            mode: CommandMode::Shell,
+            program: None,
+            args: Vec::new(),
+            command: Some("echo ok".to_owned()),
+            prompt_input: PromptInput::File,
+            prompt_env_var: "PROMPT".to_owned(),
+            env: BTreeMap::new(),
+        };
+
+        let envs = super::rendered_envs(&config, &context, "/tmp/prompt.txt");
+        assert!(
+            envs.iter().any(|(key, value)| {
+                key == "RALPH_BIN" && std::path::Path::new(value).is_absolute()
+            }),
+            "RALPH_BIN must be present as an absolute path"
+        );
+        assert!(envs.iter().any(|(key, value)| {
+            key == "RALPH_RUN_DIR" && value == "/tmp/project/.ralph/runs/task-based/run-1"
+        }));
     }
 
     #[test]
@@ -695,7 +720,9 @@ mod tests {
                 .env
                 .get("OPENCODE_CONFIG_CONTENT")
                 .map(String::as_str),
-            Some(r#"{"$schema":"https://opencode.ai/config.json","permission":"allow"}"#)
+            Some(
+                r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#
+            )
         );
         assert_eq!(
             opencode
@@ -703,7 +730,9 @@ mod tests {
                 .env
                 .get("OPENCODE_CONFIG_CONTENT")
                 .map(String::as_str),
-            Some(r#"{"$schema":"https://opencode.ai/config.json","permission":"allow"}"#)
+            Some(
+                r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#
+            )
         );
     }
 
