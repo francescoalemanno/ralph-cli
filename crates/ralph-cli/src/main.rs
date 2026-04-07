@@ -247,7 +247,7 @@ struct EmitContext {
     run_id: String,
     project_dir: Utf8PathBuf,
     run_dir: Utf8PathBuf,
-    prompt_path: Utf8PathBuf,
+    prompt_path: Option<Utf8PathBuf>,
     prompt_name: String,
 }
 
@@ -272,7 +272,7 @@ fn run_emit(args: EmitArgs) -> Result<()> {
             body,
             project_dir: context.project_dir,
             run_dir: context.run_dir,
-            prompt_path: context.prompt_path,
+            prompt_path: context.prompt_path.unwrap_or_default(),
             prompt_name: context.prompt_name,
             pid: std::process::id(),
         },
@@ -283,13 +283,13 @@ fn run_emit(args: EmitArgs) -> Result<()> {
 }
 
 fn emit_context_from_env() -> Result<EmitContext> {
-    Ok(EmitContext {
-        run_id: required_env("RALPH_RUN_ID")?,
-        project_dir: env_utf8_path("RALPH_PROJECT_DIR")?,
-        run_dir: env_utf8_path("RALPH_RUN_DIR")?,
-        prompt_path: env_utf8_path("RALPH_PROMPT_PATH")?,
-        prompt_name: required_env("RALPH_PROMPT_NAME")?,
-    })
+    build_emit_context(
+        env_utf8_path("RALPH_RUN_DIR")?,
+        optional_env("RALPH_RUN_ID")?,
+        optional_env_utf8_path("RALPH_PROJECT_DIR")?,
+        optional_env_utf8_path("RALPH_PROMPT_PATH")?,
+        optional_env("RALPH_PROMPT_NAME")?,
+    )
 }
 
 fn validate_emit_args(event: &str, body: &str, context: &EmitContext) -> Result<()> {
@@ -347,8 +347,90 @@ fn required_env(key: &str) -> Result<String> {
         .map_err(|_| anyhow!("missing {key}; this command only works inside a Ralph agent run"))
 }
 
+fn optional_env(key: &str) -> Result<Option<String>> {
+    match env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(anyhow!(
+            "{key} is not valid UTF-8; this command only works inside a Ralph agent run"
+        )),
+    }
+}
+
 fn env_utf8_path(key: &str) -> Result<Utf8PathBuf> {
     Ok(Utf8PathBuf::from(required_env(key)?))
+}
+
+fn optional_env_utf8_path(key: &str) -> Result<Option<Utf8PathBuf>> {
+    optional_env(key).map(|value| value.map(Utf8PathBuf::from))
+}
+
+fn build_emit_context(
+    run_dir: Utf8PathBuf,
+    run_id_env: Option<String>,
+    project_dir_env: Option<Utf8PathBuf>,
+    prompt_path: Option<Utf8PathBuf>,
+    prompt_name: Option<String>,
+) -> Result<EmitContext> {
+    if !run_dir.is_absolute() {
+        return Err(anyhow!(
+            "RALPH_RUN_DIR must be an absolute path; got {}",
+            run_dir
+        ));
+    }
+
+    let derived_run_id = run_dir
+        .file_name()
+        .ok_or_else(|| {
+            anyhow!(
+                "RALPH_RUN_DIR must end with a run id directory: {}",
+                run_dir
+            )
+        })?
+        .to_owned();
+    let run_id = match run_id_env {
+        Some(run_id) if run_id != derived_run_id => {
+            return Err(anyhow!(
+                "RALPH_RUN_ID '{}' does not match RALPH_RUN_DIR '{}'",
+                run_id,
+                run_dir
+            ));
+        }
+        Some(run_id) => run_id,
+        None => derived_run_id,
+    };
+
+    let derived_project_dir = project_dir_from_run_dir(&run_dir);
+    let project_dir = match (project_dir_env, derived_project_dir) {
+        (Some(project_dir), Some(derived)) if project_dir != derived => {
+            return Err(anyhow!(
+                "RALPH_PROJECT_DIR '{}' does not match RALPH_RUN_DIR '{}'",
+                project_dir,
+                run_dir
+            ));
+        }
+        (Some(project_dir), _) => project_dir,
+        (None, Some(derived)) => derived,
+        (None, None) => resolve_project_dir(None)?,
+    };
+
+    Ok(EmitContext {
+        run_id,
+        project_dir,
+        run_dir,
+        prompt_path,
+        prompt_name: prompt_name.unwrap_or_default(),
+    })
+}
+
+fn project_dir_from_run_dir(run_dir: &Utf8Path) -> Option<Utf8PathBuf> {
+    let workflow_dir = run_dir.parent()?;
+    let runs_dir = workflow_dir.parent()?;
+    let ralph_dir = runs_dir.parent()?;
+    if runs_dir.file_name()? != "runs" || ralph_dir.file_name()? != ".ralph" {
+        return None;
+    }
+    Some(ralph_dir.parent()?.to_path_buf())
 }
 
 fn current_unix_timestamp_ms() -> u64 {
@@ -398,7 +480,10 @@ fn resolve_project_relative_path(project_dir: &Utf8Path, path: &Utf8Path) -> Utf
 }
 
 fn available_routes(context: &EmitContext) -> Result<Vec<String>> {
-    let workflow = load_workflow_from_path(&context.prompt_path)?;
+    let prompt_path = context.prompt_path.as_ref().ok_or_else(|| {
+        anyhow!("missing RALPH_PROMPT_PATH; `loop-route` requires workflow source context")
+    })?;
+    let workflow = load_workflow_from_path(prompt_path)?;
     Ok(workflow
         .prompt_ids()
         .into_iter()
@@ -580,7 +665,7 @@ prompts:
             run_id: "run-1".to_owned(),
             project_dir: Utf8PathBuf::from("/tmp/project"),
             run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
-            prompt_path: workflow_path,
+            prompt_path: Some(workflow_path),
             prompt_name: "plan".to_owned(),
         };
         let error = validate_loop_route_body("broken", &context)
@@ -624,7 +709,7 @@ prompts:
             run_id: "run-1".to_owned(),
             project_dir: Utf8PathBuf::from("/tmp/project"),
             run_dir,
-            prompt_path: workflow_path,
+            prompt_path: Some(workflow_path),
             prompt_name: "plan".to_owned(),
         };
 
@@ -659,7 +744,7 @@ prompts:
                 run_id: "run-1".to_owned(),
                 project_dir: Utf8PathBuf::from("/tmp/project"),
                 run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
-                prompt_path: workflow_path,
+                prompt_path: Some(workflow_path),
                 prompt_name: "plan".to_owned(),
             },
         )
@@ -699,11 +784,83 @@ prompts:
                 run_id: "run-1".to_owned(),
                 project_dir: Utf8PathBuf::from("/tmp/project"),
                 run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
-                prompt_path: workflow_path,
+                prompt_path: Some(workflow_path),
                 prompt_name: "plan".to_owned(),
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn emit_context_derives_run_id_and_project_dir_from_run_dir() {
+        let context = build_emit_context(
+            Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(context.run_id, "run-1");
+        assert_eq!(context.project_dir, Utf8PathBuf::from("/tmp/project"));
+        assert_eq!(
+            context.run_dir,
+            Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1")
+        );
+        assert!(context.prompt_path.is_none());
+        assert!(context.prompt_name.is_empty());
+    }
+
+    #[test]
+    fn emit_context_rejects_mismatched_run_id_and_run_dir() {
+        let error = build_emit_context(
+            Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+            Some("run-2".to_owned()),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("RALPH_RUN_ID 'run-2' does not match RALPH_RUN_DIR"));
+    }
+
+    #[test]
+    fn emit_context_rejects_mismatched_project_dir_and_run_dir() {
+        let error = build_emit_context(
+            Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+            None,
+            Some(Utf8PathBuf::from("/tmp/other-project")),
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("RALPH_PROJECT_DIR '/tmp/other-project' does not match RALPH_RUN_DIR")
+        );
+    }
+
+    #[test]
+    fn loop_route_requires_prompt_path_context() {
+        let error = validate_emit_args(
+            "loop-route",
+            "build",
+            &EmitContext {
+                run_id: "run-1".to_owned(),
+                project_dir: Utf8PathBuf::from("/tmp/project"),
+                run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/plan-build/run-1"),
+                prompt_path: None,
+                prompt_name: "plan".to_owned(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("missing RALPH_PROMPT_PATH"));
     }
 
     #[test]
