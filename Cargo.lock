@@ -757,7 +757,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "ralph-app"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "ralph-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -788,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "ralph-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "camino",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "ralph-runner"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -816,7 +816,7 @@ dependencies = [
 
 [[package]]
 name = "ralph-tui"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
