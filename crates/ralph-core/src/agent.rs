@@ -82,6 +82,7 @@ impl CodingAgent {
                 id: self.id().to_owned(),
                 name: self.label().to_owned(),
                 builtin: true,
+                hidden: false,
                 non_interactive: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("opencode".to_owned()),
@@ -122,6 +123,7 @@ impl CodingAgent {
                 id: self.id().to_owned(),
                 name: self.label().to_owned(),
                 builtin: true,
+                hidden: false,
                 non_interactive: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("codex".to_owned()),
@@ -149,6 +151,7 @@ impl CodingAgent {
                 id: self.id().to_owned(),
                 name: self.label().to_owned(),
                 builtin: true,
+                hidden: false,
                 non_interactive: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("claude".to_owned()),
@@ -181,6 +184,7 @@ impl CodingAgent {
                 id: self.id().to_owned(),
                 name: self.label().to_owned(),
                 builtin: true,
+                hidden: false,
                 non_interactive: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("droid".to_owned()),
@@ -208,6 +212,7 @@ impl CodingAgent {
                 id: self.id().to_owned(),
                 name: self.label().to_owned(),
                 builtin: true,
+                hidden: false,
                 non_interactive: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("raijin".to_owned()),
@@ -231,6 +236,7 @@ impl CodingAgent {
                 id: self.id().to_owned(),
                 name: self.label().to_owned(),
                 builtin: true,
+                hidden: false,
                 non_interactive: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("gemini".to_owned()),
@@ -254,6 +260,7 @@ impl CodingAgent {
                 id: self.id().to_owned(),
                 name: self.label().to_owned(),
                 builtin: true,
+                hidden: false,
                 non_interactive: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("pi".to_owned()),
@@ -355,6 +362,8 @@ pub struct AgentConfig {
     pub name: String,
     #[serde(default)]
     pub builtin: bool,
+    #[serde(default)]
+    pub hidden: bool,
     pub non_interactive: RunnerConfig,
     pub interactive: RunnerConfig,
 }
@@ -366,10 +375,32 @@ impl AgentConfig {
 }
 
 pub fn builtin_agents() -> Vec<AgentConfig> {
-    CodingAgent::all()
+    let mut agents = CodingAgent::all()
         .into_iter()
         .map(CodingAgent::definition)
-        .collect()
+        .collect::<Vec<_>>();
+    agents.push(test_shell_agent_definition());
+    agents
+}
+
+fn test_shell_agent_definition() -> AgentConfig {
+    let runner = RunnerConfig {
+        mode: CommandMode::Shell,
+        program: None,
+        args: Vec::new(),
+        command: Some("{prompt}".to_owned()),
+        prompt_input: PromptInput::Argv,
+        prompt_env_var: default_prompt_env_var(),
+        env: BTreeMap::new(),
+    };
+    AgentConfig {
+        id: "__test_shell".to_owned(),
+        name: "Test Shell".to_owned(),
+        builtin: true,
+        hidden: true,
+        non_interactive: runner.clone(),
+        interactive: runner,
+    }
 }
 
 fn detect_agents_in_path(path: Option<&OsStr>, pathext: Option<&OsStr>) -> Vec<CodingAgent> {
@@ -430,9 +461,30 @@ mod tests {
         assert_eq!(
             builtin_ids,
             vec![
-                "opencode", "codex", "claude", "droid", "gemini", "pi", "raijin"
+                "opencode",
+                "codex",
+                "claude",
+                "droid",
+                "gemini",
+                "pi",
+                "raijin",
+                "__test_shell",
             ]
         );
+    }
+
+    #[test]
+    fn hidden_test_shell_builtin_executes_prompts_verbatim_in_shell_mode() {
+        let agent = builtin_agents()
+            .into_iter()
+            .find(|agent| agent.id == "__test_shell")
+            .expect("hidden test shell builtin must exist");
+
+        assert!(agent.hidden);
+        assert_eq!(agent.non_interactive.mode, CommandMode::Shell);
+        assert_eq!(agent.non_interactive.command.as_deref(), Some("{prompt}"));
+        assert_eq!(agent.interactive.mode, CommandMode::Shell);
+        assert_eq!(agent.interactive.command.as_deref(), Some("{prompt}"));
     }
 
     #[test]
