@@ -17,6 +17,6 @@ pub use types::{LastRunStatus, RunControl, RunnerInvocation, RunnerResult, Workf
 pub use workflow::{
     NO_ROUTE_ERROR, NO_ROUTE_OK, WorkflowDefinition, WorkflowFileRequest, WorkflowOptionDefinition,
     WorkflowPromptDefinition, WorkflowRequestDefinition, WorkflowRuntimeRequest, WorkflowSummary,
-    list_workflows, load_workflow, load_workflow_from_path, seed_builtin_workflows_if_missing,
-    workflow_config_dir, workflow_option_flag,
+    list_all_workflows, list_workflows, load_workflow, load_workflow_from_path,
+    seed_builtin_workflows_if_missing, workflow_config_dir, workflow_option_flag,
 };

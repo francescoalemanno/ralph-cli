@@ -25,6 +25,8 @@ pub struct WorkflowDefinition {
     pub title: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub hidden: bool,
     pub entrypoint: String,
     #[serde(default)]
     pub options: BTreeMap<String, WorkflowOptionDefinition>,
@@ -371,19 +373,33 @@ pub fn load_workflow(workflow_id: &str) -> Result<WorkflowDefinition> {
 }
 
 pub fn list_workflows() -> Result<Vec<WorkflowSummary>> {
+    list_workflow_summaries(false)
+}
+
+pub fn list_all_workflows() -> Result<Vec<WorkflowSummary>> {
+    list_workflow_summaries(true)
+}
+
+fn list_workflow_summaries(include_hidden: bool) -> Result<Vec<WorkflowSummary>> {
     seed_builtin_workflows_if_missing()?;
     let mut workflows = workflow_paths()?
         .into_iter()
         .map(|path| {
             let workflow = load_workflow_from_path(&path)?;
-            Ok(WorkflowSummary {
+            if workflow.hidden && !include_hidden {
+                return Ok(None);
+            }
+            Ok(Some(WorkflowSummary {
                 workflow_id: workflow.workflow_id,
                 title: workflow.title,
                 description: workflow.description,
                 path,
-            })
+            }))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<Option<_>>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     workflows.sort_by(|left, right| left.workflow_id.cmp(&right.workflow_id));
     Ok(workflows)
 }
@@ -421,7 +437,7 @@ struct BuiltinWorkflow {
     contents: &'static str,
 }
 
-fn builtin_workflows() -> [BuiltinWorkflow; 4] {
+fn builtin_workflows() -> [BuiltinWorkflow; 5] {
     [
         BuiltinWorkflow {
             file_name: "bare.yml",
@@ -439,6 +455,10 @@ fn builtin_workflows() -> [BuiltinWorkflow; 4] {
             file_name: "pdd.yml",
             contents: include_str!("../workflows/pdd.yml"),
         },
+        BuiltinWorkflow {
+            file_name: "test-workflow.yml",
+            contents: include_str!("../workflows/test-workflow.yml"),
+        },
     ]
 }
 
@@ -452,8 +472,8 @@ mod tests {
     use super::{
         NO_ROUTE_ERROR, WorkflowDefinition, WorkflowFileRequest, WorkflowOptionDefinition,
         WorkflowPromptDefinition, WorkflowRequestDefinition, WorkflowRuntimeRequest,
-        list_workflows, load_workflow, load_workflow_from_path, seed_builtin_workflows_if_missing,
-        workflow_config_dir,
+        list_all_workflows, list_workflows, load_workflow, load_workflow_from_path,
+        seed_builtin_workflows_if_missing, workflow_config_dir,
     };
     use crate::config::{configure_test_global_config_home, global_config_test_lock};
 
@@ -478,11 +498,12 @@ mod tests {
             assert!(workflow_dir.join("plan-build.yml").exists());
             assert!(workflow_dir.join("task-based.yml").exists());
             assert!(workflow_dir.join("pdd.yml").exists());
+            assert!(workflow_dir.join("test-workflow.yml").exists());
         });
     }
 
     #[test]
-    fn list_workflows_reads_seeded_builtins() {
+    fn list_workflows_reads_only_visible_seeded_builtins() {
         with_test_workflow_home(|_| {
             let workflows = list_workflows().unwrap();
             assert!(
@@ -504,6 +525,23 @@ mod tests {
                 workflows
                     .iter()
                     .any(|workflow| workflow.workflow_id == "pdd")
+            );
+            assert!(
+                workflows
+                    .iter()
+                    .all(|workflow| workflow.workflow_id != "test-workflow")
+            );
+        });
+    }
+
+    #[test]
+    fn list_all_workflows_includes_hidden_builtins() {
+        with_test_workflow_home(|_| {
+            let workflows = list_all_workflows().unwrap();
+            assert!(
+                workflows
+                    .iter()
+                    .any(|workflow| workflow.workflow_id == "test-workflow")
             );
         });
     }
@@ -567,6 +605,7 @@ prompts:
             workflow_id: "broken".to_owned(),
             title: "Broken".to_owned(),
             description: String::new(),
+            hidden: false,
             entrypoint: "main".to_owned(),
             options: BTreeMap::new(),
             request: Some(WorkflowRequestDefinition {
@@ -603,6 +642,7 @@ prompts:
             workflow_id: "broken".to_owned(),
             title: "Broken".to_owned(),
             description: String::new(),
+            hidden: false,
             entrypoint: "main".to_owned(),
             options: BTreeMap::new(),
             request: None,
@@ -630,6 +670,7 @@ prompts:
             workflow_id: "broken".to_owned(),
             title: "Broken".to_owned(),
             description: String::new(),
+            hidden: false,
             entrypoint: "main".to_owned(),
             options: BTreeMap::new(),
             request: None,
@@ -656,6 +697,7 @@ prompts:
             workflow_id: "broken".to_owned(),
             title: "Broken".to_owned(),
             description: String::new(),
+            hidden: false,
             entrypoint: "main".to_owned(),
             options: BTreeMap::from([
                 (
