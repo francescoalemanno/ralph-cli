@@ -1,11 +1,11 @@
 version: 1
 workflow_id: task-based
 title: Task Based
-description: Execute one high-priority task at a time against a supplied request list.
-entrypoint: main
+description: Complete one right-sized high-priority task at a time from a durable request list.
+entrypoint: worker
 options:
   progress-file:
-    help: Progress file to read before work and update before handing off.
+    help: Durable handoff file to read before work and update after each pass.
     default: progress.txt
     value_name: FILE
 request:
@@ -14,26 +14,61 @@ request:
     stdin: true
     file_flag: true
 prompts:
-  main:
+  worker:
     title: Task Based
     is_interactive: false
-    fallback-route: main
+    fallback-route: verify
     prompt: |
+      {ralph-skill-emit}
+
       # Execution policy
       1. Study `{ralph-option:progress-file}`.
-      2. Study the existing source code.
-      3. Find the single most high-leverage item in the requests.
-         - If none found, run `$RALPH_BIN emit loop-stop:ok found-no-open-task`, goto 7. Stop.
-      4. Execute ONLY the chosen high-priority item.
-      5. Update `{ralph-option:progress-file}` with completed work and new findings such that the next worker can continue seamlessly.
-      6. After finishing 4 and 5: run `$RALPH_BIN emit loop-continue handoff-to-next-worker`, goto 7. Stop.
-      7. Stop.
+      2. Study the existing source code and any files needed to evaluate the top candidate tasks.
+      3. Select exactly one highest-leverage open item from the request and `{ralph-option:progress-file}`.
+         - Use your own judgment; do not blindly take the first listed item.
+      4. Before implementing, classify that item as RIGHT-SIZED or COMPLEX.
+         - If it is COMPLEX, decompose it into smaller RIGHT-SIZED sub-items in `{ralph-option:progress-file}`.
+         - Then execute ONLY the single highest-priority RIGHT-SIZED sub-item from that decomposition in this pass.
+      5. Implement ONLY the chosen item and integrate it properly with the existing codebase.
+      6. Run the checks relevant to the work you just performed.
+      7. Update `{ralph-option:progress-file}` truthfully so the next worker can continue seamlessly.
+         - Record what was completed, what remains open, and any new findings or blockers.
+         - If your understanding of the work changed, rewrite the file so it reflects reality.
+      8. If `{ralph-option:progress-file}` still contains open items, run {ralph-route:worker}, then goto 9. Stop.
+      9. Stop.
 
       # Constraints
-      1. NEVER assume that something is not-implemented, study the source code.
-      2. YAGNI ruthlessly - no speculative features
-      3. ALWAYS classify the high priority item into RIGHT-SIZED <-> COMPLEX
-      4. ALWAYS check if item is COMPLEX, if it is: break it up into RIGHT-SIZED sub-items, you MUST ONLY execute the highest priority right-sized sub-task.
+      1. STRICTLY execute one item only.
+      2. Never assume something is missing before studying the code.
+      3. YAGNI ruthlessly. No speculative features.
+      4. Prefer keeping `{ralph-option:progress-file}` truthful over preserving outdated task breakdowns.
 
-      # REQUESTS
+      <<< USER REQUEST
       {ralph-request}
+      END USER REQUEST >>> 
+  verify:
+    title: Verifier
+    is_interactive: false
+    fallback-route: verify
+    prompt: |
+      {ralph-skill-emit}
+      
+      # Execution policy
+      1. Study the request.
+      2. Study `{ralph-option:progress-file}` if it exists.
+      3. Decide whether the request and `{ralph-option:progress-file}` are aligned enough for continued execution.
+      4. Route exactly once:
+         - If `{ralph-option:progress-file}` is missing, stale, contradictory, not right-sized, or otherwise not aligned with the request, remove it if it exists, run {ralph-route:worker}, then goto 5. Stop.
+         - Else if `{ralph-option:progress-file}` still contains one or more actionable open items, run {ralph-route:worker}, then goto 5. Stop.
+         - Else if `{ralph-option:progress-file}` is aligned with the request and clearly indicates that all actionable work is complete, run {ralph-stop:ok:progress-complete}, then goto 5. Stop.
+      5. Stop.
+
+      # Constraints
+      1. Verification and routing only. Do not implement. Do not update source code.
+      2. Only judge alignment and remaining actionable work in `{ralph-option:progress-file}`.
+      3. If you determine the file is not aligned, remove it and do not recreate it in this step.
+      4. You MUST emit either `loop-route worker` or `loop-stop:ok`.
+
+      <<< USER REQUEST
+      {ralph-request}
+      END USER REQUEST >>> 

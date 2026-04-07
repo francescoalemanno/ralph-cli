@@ -1,0 +1,119 @@
+version: 1
+workflow_id: dbv
+title: Decompose Build Verify
+description: Iterate between plan repair, one-item execution, and whole-project verification.
+entrypoint: dispatch
+options:
+  plan-file:
+    help: Durable execution plan to repair, execute, and verify.
+    default: PLAN.md
+    value_name: FILE
+request:
+  runtime:
+    argv: true
+    stdin: true
+    file_flag: true
+prompts:
+  dispatch:
+    title: Dispatcher
+    is_interactive: false
+    fallback-route: dispatch
+    prompt: |
+      {ralph-skill-emit}
+      # Execution policy
+      1. Study `{ralph-option:plan-file}` if it exists in the repository root.
+      2. Study the request carefully.
+      3. Decide whether the request and `{ralph-option:plan-file}` are aligned enough for execution.
+         - Use the request and plan as your primary control surface.
+         - If the decision is still unclear after reading the request and plan, you MAY inspect the codebase just enough to disambiguate.
+      4. Route exactly once:
+         - If `{ralph-option:plan-file}` is missing, stale, ambiguous, contradictory, not right-sized, or not aligned with the request, run {ralph-route:decompose}, then goto 5. Stop.
+         - Else if `{ralph-option:plan-file}` still has one or more actionable unchecked checklist items, run {ralph-route:build}, then goto 5. Stop.
+         - Else if `{ralph-option:plan-file}` is aligned with the request and all actionable checklist items appear completed, run {ralph-route:verify}, then goto 5. Stop.
+      5. Stop.
+
+      # Constraints
+      1. Do not implement or rewrite the plan here; your only job is routing.
+      2. Treat an executable plan as a prioritized Markdown checklist of right-sized vertical outcomes.
+      3. Prefer `decompose` whenever the plan is not clearly execution-ready.
+
+      <<< USER REQUEST
+      {ralph-request}
+      END USER REQUEST >>> 
+  build:
+    title: Builder
+    is_interactive: false
+    fallback-route: dispatch
+    prompt: |
+      # Execution policy
+      1. Study `{ralph-option:plan-file}`.
+      2. Study the existing source code and any files referenced by the item you choose.
+      3. Select exactly one unchecked plan item to execute. Choose the highest-priority item according to your own judgment; do not blindly take the first unchecked entry.
+      4. Implement ONLY that one item completely and integrate it properly with the existing codebase.
+      5. Run the checks relevant to the task you just performed. Validate the item now; do not leave its status ambiguous.
+      6. Update `{ralph-option:plan-file}` truthfully so the plan itself clearly reflects the new state of the work.
+         - Mark the item done only if it is truly complete.
+         - Record concise handoff notes and new findings.
+         - If the item turned out blocked, invalid, or underspecified, rewrite the plan accordingly so the file clearly communicates that reality.
+      7. Stop.
+
+      # Constraints
+      1. STRICTLY execute one plan item only.
+      2. Do not do broad replanning beyond the changes needed to keep `{ralph-option:plan-file}` truthful.
+      3. Never assume something is missing before studying the code.
+      4. Prefer existing shared code and well-integrated solutions over duplication.
+
+      <<< USER REQUEST
+      {ralph-request}
+      END USER REQUEST >>> 
+
+  decompose:
+    title: Decomposer
+    is_interactive: false
+    fallback-route: dispatch
+    prompt: |
+      # Execution policy
+      1. Study the request carefully.
+      2. Study `{ralph-option:plan-file}` if it exists.
+      3. Study the actual project files, codebase, and any documents or specs referenced by the request or needed to understand the work.
+      4. Treat the user request plus the actual project files/codebase as the only truth.
+      5. Rewrite or repair `{ralph-option:plan-file}` so it becomes an execution-ready prioritized Markdown checklist of right-sized vertical outcomes.
+      6. Update related documents when you find problems in them and those repairs materially improve the plan.
+      7. Stop.
+
+      # Constraints
+      1. Planning only. MUST NEVER implement production code.
+      2. You may rewrite the whole plan from scratch if that is the cleanest way to make it correct.
+      3. Each unchecked plan item must be neither trivial nor complex; each should be one observable vertical slice that one focused implementation pass can complete.
+      4. Prefer plans that minimize time-to-first-demo and integration risk.
+      5. Avoid horizontal phase-based plans when a vertical decomposition is possible.
+
+      <<< USER REQUEST
+      {ralph-request}
+      END USER REQUEST >>> 
+
+  verify:
+    title: Verifier
+    is_interactive: false
+    fallback-route: verify
+    prompt: |
+      {ralph-skill-emit}
+      # Execution policy
+      1. Study the request.
+      2. Study `{ralph-option:plan-file}`.
+      3. Study the repository just enough to identify the most relevant whole-project validation for the completed work.
+      4. Run the checks and tests needed to verify that the whole project works as expected for the request, not just one item.
+         - If there is no single obvious command, use your judgment and run the best available whole-project validation set.
+      5. Decide exactly once:
+         - If the project works as expected, run {ralph-stop:ok:verification-passed}, then goto 6. Stop.
+         - Else run {ralph-stop:error:verification-failed}, then goto 6. Stop.
+      6. Stop.
+
+      # Constraints
+      1. Verification only. Do not implement. Do not replan. Do not update `{ralph-option:plan-file}`.
+      2. You MUST emit either `loop-stop:ok` or `loop-stop:error`.
+      3. Prefer whole-project validation over narrow item-local checks.
+
+      <<< USER REQUEST
+      {ralph-request}
+      END USER REQUEST >>> 

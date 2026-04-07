@@ -444,8 +444,8 @@ fn builtin_workflows() -> [BuiltinWorkflow; 5] {
             contents: include_str!("../workflows/bare.yml"),
         },
         BuiltinWorkflow {
-            file_name: "plan-build.yml",
-            contents: include_str!("../workflows/plan-build.yml"),
+            file_name: "dbv.yml",
+            contents: include_str!("../workflows/dbv.yml"),
         },
         BuiltinWorkflow {
             file_name: "task-based.yml",
@@ -495,7 +495,7 @@ mod tests {
 
             let workflow_dir = home.join("workflows");
             assert!(workflow_dir.join("bare.yml").exists());
-            assert!(workflow_dir.join("plan-build.yml").exists());
+            assert!(workflow_dir.join("dbv.yml").exists());
             assert!(workflow_dir.join("task-based.yml").exists());
             assert!(workflow_dir.join("pdd.yml").exists());
             assert!(workflow_dir.join("test-workflow.yml").exists());
@@ -514,7 +514,7 @@ mod tests {
             assert!(
                 workflows
                     .iter()
-                    .any(|workflow| workflow.workflow_id == "plan-build")
+                    .any(|workflow| workflow.workflow_id == "dbv")
             );
             assert!(
                 workflows
@@ -538,6 +538,11 @@ mod tests {
     fn list_all_workflows_includes_hidden_builtins() {
         with_test_workflow_home(|_| {
             let workflows = list_all_workflows().unwrap();
+            assert!(
+                workflows
+                    .iter()
+                    .any(|workflow| workflow.workflow_id == "dbv")
+            );
             assert!(
                 workflows
                     .iter()

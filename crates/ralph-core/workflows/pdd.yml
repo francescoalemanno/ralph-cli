@@ -193,37 +193,36 @@ prompts:
 
       ### 7. Develop Implementation Plan
 
-      Create a structured implementation plan with a series of steps for implementing the design.
+      Create a structured implementation plan for implementing the design through `dbv`.
 
       **Constraints:**
       - You MUST create an implementation plan at {ralph-option:pdd-dir}/implementation/plan.md
-      - You MUST include a checklist at the beginning of the plan.md file to track implementation progress
-      - You MUST treat the implementation plan as a handoff artifact for a later `ralph run plan-build ...` execution, not as a license to start implementing during this workflow
+      - You MUST format the implementation plan as a prioritized Markdown checklist of right-sized vertical outcomes that `dbv` can execute directly
+      - You MUST treat the implementation plan as a handoff artifact for a later `ralph run dbv ...` execution, not as a license to start implementing during this workflow
       - You MUST use the following specific instructions when creating the implementation plan:
         ```
-        Convert the design into a series of implementation steps that will build each component in a test-driven manner following agile best practices. Each step must result in a working, demoable increment of functionality. Prioritize best practices, incremental progress, and early testing, ensuring no big jumps in complexity at any stage. Make sure that each step builds on the previous steps, and ends with wiring things together. There should be no hanging or orphaned code that isn't integrated into a previous step.
+        Convert the design into a prioritized Markdown checklist of implementation outcomes that Ralph can execute one item at a time. Each unchecked item must be right-sized for one focused build pass, must produce a working demoable increment, and must include the tests or checks that prove it. Prioritize incremental progress, early end-to-end validation, and no big jumps in complexity. Make sure each item builds on previous completed items and leaves no orphaned code.
         ```
-      - You MUST format the implementation plan as a numbered series of detailed steps
-      - Each step in the plan MUST be written as a clear implementation objective
-      - Each step MUST begin with "Step N:" where N is the sequential number
-      - You MUST ensure each step includes:
+      - Each checklist item in the plan MUST be written as a clear implementation objective
+      - Each checklist item MUST be actionable, self-contained, and small enough for one `dbv` build loop to complete truthfully
+      - You MUST ensure each checklist item includes or is immediately followed by:
         - A clear objective
         - General implementation guidance
         - Test requirements for the functionality introduced in this step
         - How it integrates with previous work
         - **Demo** - explicit description of the working functionality that can be demonstrated after completing this step
-      - You MUST ensure each step results in working, demoable functionality that provides value
-      - You MUST sequence steps so that core end-to-end functionality is available as early as possible
+      - You MUST ensure each checklist item results in working, demoable functionality that provides value
+      - You MUST sequence checklist items so that core end-to-end functionality is available as early as possible
       - You MUST NOT include excessive implementation details that are already covered in the design document because this creates redundancy and potential inconsistencies
       - You MUST assume that all context documents (requirements, design, research) will be available during implementation
-      - You MUST break down the implementation into a series of discrete, manageable steps
-      - You MUST ensure each step builds incrementally on previous steps
-      - You MUST structure each step so that tests are written before or alongside the implementation code
-      - You MUST include test requirements as part of each step that introduces or modifies functionality, not as separate testing-only steps
-      - You MUST NOT create steps that are solely dedicated to testing or "adding tests" for functionality implemented in previous steps because this violates test-driven development principles and allows untested code to accumulate
+      - You MUST break down the implementation into a series of discrete, manageable checklist items
+      - You MUST ensure each checklist item builds incrementally on previous items
+      - You MUST structure each checklist item so that tests are written before or alongside the implementation code
+      - You MUST include test requirements as part of each checklist item that introduces or modifies functionality, not as separate testing-only items
+      - You MUST NOT create checklist items that are solely dedicated to testing or "adding tests" for functionality implemented in previous items because this violates test-driven development principles and allows untested code to accumulate
       - You MUST ensure the plan covers all aspects of the design
       - You SHOULD sequence steps to validate core functionality early
-      - You MUST ensure the checklist items correspond directly to the steps in the implementation plan
+      - You MUST ensure the unchecked checklist items are the primary control surface for later `dbv` execution
       - You MUST NOT implement any plan item or modify production code as part of this workflow; this step ends once the plan is documented
 
       ### 8. Summarize and Present Results
@@ -235,8 +234,8 @@ prompts:
       - You MUST list all artifacts created during the process
       - You MUST provide a brief overview of the design and implementation plan
       - You MUST suggest next steps for the user
-      - You MUST include in the summary document and in your final response the exact follow-up command `ralph run plan-build --specsglob "{ralph-option:pdd-dir}/design/*.md" --planfile "{ralph-option:pdd-dir}/implementation/plan.md" "Implement the planned work described in {ralph-option:pdd-dir}/design/detailed-design.md"`
-      - You MUST explain that the current `pdd` workflow has not implemented the plan and that the follow-up `plan-build` command is how Ralph should execute the planned work
+      - You MUST include in the summary document and in your final response the exact follow-up command `ralph run dbv --planfile "{ralph-option:pdd-dir}/implementation/plan.md" "Implement the planned work described in {ralph-option:pdd-dir}/design/detailed-design.md"`
+      - You MUST explain that the current `pdd` workflow has not implemented the plan and that the follow-up `dbv` command is how Ralph should execute the planned work
       - You SHOULD highlight any areas that may need further refinement
       - You MUST present this summary to the user in the conversation
 
@@ -291,12 +290,12 @@ prompts:
       - Document generation engine
 
       ## Implementation Approach
-      The implementation plan breaks down the work into 12 incremental steps, starting with core data models and building up to the complete feature set.
+      The implementation plan breaks down the work into a prioritized checklist of incremental outcomes, starting with core data models and building up to the complete feature set.
 
       ## Next Steps
       1. Review the detailed design document at {ralph-option:pdd-dir}/design/detailed-design.md
       2. Check the implementation plan and checklist at {ralph-option:pdd-dir}/implementation/plan.md
-      3. Run `ralph run plan-build --specsglob "{ralph-option:pdd-dir}/design/*.md" --planfile "{ralph-option:pdd-dir}/implementation/plan.md" "Implement the planned work described in {ralph-option:pdd-dir}/design/detailed-design.md"` to have Ralph execute the full planned work
+      3. Run `ralph run dbv --planfile "{ralph-option:pdd-dir}/implementation/plan.md" "Implement the planned work described in {ralph-option:pdd-dir}/design/detailed-design.md"` to have Ralph execute the full planned work
 
       Would you like me to explain any specific part of the design or implementation plan in more detail?
       ```
