@@ -119,14 +119,12 @@ async fn run_command(project_dir: Utf8PathBuf, command: Commands) -> Result<()> 
 async fn run_run_command(project_dir: Utf8PathBuf, args: cli::RunArgs) -> Result<()> {
     let result = if args.cli {
         run_cli_workflow(project_dir, &args).await
+    } else if !io::stdin().is_terminal() {
+        Err(anyhow!(
+            "stdin preloading is not supported in TUI mode; use `ralph run --cli <workflow-id>` or pass the request as argv text or `--file`"
+        ))
     } else {
-        if !io::stdin().is_terminal() {
-            Err(anyhow!(
-                "stdin preloading is not supported in TUI mode; use `ralph run --cli <workflow-id>` or pass the request as argv text or `--file`"
-            ))
-        } else {
-            run_tui_workflow(project_dir, &args)
-        }
+        run_tui_workflow(project_dir, &args)
     };
 
     result.map_err(|error| maybe_with_run_help(&args.workflow, error))
