@@ -10,7 +10,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent,
-        KeyEventKind, KeyModifiers,
+        KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -280,6 +280,11 @@ impl TuiApp {
                             return Ok(());
                         }
                     }
+                    CEvent::Mouse(mouse) => {
+                        let size = terminal.size().context("failed to read terminal size")?;
+                        let area = Rect::new(0, 0, size.width, size.height);
+                        self.handle_mouse(mouse, area);
+                    }
                     _ => {}
                 }
             }
@@ -375,6 +380,27 @@ impl TuiApp {
         }
 
         Ok(true)
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, screen: Rect) {
+        if self.running.is_none() {
+            return;
+        }
+
+        let output_area = self.running_output_area(screen);
+        let within_output = mouse.column >= output_area.x
+            && mouse.column < output_area.x.saturating_add(output_area.width)
+            && mouse.row >= output_area.y
+            && mouse.row < output_area.y.saturating_add(output_area.height);
+        if !within_output {
+            return;
+        }
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.scroll_running(1),
+            MouseEventKind::ScrollDown => self.scroll_running(-1),
+            _ => {}
+        }
     }
 
     fn handle_ui_event(
@@ -810,6 +836,25 @@ impl TuiApp {
         max
     }
 
+    fn running_output_area(&self, screen: Rect) -> Rect {
+        let has_notice = !self.message.trim().is_empty();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),
+                Constraint::Length(if has_notice { 3 } else { 0 }),
+                Constraint::Min(1),
+                Constraint::Length(2),
+            ])
+            .split(screen);
+        let running_body = chunks[2];
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(6), Constraint::Min(1)])
+            .split(running_body);
+        sections[1]
+    }
+
     fn draw(&mut self, frame: &mut Frame<'_>) {
         frame.render_widget(
             Block::default().style(Style::default().bg(self.background_color())),
@@ -935,9 +980,9 @@ impl TuiApp {
     fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         let footer = if let Some(running) = self.running.as_ref() {
             if running.is_finished() {
-                "R rerun  •  E edit request  •  A cycle next agent  •  Q quit"
+                "R rerun  •  E edit request  •  A cycle next agent  •  F/End follow  •  wheel/↑/↓/PgUp/PgDn scroll  •  Q quit"
             } else {
-                "Ctrl-C cancel run  •  A cycle next agent  •  E edit request  •  Q quit  •  F/End follow  •  PgUp/PgDn scroll"
+                "Ctrl-C cancel run  •  A cycle next agent  •  E edit request  •  F/End follow  •  wheel/↑/↓/PgUp/PgDn scroll  •  Q quit"
             }
         } else {
             "Enter/R run  •  ←/→ switch request source  •  E edit request  •  A cycle agent  •  Q quit"
@@ -1325,9 +1370,15 @@ impl RunDelegate for TuiRunDelegate {
 mod tests {
     use std::fs;
 
-    use super::{RequestOrigin, TuiApp, TuiLaunchOptions, TuiPreloadedRequest, TuiRequestSource};
+    use super::{
+        RequestOrigin, RunningState, TuiApp, TuiLaunchOptions, TuiPreloadedRequest,
+        TuiRequestSource,
+    };
     use camino::Utf8PathBuf;
+    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
     use ralph_app::RalphApp;
+    use ralph_core::RunControl;
+    use ratatui::layout::Rect;
 
     fn configure_test_config_home() -> Utf8PathBuf {
         let path = Utf8PathBuf::from_path_buf(
@@ -1344,6 +1395,35 @@ mod tests {
     fn temp_project_dir() -> tempfile::TempDir {
         configure_test_config_home();
         tempfile::tempdir().unwrap()
+    }
+
+    fn new_test_tui() -> TuiApp {
+        let temp = temp_project_dir();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let app = RalphApp::load(project_dir).unwrap();
+        let tui = TuiApp::new(
+            app,
+            runtime.handle().clone(),
+            TuiLaunchOptions {
+                preset_workflow: Some("bare".to_owned()),
+                preloaded_request: Some(TuiPreloadedRequest {
+                    source: TuiRequestSource::Argv,
+                    text: "ship it".to_owned(),
+                    file_path: None,
+                }),
+                workflow_options: Default::default(),
+            },
+        )
+        .unwrap();
+        std::mem::forget(temp);
+        tui
+    }
+
+    fn output_for_scroll(running: &mut RunningState) -> String {
+        let scroll = if running.follow { 0 } else { running.scroll };
+        running.terminal.set_scrollback(scroll);
+        running.terminal.screen().contents()
     }
 
     #[test]
@@ -1440,5 +1520,71 @@ prompt_env_var = "PROMPT"
         tui.cycle_agent(None).unwrap();
 
         assert_eq!(tui.app.agent_id(), "two");
+    }
+
+    #[test]
+    fn running_scroll_changes_visible_output() {
+        let mut tui = new_test_tui();
+        let mut running = RunningState::new(RunControl::new());
+        running.ensure_terminal_size(4, 24);
+        running.push_terminal_text("line 1\nline 2\nline 3\nline 4\nline 5\nline 6");
+        tui.running = Some(running);
+
+        assert_eq!(tui.max_running_scroll(), 2);
+        assert_eq!(
+            output_for_scroll(tui.running.as_mut().unwrap()),
+            "line 3\nline 4\nline 5\nline 6"
+        );
+
+        tui.scroll_running(1);
+        assert_eq!(
+            output_for_scroll(tui.running.as_mut().unwrap()),
+            "line 2\nline 3\nline 4\nline 5"
+        );
+
+        tui.scroll_running(1);
+        assert_eq!(
+            output_for_scroll(tui.running.as_mut().unwrap()),
+            "line 1\nline 2\nline 3\nline 4"
+        );
+
+        tui.scroll_running(-1);
+        assert_eq!(
+            output_for_scroll(tui.running.as_mut().unwrap()),
+            "line 2\nline 3\nline 4\nline 5"
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_runner_output_panel() {
+        let mut tui = new_test_tui();
+        let mut running = RunningState::new(RunControl::new());
+        running.ensure_terminal_size(4, 24);
+        running.push_terminal_text("line 1\nline 2\nline 3\nline 4\nline 5\nline 6");
+        tui.running = Some(running);
+        tui.message = "run failed".to_owned();
+
+        let output_area = tui.running_output_area(Rect::new(0, 0, 100, 30));
+        tui.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: output_area.x + 1,
+                row: output_area.y + 1,
+                modifiers: KeyModifiers::empty(),
+            },
+            Rect::new(0, 0, 100, 30),
+        );
+        assert_eq!(tui.running.as_ref().unwrap().scroll, 1);
+
+        tui.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            },
+            Rect::new(0, 0, 100, 30),
+        );
+        assert_eq!(tui.running.as_ref().unwrap().scroll, 1);
     }
 }
