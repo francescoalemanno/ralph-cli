@@ -19,9 +19,9 @@ path = "src/main.rs"
 anyhow.workspace = true
 camino.workspace = true
 clap.workspace = true
-ralph-app = { version = "0.4.2", path = "../ralph-app" }
-ralph-core = { version = "0.4.2", path = "../ralph-core" }
-ralph-tui = { version = "0.4.2", path = "../ralph-tui" }
+ralph-app = { version = "0.4.3", path = "../ralph-app" }
+ralph-core = { version = "0.4.3", path = "../ralph-core" }
+ralph-tui = { version = "0.4.3", path = "../ralph-tui" }
 serde.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
