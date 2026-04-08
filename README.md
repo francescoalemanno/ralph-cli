@@ -82,6 +82,7 @@ ralph ls
 ## Choose The Right Workflow
 
 - `bare`: use this when your request already contains the exact loop discipline you want and you just need Ralph to run it durably.
+- `simple`: use this when you want one right-sized vertical slice per loop with a durable write-ahead log for handoff and task breakdown.
 - `dbv`: use this when you want a durable plan in `PLAN.md`, one-item-at-a-time execution, and a final whole-project verification pass before declaring success.
 - `task-based`: use this when the work already lives in a request list or `progress.txt` and you want one right-sized item completed per loop.
 - `pdd`: use this when the idea is still rough and you need an interactive path to research, design, and an implementation plan before autonomous loops.
@@ -154,6 +155,7 @@ If you provide more than one, Ralph exits with a usage error.
 | Workflow | What it does | Useful options |
 | --- | --- | --- |
 | `bare` | Minimal wrapper when your request already contains the loop discipline you want. | None |
+| `simple` | Implements one right-sized vertical slice per pass and uses a durable write-ahead log for handoff and decomposition. | `--writeaheadlog` (default: `write-ahead-log.md`) |
 | `dbv` | Uses a durable `PLAN.md` as the control surface, decomposes when needed, builds one item per loop, and performs whole-project verification when the plan is complete. | `--planfile` (default: `PLAN.md`) |
 | `task-based` | Reads the request list, chooses one high-priority right-sized item, executes it, and updates a handoff file for the next loop. | `--progressfile` (default: `progress.txt`) |
 | `pdd` | Interactive prompt-driven development for turning a rough idea into research, design, and an implementation plan. | `--pdddir` (default: `docs/planning/{project_name}`) |

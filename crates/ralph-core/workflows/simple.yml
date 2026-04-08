@@ -1,0 +1,24 @@
+version: 1
+workflow_id: simple
+title: Simplest Loop
+description: Implements most important part of the request per iteration. 
+entrypoint: main
+request:
+  runtime:
+    argv: true
+    stdin: true
+    file_flag: true
+prompts:
+  main:
+    title: Simplest Loop
+    is_interactive: false
+    fallback-route: main
+    prompt: |
+      You are an iteration step, running inside a looping harness.
+      1. Study the user request
+      2. Study the project completely, the user request may be partially fullfilled, do not assume something is not implemented!
+      3. Find the single highest-leverage step to move towards completing the user-request.
+      4. Execute the highest-leverage step.
+      <<<< BEGIN USER-REQ >>>>
+      {ralph-request}
+      <<<< END USER-REQ >>>>

@@ -437,11 +437,15 @@ struct BuiltinWorkflow {
     contents: &'static str,
 }
 
-fn builtin_workflows() -> [BuiltinWorkflow; 5] {
+fn builtin_workflows() -> [BuiltinWorkflow; 6] {
     [
         BuiltinWorkflow {
             file_name: "bare.yml",
             contents: include_str!("../workflows/bare.yml"),
+        },
+        BuiltinWorkflow {
+            file_name: "simple.yml",
+            contents: include_str!("../workflows/simple.yml"),
         },
         BuiltinWorkflow {
             file_name: "dbv.yml",
@@ -495,6 +499,7 @@ mod tests {
 
             let workflow_dir = home.join("workflows");
             assert!(workflow_dir.join("bare.yml").exists());
+            assert!(workflow_dir.join("simple.yml").exists());
             assert!(workflow_dir.join("dbv.yml").exists());
             assert!(workflow_dir.join("task-based.yml").exists());
             assert!(workflow_dir.join("pdd.yml").exists());
@@ -510,6 +515,11 @@ mod tests {
                 workflows
                     .iter()
                     .any(|workflow| workflow.workflow_id == "bare")
+            );
+            assert!(
+                workflows
+                    .iter()
+                    .any(|workflow| workflow.workflow_id == "simple")
             );
             assert!(
                 workflows
@@ -542,6 +552,11 @@ mod tests {
                 workflows
                     .iter()
                     .any(|workflow| workflow.workflow_id == "dbv")
+            );
+            assert!(
+                workflows
+                    .iter()
+                    .any(|workflow| workflow.workflow_id == "simple")
             );
             assert!(
                 workflows
@@ -750,8 +765,8 @@ prompts:
     fn dbv_requires_explicit_plan_coverage_for_request_details() {
         let temp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(temp.path().join("dbv.yml")).unwrap();
-        let workflow = load_workflow_from_path_for_test(&path, include_str!("../workflows/dbv.yml"))
-            .unwrap();
+        let workflow =
+            load_workflow_from_path_for_test(&path, include_str!("../workflows/dbv.yml")).unwrap();
 
         let dispatch = workflow.prompt("dispatch").expect("dispatch prompt");
         assert!(dispatch.prompt.contains(
