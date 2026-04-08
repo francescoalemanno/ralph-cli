@@ -36,6 +36,8 @@ prompts:
       1. Do not implement or rewrite the plan here; your only job is routing.
       2. Treat an executable plan as a prioritized Markdown checklist of right-sized vertical outcomes.
       3. Prefer `decompose` whenever the plan is not clearly execution-ready.
+      4. Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST appear explicitly in `{ralph-option:plan-file}`.
+      5. If any material part of the request is missing from the plan or only implicitly covered, treat the plan as not aligned and route to `decompose`.
 
       <<< USER REQUEST
       {ralph-request}
@@ -87,6 +89,8 @@ prompts:
       3. Each unchecked plan item must be neither trivial nor complex; each should be one observable vertical slice that one focused implementation pass can complete.
       4. Prefer plans that minimize time-to-first-demo and integration risk.
       5. Avoid horizontal phase-based plans when a vertical decomposition is possible.
+      6. Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST become explicit in `{ralph-option:plan-file}`.
+      7. If any material part of the request is not represented explicitly in the plan, the plan is incomplete and you must correct it before stopping.
 
       <<< USER REQUEST
       {ralph-request}

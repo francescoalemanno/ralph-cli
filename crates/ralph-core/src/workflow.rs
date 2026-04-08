@@ -746,6 +746,30 @@ prompts:
         });
     }
 
+    #[test]
+    fn dbv_requires_explicit_plan_coverage_for_request_details() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("dbv.yml")).unwrap();
+        let workflow = load_workflow_from_path_for_test(&path, include_str!("../workflows/dbv.yml"))
+            .unwrap();
+
+        let dispatch = workflow.prompt("dispatch").expect("dispatch prompt");
+        assert!(dispatch.prompt.contains(
+            "Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST appear explicitly"
+        ));
+        assert!(dispatch.prompt.contains(
+            "If any material part of the request is missing from the plan or only implicitly covered"
+        ));
+
+        let decompose = workflow.prompt("decompose").expect("decompose prompt");
+        assert!(decompose.prompt.contains(
+            "Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST become explicit"
+        ));
+        assert!(decompose.prompt.contains(
+            "If any material part of the request is not represented explicitly in the plan"
+        ));
+    }
+
     fn load_workflow_from_path_for_test(
         path: &Utf8PathBuf,
         raw: &str,
