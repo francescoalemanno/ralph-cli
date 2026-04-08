@@ -1,7 +1,7 @@
 version: 1
 workflow_id: simple
-title: Simplest Loop
-description: Implements most important part of the request per iteration. 
+title: Simple Highest-Leverage Loop
+description: Study the request and project state, then execute the single highest-leverage next step toward completion in each pass.
 entrypoint: main
 request:
   runtime:
@@ -10,7 +10,7 @@ request:
     file_flag: true
 prompts:
   main:
-    title: Simplest Loop
+    title: Simple Highest-Leverage Loop
     is_interactive: false
     fallback-route: main
     prompt: |
