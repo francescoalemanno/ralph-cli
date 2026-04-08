@@ -116,9 +116,12 @@ impl AppConfig {
     }
 
     pub fn available_agents(&self) -> Vec<&AgentConfig> {
-        prioritized_agents(self.agents.iter().enumerate().filter(|(_, agent)| {
-            !agent.hidden && agent.is_available()
-        }))
+        prioritized_agents(
+            self.agents
+                .iter()
+                .enumerate()
+                .filter(|(_, agent)| !agent.hidden && agent.is_available()),
+        )
     }
 
     fn effective_agent_definition(&self) -> Option<&AgentConfig> {
