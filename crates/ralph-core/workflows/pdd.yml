@@ -234,7 +234,7 @@ prompts:
       - You MUST list all artifacts created during the process
       - You MUST provide a brief overview of the design and implementation plan
       - You MUST suggest next steps for the user
-      - You MUST include in the summary document and in your final response the exact follow-up command `ralph run dbv --planfile "{ralph-option:pdd-dir}/implementation/plan.md" "Implement the planned work described in {ralph-option:pdd-dir}/design/detailed-design.md"`
+      - You MUST include in the summary document and in your final response the exact follow-up command `ralph run dbv --planfile "{ralph-option:pdd-dir}/implementation/plan.md" "Implement the planned work, study {ralph-option:pdd-dir}/design/detailed-design.md"`
       - You MUST explain that the current `pdd` workflow has not implemented the plan and that the follow-up `dbv` command is how Ralph should execute the planned work
       - You SHOULD highlight any areas that may need further refinement
       - You MUST present this summary to the user in the conversation
@@ -295,7 +295,7 @@ prompts:
       ## Next Steps
       1. Review the detailed design document at {ralph-option:pdd-dir}/design/detailed-design.md
       2. Check the implementation plan and checklist at {ralph-option:pdd-dir}/implementation/plan.md
-      3. Run `ralph run dbv --planfile "{ralph-option:pdd-dir}/implementation/plan.md" "Implement the planned work described in {ralph-option:pdd-dir}/design/detailed-design.md"` to have Ralph execute the full planned work
+      3. Run `ralph run dbv --planfile "{ralph-option:pdd-dir}/implementation/plan.md" "Implement the planned work, study {ralph-option:pdd-dir}/design/detailed-design.md"` to have Ralph execute the full planned work
 
       Would you like me to explain any specific part of the design or implementation plan in more detail?
       ```
