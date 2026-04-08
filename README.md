@@ -156,7 +156,7 @@ If you provide more than one, Ralph exits with a usage error.
 | `bare` | Minimal wrapper when your request already contains the loop discipline you want. | None |
 | `dbv` | Uses a durable `PLAN.md` as the control surface, decomposes when needed, builds one item per loop, and performs whole-project verification when the plan is complete. | `--planfile` (default: `PLAN.md`) |
 | `task-based` | Reads the request list, chooses one high-priority right-sized item, executes it, and updates a handoff file for the next loop. | `--progressfile` (default: `progress.txt`) |
-| `pdd` | Interactive prompt-driven development for turning a rough idea into research, design, and an implementation plan. | None |
+| `pdd` | Interactive prompt-driven development for turning a rough idea into research, design, and an implementation plan. | `--pdddir` (default: `docs/planning/{project_name}`) |
 
 List them at any time with:
 
