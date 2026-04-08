@@ -720,8 +720,9 @@ mod tests {
     #[test]
     fn run_subcommand_parses_cli_flag() {
         with_test_workflow_home(|| {
-            let cli = Cli::try_parse_from(["ralph", "run", "--cli", "fixture-flow", "fix", "tests"])
-                .unwrap();
+            let cli =
+                Cli::try_parse_from(["ralph", "run", "--cli", "fixture-flow", "fix", "tests"])
+                    .unwrap();
 
             let Commands::Run(args) = cli.command else {
                 panic!("expected run subcommand");
@@ -749,9 +750,7 @@ mod tests {
                 panic!("expected run subcommand");
             };
             assert_eq!(
-                args.workflow_options
-                    .get("state-file")
-                    .map(String::as_str),
+                args.workflow_options.get("state-file").map(String::as_str),
                 Some("snapshot.md")
             );
         });
@@ -760,7 +759,8 @@ mod tests {
     #[test]
     fn workflow_help_includes_declared_options() {
         with_test_workflow_home(|| {
-            let error = Cli::try_parse_from(["ralph", "run", "fixture-flow", "--help"]).unwrap_err();
+            let error =
+                Cli::try_parse_from(["ralph", "run", "fixture-flow", "--help"]).unwrap_err();
             let rendered = error.to_string();
 
             assert_eq!(error.kind(), ErrorKind::DisplayHelp);

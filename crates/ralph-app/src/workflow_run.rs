@@ -948,21 +948,14 @@ prompts:
                     argv: Some("ship it".to_owned()),
                     ..Default::default()
                 },
-                options: BTreeMap::from([(
-                    "state-file".to_owned(),
-                    "custom-state.txt".to_owned(),
-                )]),
+                options: BTreeMap::from([("state-file".to_owned(), "custom-state.txt".to_owned())]),
             },
             &mut delegate,
         )
         .await?;
 
         let invocation = runner.invocations.lock().unwrap().first().cloned().unwrap();
-        assert!(
-            invocation
-                .prompt_text
-                .contains("state=custom-state.txt")
-        );
+        assert!(invocation.prompt_text.contains("state=custom-state.txt"));
         assert!(invocation.prompt_text.contains("request=ship it"));
         Ok(())
     }
