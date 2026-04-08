@@ -186,7 +186,7 @@ ralph agent current
 ralph agent set claude --scope user
 ralph config show --scope effective
 ralph config path
-ralph init --agent codex --editor nvim --max-iterations 20
+ralph init --agent opencode --editor nvim --max-iterations 20
 ralph doctor
 ```
 
@@ -207,7 +207,7 @@ ralph agent current
 Persist a default agent:
 
 ```bash
-ralph agent set codex --scope user
+ralph agent set opencode --scope user
 ralph agent set claude --scope project
 ```
 
@@ -230,12 +230,13 @@ ralph config show --scope effective
 Create a project config file:
 
 ```bash
-ralph init --agent codex --editor nvim --max-iterations 20
+ralph init --agent opencode --editor nvim --max-iterations 20
 ```
 
 Notes:
 
-- The default built-in agent is `codex`.
+- The default built-in agent is `opencode`.
+- On startup Ralph keeps the configured agent when it is available; otherwise it falls back to the first detected agent in priority order: `opencode`, `raijin`, then the remaining configured agents.
 - The default workflow iteration limit is `40`.
 - `ralph init` writes `.ralph/config.toml`.
 - Re-run `ralph init` with `--force` to overwrite an existing project config.

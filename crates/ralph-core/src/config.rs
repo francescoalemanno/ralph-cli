@@ -87,12 +87,18 @@ impl AppConfig {
         Ok(config)
     }
 
-    pub fn agent_id(&self) -> &str {
+    pub fn configured_agent_id(&self) -> &str {
         self.agent.as_deref().unwrap_or(&self.default_agent)
     }
 
+    pub fn agent_id(&self) -> &str {
+        self.effective_agent_definition()
+            .map(|agent| agent.id.as_str())
+            .unwrap_or_else(|| self.configured_agent_id())
+    }
+
     pub fn agent_name(&self) -> String {
-        self.agent_definition(self.agent_id())
+        self.effective_agent_definition()
             .map(|agent| agent.name.clone())
             .unwrap_or_else(|| self.agent_id().to_owned())
     }
@@ -110,10 +116,20 @@ impl AppConfig {
     }
 
     pub fn available_agents(&self) -> Vec<&AgentConfig> {
-        self.agents
-            .iter()
-            .filter(|agent| !agent.hidden && agent.is_available())
-            .collect()
+        prioritized_agents(self.agents.iter().enumerate().filter(|(_, agent)| {
+            !agent.hidden && agent.is_available()
+        }))
+    }
+
+    fn effective_agent_definition(&self) -> Option<&AgentConfig> {
+        let configured = self.configured_agent_id();
+        if let Some(agent) = self.agent_definition(configured)
+            && agent.is_available()
+        {
+            return Some(agent);
+        }
+
+        self.available_agents().into_iter().next()
     }
 
     pub fn persist_scoped_coding_agent(
@@ -406,8 +422,25 @@ fn normalize_optional_string(value: String) -> Option<String> {
     }
 }
 
+fn prioritized_agents<'a, I>(agents: I) -> Vec<&'a AgentConfig>
+where
+    I: IntoIterator<Item = (usize, &'a AgentConfig)>,
+{
+    let mut prioritized = agents.into_iter().collect::<Vec<_>>();
+    prioritized.sort_by_key(|(index, agent)| (agent_priority_bucket(agent.id.as_str()), *index));
+    prioritized.into_iter().map(|(_, agent)| agent).collect()
+}
+
+fn agent_priority_bucket(agent_id: &str) -> usize {
+    match agent_id {
+        "opencode" => 0,
+        "raijin" => 1,
+        _ => 2,
+    }
+}
+
 fn default_default_agent() -> String {
-    "codex".to_owned()
+    "opencode".to_owned()
 }
 
 fn default_max_iterations() -> usize {
@@ -436,12 +469,12 @@ mod tests {
         AppConfig, ConfigFileScope, PartialAppConfig, configure_test_global_config_home,
         global_config_test_lock, merge_config, write_partial_config,
     };
-    use crate::AgentConfig;
+    use crate::{AgentConfig, CommandMode, PromptInput, RunnerConfig};
 
     #[test]
     fn app_config_defaults_to_seeded_agents() {
         let config = AppConfig::default();
-        assert_eq!(config.default_agent, "codex");
+        assert_eq!(config.default_agent, "opencode");
         assert!(config.agent_definition("codex").is_some());
         assert!(config.agent_definition("claude").is_some());
         assert!(config.agent_definition("droid").is_some());
@@ -472,7 +505,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(merged.agent_id(), "raijin");
+        assert_eq!(merged.configured_agent_id(), "raijin");
     }
 
     #[test]
@@ -582,10 +615,51 @@ mod tests {
     #[test]
     fn effective_agent_name_comes_from_definition() {
         let config = AppConfig {
-            agent: Some("raijin".to_owned()),
+            default_agent: "raijin".to_owned(),
+            agents: vec![shell_agent("raijin", "Raijin")],
             ..AppConfig::default()
         };
         assert_eq!(config.agent_name(), "Raijin");
+    }
+
+    #[test]
+    fn effective_agent_prefers_prioritized_available_fallback() {
+        let config = AppConfig {
+            default_agent: "codex".to_owned(),
+            agent: Some("codex".to_owned()),
+            agents: vec![
+                unavailable_agent("codex", "Codex"),
+                shell_agent("claude", "Claude"),
+                shell_agent("raijin", "Raijin"),
+                shell_agent("opencode", "OpenCode"),
+            ],
+            ..AppConfig::default()
+        };
+
+        assert_eq!(config.configured_agent_id(), "codex");
+        assert_eq!(config.agent_id(), "opencode");
+        assert_eq!(config.agent_name(), "OpenCode");
+    }
+
+    #[test]
+    fn available_agents_follow_priority_order() {
+        let config = AppConfig {
+            default_agent: "custom".to_owned(),
+            agents: vec![
+                shell_agent("custom", "Custom"),
+                shell_agent("raijin", "Raijin"),
+                shell_agent("opencode", "OpenCode"),
+                shell_agent("claude", "Claude"),
+            ],
+            ..AppConfig::default()
+        };
+
+        let available = config
+            .available_agents()
+            .into_iter()
+            .map(|agent| agent.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(available, vec!["opencode", "raijin", "custom", "claude"]);
     }
 
     #[test]
@@ -616,12 +690,52 @@ mod tests {
             },
         );
         assert_eq!(merged.agents.len(), 1);
-        assert_eq!(merged.agent_id(), "custom");
+        assert_eq!(merged.configured_agent_id(), "custom");
     }
 
     #[test]
     fn canonical_global_config_dir_uses_dot_config() {
         let path = super::canonical_global_config_dir().unwrap();
         assert!(path.as_str().ends_with("/.config/ralph"));
+    }
+
+    fn shell_agent(id: &str, name: &str) -> AgentConfig {
+        let runner = RunnerConfig {
+            mode: CommandMode::Shell,
+            program: None,
+            args: Vec::new(),
+            command: Some("echo ok".to_owned()),
+            prompt_input: PromptInput::Argv,
+            prompt_env_var: "PROMPT".to_owned(),
+            env: Default::default(),
+        };
+        AgentConfig {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            builtin: false,
+            hidden: false,
+            non_interactive: runner.clone(),
+            interactive: runner,
+        }
+    }
+
+    fn unavailable_agent(id: &str, name: &str) -> AgentConfig {
+        let runner = RunnerConfig {
+            mode: CommandMode::Exec,
+            program: Some("__missing_agent__".to_owned()),
+            args: Vec::new(),
+            command: None,
+            prompt_input: PromptInput::Argv,
+            prompt_env_var: "PROMPT".to_owned(),
+            env: Default::default(),
+        };
+        AgentConfig {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            builtin: false,
+            hidden: false,
+            non_interactive: runner.clone(),
+            interactive: runner,
+        }
     }
 }
