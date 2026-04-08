@@ -143,6 +143,18 @@ impl RequestOrigin {
     }
 }
 
+#[derive(Debug, Clone)]
+struct RequestEditTarget {
+    path: Utf8PathBuf,
+    kind: RequestEditKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestEditKind {
+    TextDraft,
+    File,
+}
+
 struct RunningState {
     prompt_name: String,
     iteration: usize,
@@ -711,49 +723,96 @@ impl TuiApp {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<()> {
-        let path = self.resolve_request_edit_path()?;
-        self.prepare_request_edit_path(&path)?;
+        let target = self.resolve_request_edit_target()?;
+        self.prepare_request_edit_target(&target)?;
         suspend_terminal(terminal)?;
-        let edit_result = edit_file(&path, self.app.config().editor_override.as_deref());
+        let edit_result = edit_file(&target.path, self.app.config().editor_override.as_deref());
         resume_terminal(terminal)?;
         edit_result?;
-        self.refresh_request_from_path(&path)?;
+        self.refresh_request_from_target(&target)?;
         self.message = format!(
             "updated request from {}",
-            path.file_name().unwrap_or(path.as_str())
+            target.path.file_name().unwrap_or(target.path.as_str())
         );
         Ok(())
     }
 
-    fn resolve_request_edit_path(&self) -> Result<Utf8PathBuf> {
+    fn resolve_request_edit_target(&self) -> Result<RequestEditTarget> {
+        if let Some(runtime) = self.runtime_request() {
+            match self.request_mode {
+                RequestMode::Text if runtime.argv => {
+                    return Ok(RequestEditTarget {
+                        path: self
+                            .app
+                            .project_dir()
+                            .join(".ralph")
+                            .join("request-drafts")
+                            .join(format!("{}.md", self.workflow_id)),
+                        kind: RequestEditKind::TextDraft,
+                    });
+                }
+                RequestMode::File if runtime.file_flag => {
+                    if !self.request_file.trim().is_empty() {
+                        return Ok(RequestEditTarget {
+                            path: self.resolve_project_relative_path(Utf8Path::new(
+                                self.request_file.trim(),
+                            )),
+                            kind: RequestEditKind::File,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
         if let Some(request) = &self.workflow.request
             && let Some(file) = &request.file
         {
-            return Ok(self.resolve_project_relative_path(&file.path));
+            return Ok(RequestEditTarget {
+                path: self.resolve_project_relative_path(&file.path),
+                kind: RequestEditKind::File,
+            });
         }
 
         if !self.request_file.trim().is_empty() {
-            return Ok(self.resolve_project_relative_path(Utf8Path::new(self.request_file.trim())));
+            return Ok(RequestEditTarget {
+                path: self.resolve_project_relative_path(Utf8Path::new(self.request_file.trim())),
+                kind: RequestEditKind::File,
+            });
         }
 
-        if !self.request_text.trim().is_empty() || !self.request_file.trim().is_empty() {
-            return Ok(self
-                .app
-                .project_dir()
-                .join(".ralph")
-                .join("request-drafts")
-                .join(format!("{}.md", self.workflow_id)));
+        if !self.request_text.trim().is_empty() {
+            return Ok(RequestEditTarget {
+                path: self
+                    .app
+                    .project_dir()
+                    .join(".ralph")
+                    .join("request-drafts")
+                    .join(format!("{}.md", self.workflow_id)),
+                kind: RequestEditKind::TextDraft,
+            });
         }
 
         Err(anyhow!("no editable request is available"))
     }
 
-    fn prepare_request_edit_path(&mut self, path: &Utf8Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
+    fn prepare_request_edit_target(&mut self, target: &RequestEditTarget) -> Result<()> {
+        if let Some(parent) = target.path.parent() {
             std::fs::create_dir_all(parent.as_std_path())
                 .with_context(|| format!("failed to create {}", parent))?;
         }
-        if path.exists() {
+
+        if target.kind == RequestEditKind::TextDraft {
+            let mut contents = self.request_text.clone();
+            if !contents.ends_with('\n') {
+                contents.push('\n');
+            }
+            atomic_write(&target.path, contents)
+                .with_context(|| format!("failed to create request draft {}", target.path))?;
+            return Ok(());
+        }
+
+        if target.path.exists() {
             return Ok(());
         }
 
@@ -761,24 +820,33 @@ impl TuiApp {
         if !contents.ends_with('\n') {
             contents.push('\n');
         }
-        atomic_write(path, contents)
-            .with_context(|| format!("failed to create request draft {}", path))?;
+        atomic_write(&target.path, contents)
+            .with_context(|| format!("failed to create request draft {}", target.path))?;
         Ok(())
     }
 
-    fn refresh_request_from_path(&mut self, path: &Utf8Path) -> Result<()> {
-        self.request_text = self.app.read_utf8_file(path)?;
-        self.request_file = path.to_string();
-        self.request_origin = RequestOrigin::Draft;
-        if self
-            .workflow
-            .request
-            .as_ref()
-            .and_then(|request| request.runtime.as_ref())
-            .is_some_and(|runtime| runtime.file_flag)
-            && !self.request_file.trim().is_empty()
-        {
-            self.request_mode = RequestMode::File;
+    fn refresh_request_from_target(&mut self, target: &RequestEditTarget) -> Result<()> {
+        self.request_text = self.app.read_utf8_file(&target.path)?;
+        match target.kind {
+            RequestEditKind::TextDraft => {
+                self.request_file.clear();
+                self.request_origin = RequestOrigin::Draft;
+                self.request_mode = RequestMode::Text;
+            }
+            RequestEditKind::File => {
+                self.request_file = target.path.to_string();
+                self.request_origin = RequestOrigin::File;
+                if self
+                    .workflow
+                    .request
+                    .as_ref()
+                    .and_then(|request| request.runtime.as_ref())
+                    .is_some_and(|runtime| runtime.file_flag)
+                    && !self.request_file.trim().is_empty()
+                {
+                    self.request_mode = RequestMode::File;
+                }
+            }
         }
         Ok(())
     }
@@ -1371,8 +1439,8 @@ mod tests {
     use std::fs;
 
     use super::{
-        RequestOrigin, RunningState, TuiApp, TuiLaunchOptions, TuiPreloadedRequest,
-        TuiRequestSource,
+        RequestEditKind, RequestMode, RequestOrigin, RunningState, TuiApp, TuiLaunchOptions,
+        TuiPreloadedRequest, TuiRequestSource,
     };
     use camino::Utf8PathBuf;
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
@@ -1424,6 +1492,78 @@ mod tests {
         let scroll = if running.follow { 0 } else { running.scroll };
         running.terminal.set_scrollback(scroll);
         running.terminal.screen().contents()
+    }
+
+    #[test]
+    fn editing_argv_request_uses_current_text_instead_of_stale_draft() {
+        let temp = temp_project_dir();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let draft_dir = project_dir.join(".ralph").join("request-drafts");
+        fs::create_dir_all(draft_dir.as_std_path()).unwrap();
+        let draft_path = draft_dir.join("bare.md");
+        fs::write(draft_path.as_std_path(), "stale draft\n").unwrap();
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let app = RalphApp::load(project_dir).unwrap();
+        let mut tui = TuiApp::new(
+            app,
+            runtime.handle().clone(),
+            TuiLaunchOptions {
+                preset_workflow: Some("bare".to_owned()),
+                preloaded_request: Some(TuiPreloadedRequest {
+                    source: TuiRequestSource::Argv,
+                    text: "implement x".to_owned(),
+                    file_path: None,
+                }),
+                workflow_options: Default::default(),
+            },
+        )
+        .unwrap();
+
+        let target = tui.resolve_request_edit_target().unwrap();
+        assert_eq!(target.kind, RequestEditKind::TextDraft);
+        tui.prepare_request_edit_target(&target).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target.path.as_std_path()).unwrap(),
+            "implement x\n"
+        );
+    }
+
+    #[test]
+    fn edited_argv_request_stays_in_text_mode_for_reruns() {
+        let temp = temp_project_dir();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let app = RalphApp::load(project_dir).unwrap();
+        let mut tui = TuiApp::new(
+            app,
+            runtime.handle().clone(),
+            TuiLaunchOptions {
+                preset_workflow: Some("bare".to_owned()),
+                preloaded_request: Some(TuiPreloadedRequest {
+                    source: TuiRequestSource::Argv,
+                    text: "implement x".to_owned(),
+                    file_path: None,
+                }),
+                workflow_options: Default::default(),
+            },
+        )
+        .unwrap();
+
+        let target = tui.resolve_request_edit_target().unwrap();
+        tui.prepare_request_edit_target(&target).unwrap();
+        fs::write(target.path.as_std_path(), "edited request\n").unwrap();
+        tui.refresh_request_from_target(&target).unwrap();
+
+        assert_eq!(tui.request_mode, RequestMode::Text);
+        assert_eq!(tui.request_origin, RequestOrigin::Draft);
+        assert!(tui.request_file.is_empty());
+        assert_eq!(tui.request_text, "edited request\n");
+
+        let request_input = tui.request_input_for(&tui.workflow).unwrap();
+        assert_eq!(request_input.argv.as_deref(), Some("edited request\n"));
+        assert!(request_input.request_file.is_none());
     }
 
     #[test]
