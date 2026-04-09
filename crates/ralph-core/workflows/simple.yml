@@ -19,6 +19,10 @@ prompts:
       2. Study the project completely, the user request may be partially fullfilled, do not assume something is not implemented!
       3. Find the single highest-leverage step to move towards completing the user-request.
       4. Execute the highest-leverage step.
+
+      # Constraints
+      - YAGNI ruthlessly. No speculative features.
+
       <<<< BEGIN USER-REQ >>>>
       {ralph-request}
       <<<< END USER-REQ >>>>

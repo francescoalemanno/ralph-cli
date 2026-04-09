@@ -38,10 +38,10 @@ prompts:
       9. Stop.
 
       # Constraints
-      1. STRICTLY execute one item only.
-      2. Never assume something is missing before studying the code.
-      3. YAGNI ruthlessly. No speculative features.
-      4. Prefer keeping `{ralph-option:progress-file}` truthful over preserving outdated task breakdowns.
+      - STRICTLY execute one item only.
+      - Never assume something is missing before studying the code.
+      - YAGNI ruthlessly. No speculative features.
+      - Prefer keeping `{ralph-option:progress-file}` truthful over preserving outdated task breakdowns.
 
       <<< USER REQUEST
       {ralph-request}
@@ -64,10 +64,10 @@ prompts:
       5. Stop.
 
       # Constraints
-      1. Verification and routing only. Do not implement. Do not update source code.
-      2. Only judge alignment and remaining actionable work in `{ralph-option:progress-file}`.
-      3. If you determine the file is not aligned, remove it and do not recreate it in this step.
-      4. You MUST emit either `loop-route worker` or `loop-stop:ok`.
+      - Verification and routing only. Do not implement. Do not update source code.
+      - Only judge alignment and remaining actionable work in `{ralph-option:progress-file}`.
+      - If you determine the file is not aligned, remove it and do not recreate it in this step.
+      - You MUST emit either `loop-route worker` or `loop-stop:ok`.
 
       <<< USER REQUEST
       {ralph-request}

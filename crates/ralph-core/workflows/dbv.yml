@@ -33,11 +33,11 @@ prompts:
       5. Stop.
 
       # Constraints
-      1. Do not implement or rewrite the plan here; your only job is routing.
-      2. Treat an executable plan as a prioritized Markdown checklist of right-sized vertical outcomes.
-      3. Prefer `decompose` whenever the plan is not clearly execution-ready.
-      4. Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST appear explicitly in `{ralph-option:plan-file}`.
-      5. If any material part of the request is missing from the plan or only implicitly covered, treat the plan as not aligned and route to `decompose`.
+      - Do not implement or rewrite the plan here; your only job is routing.
+      - Treat an executable plan as a prioritized Markdown checklist of right-sized vertical outcomes.
+      - Prefer `decompose` whenever the plan is not clearly execution-ready.
+      - Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST appear explicitly in `{ralph-option:plan-file}`.
+      - If any material part of the request is missing from the plan or only implicitly covered, treat the plan as not aligned and route to `decompose`.
 
       <<< USER REQUEST
       {ralph-request}
@@ -60,10 +60,11 @@ prompts:
       7. Stop.
 
       # Constraints
-      1. STRICTLY execute one plan item only.
-      2. Do not do broad replanning beyond the changes needed to keep `{ralph-option:plan-file}` truthful.
-      3. Never assume something is missing before studying the code.
-      4. Prefer existing shared code and well-integrated solutions over duplication.
+      - STRICTLY execute one plan item only.
+      - Do not do broad replanning beyond the changes needed to keep `{ralph-option:plan-file}` truthful.
+      - Never assume something is missing before studying the code.
+      - YAGNI ruthlessly. No speculative features.
+      - Prefer existing shared code and well-integrated solutions over duplication.
 
       <<< USER REQUEST
       {ralph-request}
@@ -84,13 +85,14 @@ prompts:
       7. Stop.
 
       # Constraints
-      1. Planning only. MUST NEVER implement production code.
-      2. You may rewrite the whole plan from scratch if that is the cleanest way to make it correct.
-      3. Each unchecked plan item must be neither trivial nor complex; each should be one observable vertical slice that one focused implementation pass can complete.
-      4. Prefer plans that minimize time-to-first-demo and integration risk.
-      5. Avoid horizontal phase-based plans when a vertical decomposition is possible.
-      6. Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST become explicit in `{ralph-option:plan-file}`.
-      7. If any material part of the request is not represented explicitly in the plan, the plan is incomplete and you must correct it before stopping.
+      - Planning only. MUST NEVER implement production code.
+      - You may rewrite the whole plan from scratch if that is the cleanest way to make it correct.
+      - Each unchecked plan item must be neither trivial nor complex; each should be one observable vertical slice that one focused implementation pass can complete.
+      - YAGNI ruthlessly. No speculative features.
+      - Prefer plans that minimize time-to-first-demo and integration risk.
+      - Avoid horizontal phase-based plans when a vertical decomposition is possible.
+      - Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST become explicit in `{ralph-option:plan-file}`.
+      - If any material part of the request is not represented explicitly in the plan, the plan is incomplete and you must correct it before stopping.
 
       <<< USER REQUEST
       {ralph-request}
@@ -114,9 +116,9 @@ prompts:
       6. Stop.
 
       # Constraints
-      1. Verification only. Do not implement. Do not replan. Do not update `{ralph-option:plan-file}`.
-      2. You MUST emit either `loop-stop:ok` or `loop-stop:error`.
-      3. Prefer whole-project validation over narrow item-local checks.
+      - Verification only. Do not implement. Do not replan. Do not update `{ralph-option:plan-file}`.
+      - You MUST emit either `loop-stop:ok` or `loop-stop:error`.
+      - Prefer whole-project validation over narrow item-local checks.
 
       <<< USER REQUEST
       {ralph-request}

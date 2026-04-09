@@ -96,12 +96,12 @@ prompts:
       - You MUST NOT pre-populate answers to questions without user input because this assumes user preferences without confirmation
       - You MUST NOT write multiple questions and answers to the idea-honing.md file at once because this skips the interactive clarification process
       - You MUST follow this exact process for each question:
-        1. Formulate a single question
-        2. Append the question to {ralph-option:pdd-dir}/idea-honing.md
-        3. Present the question to the user in the conversation
-        4. Wait for the user's complete response, which may require brief back-and-forth dialogue across multiple turns.
-        5. Once you have their complete response, append the user's answer (or final decision) to {ralph-option:pdd-dir}/idea-honing.md
-        6. Only then proceed to formulating the next question
+        - Formulate a single question
+        - Append the question to {ralph-option:pdd-dir}/idea-honing.md
+        - Present the question to the user in the conversation
+        - Wait for the user's complete response, which may require brief back-and-forth dialogue across multiple turns.
+        - Once you have their complete response, append the user's answer (or final decision) to {ralph-option:pdd-dir}/idea-honing.md
+        - Only then proceed to formulating the next question
       - You MAY suggest possible answers when asking a question, but MUST wait for the user's actual response
       - You MUST format the idea-honing.md document with clear question and answer sections
       - You MUST include the final chosen answer in the answer section
@@ -167,6 +167,7 @@ prompts:
       **Constraints:**
       - You MUST create a detailed design document at {ralph-option:pdd-dir}/design/detailed-design.md
       - You MUST write the design as a standalone document that can be understood without reading other project files
+      - YAGNI ruthlessly. No speculative features.
       - You MUST include the following sections in the design document:
         - Overview
         - Detailed Requirements (consolidated from idea-honing.md)
@@ -199,6 +200,7 @@ prompts:
       - You MUST create an implementation plan at {ralph-option:pdd-dir}/implementation/plan.md
       - You MUST format the implementation plan as a prioritized Markdown checklist of right-sized vertical outcomes that `dbv` can execute directly
       - You MUST treat the implementation plan as a handoff artifact for a later `ralph run dbv ...` execution, not as a license to start implementing during this workflow
+      - YAGNI ruthlessly. No speculative features.
       - You MUST use the following specific instructions when creating the implementation plan:
         ```
         Convert the design into a prioritized Markdown checklist of implementation outcomes that Ralph can execute one item at a time. Each unchecked item must be right-sized for one focused build pass, must produce a working demoable increment, and must include the tests or checks that prove it. Prioritize incremental progress, early end-to-end validation, and no big jumps in complexity. Make sure each item builds on previous completed items and leaves no orphaned code.
