@@ -437,7 +437,7 @@ struct BuiltinWorkflow {
     contents: &'static str,
 }
 
-fn builtin_workflows() -> [BuiltinWorkflow; 6] {
+fn builtin_workflows() -> [BuiltinWorkflow; 7] {
     [
         BuiltinWorkflow {
             file_name: "bare.yml",
@@ -450,6 +450,10 @@ fn builtin_workflows() -> [BuiltinWorkflow; 6] {
         BuiltinWorkflow {
             file_name: "dbv.yml",
             contents: include_str!("../workflows/dbv.yml"),
+        },
+        BuiltinWorkflow {
+            file_name: "default.yml",
+            contents: include_str!("../workflows/default.yml"),
         },
         BuiltinWorkflow {
             file_name: "task-based.yml",
@@ -501,6 +505,7 @@ mod tests {
             assert!(workflow_dir.join("bare.yml").exists());
             assert!(workflow_dir.join("simple.yml").exists());
             assert!(workflow_dir.join("dbv.yml").exists());
+            assert!(workflow_dir.join("default.yml").exists());
             assert!(workflow_dir.join("task-based.yml").exists());
             assert!(workflow_dir.join("pdd.yml").exists());
             assert!(workflow_dir.join("test-workflow.yml").exists());
@@ -529,6 +534,11 @@ mod tests {
             assert!(
                 workflows
                     .iter()
+                    .any(|workflow| workflow.workflow_id == "default")
+            );
+            assert!(
+                workflows
+                    .iter()
                     .any(|workflow| workflow.workflow_id == "task-based")
             );
             assert!(
@@ -552,6 +562,11 @@ mod tests {
                 workflows
                     .iter()
                     .any(|workflow| workflow.workflow_id == "dbv")
+            );
+            assert!(
+                workflows
+                    .iter()
+                    .any(|workflow| workflow.workflow_id == "default")
             );
             assert!(
                 workflows

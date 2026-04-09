@@ -83,6 +83,7 @@ ralph ls
 
 - `bare`: use this when your request already contains the exact loop discipline you want and you just need Ralph to run it durably.
 - `simple`: use this when you want Ralph to study the request and current codebase, then take the single highest-leverage next step each loop.
+- `default`: use this when you want Ralph to keep a durable `PLAN.md`, execute one plan item per loop, and finish with a whole-project verification pass.
 - `dbv`: use this when you want a durable plan in `PLAN.md`, one-item-at-a-time execution, and a final whole-project verification pass before declaring success.
 - `task-based`: use this when the work already lives in a request list or `progress.txt` and you want one right-sized item completed per loop.
 - `pdd`: use this when the idea is still rough and you need an interactive path to research, design, and an implementation plan before autonomous loops.
@@ -109,6 +110,7 @@ These open the runner UI:
 
 ```bash
 ralph run task-based "fix the failing tests"
+ralph run default "ship the auth refactor"
 ralph run dbv "ship the auth refactor"
 ralph run pdd --file rough-idea.md
 ```
@@ -156,6 +158,7 @@ If you provide more than one, Ralph exits with a usage error.
 | --- | --- | --- |
 | `bare` | Minimal wrapper when your request already contains the loop discipline you want. | None |
 | `simple` | Studies the request and project state, then executes the single highest-leverage next step toward completion each pass. | None |
+| `default` | Repairs a durable `PLAN.md`, executes one plan item per loop, and verifies the whole project when the plan is complete. | `--planfile` (default: `PLAN.md`) |
 | `dbv` | Uses a durable `PLAN.md` as the control surface, decomposes when needed, builds one item per loop, and performs whole-project verification when the plan is complete. | `--planfile` (default: `PLAN.md`) |
 | `task-based` | Reads the request list, chooses one high-priority right-sized item, executes it, and updates a handoff file for the next loop. | `--progressfile` (default: `progress.txt`) |
 | `pdd` | Interactive prompt-driven development for turning a rough idea into research, design, and an implementation plan. | `--pdddir` (default: `docs/planning/{project_name}`) |
@@ -294,7 +297,7 @@ That is why the workflow-specific help output looks slightly different from the 
 
 Files Ralph commonly reads or updates as part of the workflow itself:
 
-- `PLAN.md`: durable execution plan for `dbv`
+- `PLAN.md`: durable execution plan for `default` and `dbv`
 - `progress.txt`: task handoff memory for `task-based`
 - `docs/planning/<project>/design/detailed-design.md`: design output from `pdd`
 - `docs/planning/<project>/implementation/plan.md`: execution-ready plan output from `pdd`
@@ -320,7 +323,13 @@ If the work is still fuzzy, start with `pdd` and turn the idea into durable docs
 ralph run pdd --file rough-idea.md
 ```
 
-If the work is implementation-ready but the plan may still need repair before coding, use `dbv`:
+If the work is implementation-ready and you want a durable plan plus one-item-at-a-time execution, use `default`:
+
+```bash
+ralph run default "add SSO to the admin app"
+```
+
+If you want the more explicit dispatcher-style plan gating, use `dbv`:
 
 ```bash
 ralph run dbv "add SSO to the admin app"

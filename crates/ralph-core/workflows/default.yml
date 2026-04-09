@@ -1,0 +1,128 @@
+version: 1
+workflow_id: default
+title: Decompose Build Verify
+description: Repairs a durable plan, executes one plan item per loop, and verifies the whole project when the plan is complete.
+entrypoint: decompose
+options:
+  plan-file:
+    help: Durable execution plan to repair, execute, and verify.
+    default: PLAN.md
+    value_name: FILE
+request:
+  runtime:
+    argv: true
+    stdin: true
+    file_flag: true
+prompts:
+  decompose:
+    title: Decomposer
+    is_interactive: false
+    fallback-route: builder
+    prompt: |
+      # OPERATIONAL PROGRAM
+      ## First pass
+      Study the user request carefully.
+      Study the plan `{ralph-option:plan-file}` if it exists.
+      Study the actual project files, codebase, and any documents or specs referenced by the request or needed to understand the work.
+      Treat the user request plus the actual project files/codebase as the only truth.
+      ## Second pass
+      Rewrite or repair `{ralph-option:plan-file}` so it becomes an execution-ready prioritized Markdown checklist of right-sized vertical outcomes.
+      Update related documents when you find problems in them and those repairs materially improve the plan.
+
+      # Constraints on OPERATIONAL PROGRAM
+      - Planning only. MUST NEVER implement production code.
+      - You may rewrite the whole plan from scratch if that is the cleanest way to make it correct.
+      - Each unchecked plan item must be neither trivial nor complex; each should be one observable vertical slice that one focused implementation pass can complete.
+      - YAGNI ruthlessly. No speculative features.
+      - Prefer plans that minimize time-to-first-demo and integration risk.
+      - Avoid horizontal phase-based plans when a vertical decomposition is possible.
+      - Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST become explicit in `{ralph-option:plan-file}`.
+      - If any material part of the request is not represented explicitly in the plan, the plan is incomplete and you must correct it before stopping.
+
+      # Mandatory plan format
+      -----
+      # Plan Title
+      Plan description in plain text
+
+      ## Task 1: Task title
+      Task overall goal, in concise plain text
+      - [ ] subtasks
+      - [ ] subtasks
+      - [ ] subtasks (may have more subtasks in other lines)
+      > task notes and constraints
+      > task notes and constraints (may have more lines)
+      Demo: a description of the demoable feature obtained by completing the whole task
+
+      ## Task 2: ...
+      ...
+      -----
+
+      <<< USER REQUEST
+      {ralph-request}
+      END USER REQUEST >>> 
+
+  builder:
+    title: Builder
+    is_interactive: false
+    fallback-route: builder
+    prompt: |
+      {ralph-skill-emit}
+      # EXECUTION PROGRAM
+      1. Study the plan `{ralph-option:plan-file}`.
+      2. Study the existing source code and any files referenced by the item you choose.
+      3. Choose exactly once: 
+      - If plan is completely implemented run "PHASE: ROUTING"
+      - Else run "PHASE: BUILDING"
+
+      # PHASE: BUILDING
+      Select exactly one unchecked plan item to execute, the highest-priority item according to your own judgment.
+      Implement ONLY that one item completely and integrate it properly with the existing codebase.
+      Run the checks relevant to the item you just implemented. 
+      Validate the item now; do not leave its status ambiguous.
+      Update the plan `{ralph-option:plan-file}` to reflects the new state of the work:
+      - Mark the item done if it is truly complete by replacing `- [ ]` with `- [x]` only.
+      - If the item turned out blocked, invalid, or underspecified use `- [!]`.
+      - Record handoff notes and new findings at the end of the Task by prefixing each line of these handoff notes with `> `.
+      Stop.
+
+      Constraints:
+      - STRICTLY execute one plan item only.
+      - Do not do broad replanning beyond the changes needed to keep `{ralph-option:plan-file}` truthful.
+      - Never assume something is missing before studying the code.
+      - YAGNI ruthlessly. No speculative features.
+      - Prefer existing shared code and well-integrated solutions over duplication.
+
+      # PHASE: ROUTING
+      Since the whole plan is complete, add a single line to `{ralph-option:plan-file}` with "<< PLAN COMPLETE >>".
+      Then run {ralph-route:verify}
+
+      <<< USER REQUEST
+      {ralph-request}
+      END USER REQUEST >>> 
+
+
+  verify:
+    title: Verifier
+    is_interactive: false
+    fallback-route: verify
+    prompt: |
+      {ralph-skill-emit}
+      # Execution policy
+      1. Study the request.
+      2. Study `{ralph-option:plan-file}`.
+      3. Study the repository just enough to identify the most relevant whole-project validation for the completed work.
+      4. Run the checks and tests needed to verify that the whole project works as expected for the request, not just one item.
+         - If there is no single obvious command, use your judgment and run the best available whole-project validation set.
+      5. Decide exactly once:
+         - If the project works as expected, run {ralph-stop:ok:verification-passed}, then goto 6. Stop.
+         - Else run {ralph-stop:error:verification-failed}, then goto 6. Stop.
+      6. Stop.
+
+      # Constraints
+      - Verification only. Do not implement. Do not replan. Do not update `{ralph-option:plan-file}`.
+      - You MUST emit either `loop-stop:ok` or `loop-stop:error`.
+      - Prefer whole-project validation over narrow item-local checks.
+
+      <<< USER REQUEST
+      {ralph-request}
+      END USER REQUEST >>> 
