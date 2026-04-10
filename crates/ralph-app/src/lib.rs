@@ -24,6 +24,19 @@ pub enum RunEvent {
         max_iterations: usize,
     },
     Output(String),
+    ParallelWorkerLaunched {
+        channel_id: String,
+        label: String,
+    },
+    ParallelWorkerStarted {
+        channel_id: String,
+        label: String,
+    },
+    ParallelWorkerFinished {
+        channel_id: String,
+        label: String,
+        exit_code: i32,
+    },
     Note(String),
     Finished {
         status: LastRunStatus,

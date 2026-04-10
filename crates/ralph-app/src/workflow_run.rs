@@ -1,19 +1,26 @@
 use std::{
     collections::BTreeMap,
     fs,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
-    LastRunStatus, LoopControlDecision, NO_ROUTE_ERROR, NO_ROUTE_OK, RunControl, RunnerConfig,
-    RunnerInvocation, WorkflowDefinition, WorkflowRunSummary, WorkflowRuntimeRequest,
-    current_agent_events_offset, load_workflow, read_agent_events_since, reduce_loop_control,
-    workflow_option_flag,
+    AgentEventRecord, LastRunStatus, LoopControlDecision, MAIN_CHANNEL_ID, NO_ROUTE_ERROR,
+    NO_ROUTE_OK, RunControl, RunnerConfig, RunnerInvocation, WorkflowDefinition,
+    WorkflowParallelWorkerDefinition, WorkflowRunSummary, WorkflowRuntimeRequest,
+    append_agent_event, current_agent_events_offset, load_workflow, read_agent_events_since,
+    reduce_loop_control, validate_agent_event, workflow_option_flag,
 };
-use ralph_runner::{InteractiveSessionInvocation, RunnerAdapter, RunnerStreamEvent};
-use tokio::sync::mpsc::unbounded_channel;
+use ralph_runner::{
+    InteractiveSessionInvocation, RunnerAdapter, RunnerStreamEvent, format_event_notice,
+};
+use tokio::{
+    sync::{Mutex as AsyncMutex, mpsc::unbounded_channel},
+    task::JoinSet,
+};
 
 use crate::{RalphApp, RunDelegate, RunEvent, prompt::interpolate_workflow_prompt};
 
@@ -38,18 +45,32 @@ pub struct WorkflowRunInput {
     pub options: BTreeMap<String, String>,
 }
 
-async fn forward_stream_event<D>(delegate: &mut D, event: RunnerStreamEvent) -> Result<()>
-where
-    D: RunDelegate,
-{
-    match event {
-        RunnerStreamEvent::Output(chunk) => delegate.on_event(RunEvent::Output(chunk)).await,
-    }
+#[derive(Debug, Clone)]
+enum ParallelWorkerUiEvent {
+    Started {
+        channel_id: String,
+        label: String,
+    },
+    Output {
+        chunk: String,
+    },
+    Finished {
+        channel_id: String,
+        label: String,
+        exit_code: i32,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ParallelWorkerOutcome {
+    channel_id: String,
+    label: String,
+    exit_code: i32,
 }
 
 impl<R> RalphApp<R>
 where
-    R: RunnerAdapter,
+    R: RunnerAdapter + Clone + 'static,
 {
     pub async fn run_workflow<D>(
         &self,
@@ -91,6 +112,7 @@ where
         }
 
         let max_iterations = self.config.max_iterations;
+        let wal_write_lock = Arc::new(AsyncMutex::new(()));
         let mut current_prompt_id = workflow.entrypoint.clone();
 
         for iteration in 1..=max_iterations {
@@ -101,12 +123,6 @@ where
             let prompt = workflow.prompt(&current_prompt_id).ok_or_else(|| {
                 anyhow!("workflow prompt '{}' no longer exists", current_prompt_id)
             })?;
-            let prompt_text = interpolate_workflow_prompt(
-                &prompt.prompt,
-                &self.project_dir,
-                request.as_deref(),
-                &workflow_options,
-            )?;
 
             delegate
                 .on_event(RunEvent::IterationStarted {
@@ -116,84 +132,73 @@ where
                 })
                 .await?;
 
-            let wal_offset = current_agent_events_offset(&run_dir)?;
-            let exit_code = if prompt.is_interactive {
-                self.run_interactive_workflow_prompt(
-                    InteractiveSessionInvocation {
-                        session_name: current_prompt_id.clone(),
-                        initial_prompt: prompt_text,
-                        project_dir: self.project_dir.clone(),
-                        run_dir: run_dir.clone(),
-                        run_id: Some(run_id.clone()),
-                        prompt_path: Some(workflow_path.clone()),
-                    },
+            let next_step = if let Some(parallel) = &prompt.parallel {
+                self.run_parallel_prompt(
+                    &workflow,
+                    &current_prompt_id,
+                    parallel,
+                    request.as_deref(),
+                    &workflow_options,
+                    &run_id,
+                    &run_dir,
+                    &workflow_path,
                     &control,
+                    wal_write_lock.clone(),
                     delegate,
                 )
                 .await?
             } else {
-                let config = self.non_interactive_runner_config_for(&control)?;
-                execute_runner(
-                    &self.runner,
-                    &config,
-                    RunnerInvocation {
-                        run_id: run_id.clone(),
-                        prompt_text,
-                        project_dir: self.project_dir.clone(),
-                        run_dir: run_dir.clone(),
-                        prompt_path: workflow_path.clone(),
-                        prompt_name: current_prompt_id.clone(),
-                    },
-                    &control,
-                    delegate,
-                )
-                .await?
-                .exit_code
-            };
+                let prompt_text = interpolate_workflow_prompt(
+                    prompt
+                        .prompt
+                        .as_deref()
+                        .expect("validated workflow prompt must have prompt text"),
+                    &self.project_dir,
+                    request.as_deref(),
+                    &workflow_options,
+                )?;
 
-            if exit_code != 0 {
-                let message = format!("runner exited with code {}", exit_code);
-                delegate.on_event(RunEvent::Note(message.clone())).await?;
-                return finish_workflow(
-                    delegate,
-                    WorkflowRunSummary {
-                        workflow_id: workflow.workflow_id.clone(),
-                        run_id,
-                        final_prompt_id: current_prompt_id,
-                        run_dir,
-                        workflow_path,
-                        status: LastRunStatus::Failed,
-                    },
-                    format_summary("Workflow failed", &message),
-                )
-                .await;
-            }
-
-            let log_read = read_agent_events_since(&run_dir, wal_offset)?;
-            let run_events = log_read
-                .records
-                .into_iter()
-                .filter(|record| record.run_id == run_id)
-                .collect::<Vec<_>>();
-
-            let next_step = match reduce_loop_control(&run_events, &current_prompt_id) {
-                Some(LoopControlDecision::Continue) => NextStep::Continue,
-                Some(LoopControlDecision::StopOk(body)) => {
-                    return finish_workflow(
-                        delegate,
-                        WorkflowRunSummary {
-                            workflow_id: workflow.workflow_id.clone(),
-                            run_id,
-                            final_prompt_id: current_prompt_id,
-                            run_dir,
-                            workflow_path,
-                            status: LastRunStatus::Completed,
+                let wal_offset = current_agent_events_offset(&run_dir)?;
+                let exit_code = if prompt.is_interactive {
+                    self.run_interactive_workflow_prompt(
+                        InteractiveSessionInvocation {
+                            session_name: current_prompt_id.clone(),
+                            initial_prompt: prompt_text,
+                            project_dir: self.project_dir.clone(),
+                            run_dir: run_dir.clone(),
+                            run_id: Some(run_id.clone()),
+                            prompt_path: Some(workflow_path.clone()),
                         },
-                        format_summary("Workflow complete", &body),
+                        &control,
+                        delegate,
                     )
-                    .await;
-                }
-                Some(LoopControlDecision::StopError(body)) => {
+                    .await?
+                } else {
+                    let config = self.non_interactive_runner_config_for(&control)?;
+                    execute_runner(
+                        &self.runner,
+                        &config,
+                        RunnerInvocation {
+                            run_id: run_id.clone(),
+                            channel_id: MAIN_CHANNEL_ID.to_owned(),
+                            prompt_text,
+                            project_dir: self.project_dir.clone(),
+                            run_dir: run_dir.clone(),
+                            prompt_path: workflow_path.clone(),
+                            prompt_name: current_prompt_id.clone(),
+                        },
+                        &control,
+                        wal_write_lock.clone(),
+                        true,
+                        delegate,
+                    )
+                    .await?
+                    .exit_code
+                };
+
+                if exit_code != 0 {
+                    let message = format!("runner exited with code {}", exit_code);
+                    delegate.on_event(RunEvent::Note(message.clone())).await?;
                     return finish_workflow(
                         delegate,
                         WorkflowRunSummary {
@@ -204,14 +209,55 @@ where
                             workflow_path,
                             status: LastRunStatus::Failed,
                         },
-                        format_summary("Workflow failed", &body),
+                        format_summary("Workflow failed", &message),
                     )
                     .await;
                 }
-                Some(LoopControlDecision::Route(route)) => NextStep::Route(route),
-                None => {
-                    self.fallback_step(&workflow, &current_prompt_id, delegate)
-                        .await?
+
+                let log_read = read_agent_events_since(&run_dir, wal_offset)?;
+                let run_events = log_read
+                    .records
+                    .into_iter()
+                    .filter(|record| record.run_id == run_id)
+                    .collect::<Vec<_>>();
+
+                match reduce_loop_control(&run_events, &current_prompt_id) {
+                    Some(LoopControlDecision::Continue) => NextStep::Continue,
+                    Some(LoopControlDecision::StopOk(body)) => {
+                        return finish_workflow(
+                            delegate,
+                            WorkflowRunSummary {
+                                workflow_id: workflow.workflow_id.clone(),
+                                run_id,
+                                final_prompt_id: current_prompt_id,
+                                run_dir,
+                                workflow_path,
+                                status: LastRunStatus::Completed,
+                            },
+                            format_summary("Workflow complete", &body),
+                        )
+                        .await;
+                    }
+                    Some(LoopControlDecision::StopError(body)) => {
+                        return finish_workflow(
+                            delegate,
+                            WorkflowRunSummary {
+                                workflow_id: workflow.workflow_id.clone(),
+                                run_id,
+                                final_prompt_id: current_prompt_id,
+                                run_dir,
+                                workflow_path,
+                                status: LastRunStatus::Failed,
+                            },
+                            format_summary("Workflow failed", &body),
+                        )
+                        .await;
+                    }
+                    Some(LoopControlDecision::Route(route)) => NextStep::Route(route),
+                    None => {
+                        self.fallback_step(&workflow, &current_prompt_id, delegate)
+                            .await?
+                    }
                 }
             };
 
@@ -302,6 +348,180 @@ where
                 Ok(NextStep::Route(route.to_owned()))
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_parallel_prompt<D>(
+        &self,
+        workflow: &WorkflowDefinition,
+        prompt_id: &str,
+        parallel: &ralph_core::WorkflowParallelDefinition,
+        request: Option<&str>,
+        workflow_options: &BTreeMap<String, String>,
+        run_id: &str,
+        run_dir: &Utf8Path,
+        workflow_path: &Utf8Path,
+        control: &RunControl,
+        wal_write_lock: Arc<AsyncMutex<()>>,
+        delegate: &mut D,
+    ) -> Result<NextStep>
+    where
+        D: RunDelegate,
+    {
+        if control.is_cancelled() {
+            return Err(anyhow!("operation canceled"));
+        }
+
+        let config = self.non_interactive_runner_config_for(control)?;
+        let (ui_tx, mut ui_rx) = unbounded_channel();
+        let mut join_set = JoinSet::new();
+        let mut worker_count = 0usize;
+
+        for (channel_id, worker) in &parallel.workers {
+            let label = parallel_worker_label(channel_id, worker);
+            delegate
+                .on_event(RunEvent::ParallelWorkerLaunched {
+                    channel_id: channel_id.to_owned(),
+                    label: label.clone(),
+                })
+                .await?;
+
+            let prompt_text = interpolate_workflow_prompt(
+                &worker.prompt,
+                &self.project_dir,
+                request,
+                workflow_options,
+            )?;
+            let worker_runner = self.runner.clone();
+            let worker_config = config.clone();
+            let worker_invocation = RunnerInvocation {
+                run_id: run_id.to_owned(),
+                channel_id: channel_id.to_owned(),
+                prompt_text,
+                project_dir: self.project_dir.clone(),
+                run_dir: run_dir.to_path_buf(),
+                prompt_path: workflow_path.to_path_buf(),
+                prompt_name: prompt_id.to_owned(),
+            };
+            let worker_control = control.clone();
+            let worker_ui_tx = ui_tx.clone();
+            let worker_wal_write_lock = wal_write_lock.clone();
+            let output_log_path = parallel_output_log_path(run_dir, channel_id);
+            let worker_label = label.clone();
+            join_set.spawn(async move {
+                execute_parallel_worker(
+                    worker_runner,
+                    worker_config,
+                    worker_invocation,
+                    worker_control,
+                    worker_wal_write_lock,
+                    worker_ui_tx,
+                    worker_label,
+                    output_log_path,
+                )
+                .await
+            });
+            worker_count += 1;
+        }
+        drop(ui_tx);
+
+        let mut remaining_workers = worker_count;
+        let mut failures = Vec::new();
+        let mut fail_fast_triggered = false;
+
+        while remaining_workers > 0 {
+            tokio::select! {
+                maybe_ui = ui_rx.recv() => {
+                    if let Some(event) = maybe_ui {
+                        match event {
+                            ParallelWorkerUiEvent::Started { channel_id, label } => {
+                                delegate.on_event(RunEvent::ParallelWorkerStarted { channel_id, label }).await?;
+                            }
+                            ParallelWorkerUiEvent::Output { chunk } => {
+                                delegate.on_event(RunEvent::Output(chunk)).await?;
+                            }
+                            ParallelWorkerUiEvent::Finished { channel_id, label, exit_code } => {
+                                delegate.on_event(RunEvent::ParallelWorkerFinished {
+                                    channel_id,
+                                    label,
+                                    exit_code,
+                                }).await?;
+                            }
+                        }
+                    }
+                }
+                maybe_join = join_set.join_next() => {
+                    let Some(join_result) = maybe_join else {
+                        break;
+                    };
+                    remaining_workers = remaining_workers.saturating_sub(1);
+                    match join_result.map_err(|error| anyhow!("parallel worker task failed: {error}"))? {
+                        Ok(outcome) => {
+                            if outcome.exit_code != 0 {
+                                failures.push((outcome.channel_id.clone(), outcome.label.clone(), outcome.exit_code));
+                                if parallel.fail_fast && !fail_fast_triggered {
+                                    fail_fast_triggered = true;
+                                    control.cancel();
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if control.is_cancelled() && fail_fast_triggered && !failures.is_empty() {
+                                continue;
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+
+            if control.is_cancelled() && failures.is_empty() && !fail_fast_triggered {
+                while let Some(join_result) = join_set.join_next().await {
+                    let _ = join_result;
+                }
+                return Err(anyhow!("operation canceled"));
+            }
+        }
+
+        while let Some(event) = ui_rx.recv().await {
+            match event {
+                ParallelWorkerUiEvent::Started { channel_id, label } => {
+                    delegate
+                        .on_event(RunEvent::ParallelWorkerStarted { channel_id, label })
+                        .await?;
+                }
+                ParallelWorkerUiEvent::Output { chunk } => {
+                    delegate.on_event(RunEvent::Output(chunk)).await?;
+                }
+                ParallelWorkerUiEvent::Finished {
+                    channel_id,
+                    label,
+                    exit_code,
+                } => {
+                    delegate
+                        .on_event(RunEvent::ParallelWorkerFinished {
+                            channel_id,
+                            label,
+                            exit_code,
+                        })
+                        .await?;
+                }
+            }
+        }
+
+        if let Some((channel_id, label, exit_code)) = failures.first() {
+            let summary = format!(
+                "parallel worker '{}' ({}) exited with code {}",
+                label, channel_id, exit_code
+            );
+            delegate.on_event(RunEvent::Note(summary.clone())).await?;
+            return Ok(NextStep::FinishError(format_summary(
+                "Workflow failed",
+                &summary,
+            )));
+        }
+
+        self.fallback_step(workflow, prompt_id, delegate).await
     }
 
     fn resolve_workflow_request(
@@ -507,6 +727,8 @@ async fn execute_runner<R, D>(
     config: &RunnerConfig,
     invocation: RunnerInvocation,
     control: &RunControl,
+    wal_write_lock: Arc<AsyncMutex<()>>,
+    allow_loop_control: bool,
     delegate: &mut D,
 ) -> Result<ralph_core::RunnerResult>
 where
@@ -514,6 +736,7 @@ where
     D: RunDelegate,
 {
     let (stream_tx, mut stream_rx) = unbounded_channel();
+    let stream_invocation = invocation.clone();
     let run = runner.run(config, invocation, control, Some(stream_tx));
     tokio::pin!(run);
 
@@ -521,17 +744,227 @@ where
         tokio::select! {
             result = &mut run => {
                 while let Some(event) = stream_rx.recv().await {
-                    forward_stream_event(delegate, event).await?;
+                    match event {
+                        RunnerStreamEvent::Output(chunk) => {
+                            delegate.on_event(RunEvent::Output(chunk)).await?;
+                        }
+                        RunnerStreamEvent::StartedWorking => {}
+                        RunnerStreamEvent::ParsedEvents { child_pid, events } => {
+                            persist_agent_events(
+                                &stream_invocation,
+                                child_pid,
+                                &events,
+                                wal_write_lock.clone(),
+                                allow_loop_control,
+                            )
+                            .await?;
+                        }
+                    }
                 }
                 return result;
             }
             maybe = stream_rx.recv() => {
                 if let Some(event) = maybe {
-                    forward_stream_event(delegate, event).await?;
+                    match event {
+                        RunnerStreamEvent::Output(chunk) => {
+                            delegate.on_event(RunEvent::Output(chunk)).await?;
+                        }
+                        RunnerStreamEvent::StartedWorking => {}
+                        RunnerStreamEvent::ParsedEvents { child_pid, events } => {
+                            persist_agent_events(
+                                &stream_invocation,
+                                child_pid,
+                                &events,
+                                wal_write_lock.clone(),
+                                allow_loop_control,
+                            )
+                            .await?;
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+async fn execute_parallel_worker<R>(
+    runner: R,
+    config: RunnerConfig,
+    invocation: RunnerInvocation,
+    control: RunControl,
+    wal_write_lock: Arc<AsyncMutex<()>>,
+    ui_tx: tokio::sync::mpsc::UnboundedSender<ParallelWorkerUiEvent>,
+    label: String,
+    output_log_path: Utf8PathBuf,
+) -> Result<ParallelWorkerOutcome>
+where
+    R: RunnerAdapter,
+{
+    let (stream_tx, mut stream_rx) = unbounded_channel();
+    let stream_invocation = invocation.clone();
+    let channel_id = invocation.channel_id.clone();
+    let run = runner.run(&config, invocation, &control, Some(stream_tx));
+    tokio::pin!(run);
+
+    loop {
+        tokio::select! {
+            result = &mut run => {
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let _ = ui_tx.send(ParallelWorkerUiEvent::Finished {
+                            channel_id: channel_id.clone(),
+                            label: label.clone(),
+                            exit_code: -1,
+                        });
+                        return Err(error);
+                    }
+                };
+                while let Some(event) = stream_rx.recv().await {
+                    match event {
+                        RunnerStreamEvent::Output(_) => {}
+                        RunnerStreamEvent::StartedWorking => {
+                            let _ = ui_tx.send(ParallelWorkerUiEvent::Started {
+                                channel_id: channel_id.clone(),
+                                label: label.clone(),
+                            });
+                        }
+                        RunnerStreamEvent::ParsedEvents { child_pid, events } => {
+                            persist_agent_events(
+                                &stream_invocation,
+                                child_pid,
+                                &events,
+                                wal_write_lock.clone(),
+                                false,
+                            )
+                            .await?;
+                            for event in events {
+                                let _ = ui_tx.send(ParallelWorkerUiEvent::Output {
+                                    chunk: format_event_notice(Some(&channel_id), &event),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                write_parallel_output_log(&output_log_path, &result.output)?;
+                let _ = ui_tx.send(ParallelWorkerUiEvent::Finished {
+                    channel_id: channel_id.clone(),
+                    label: label.clone(),
+                    exit_code: result.exit_code,
+                });
+                return Ok(ParallelWorkerOutcome {
+                    channel_id,
+                    label,
+                    exit_code: result.exit_code,
+                });
+            }
+            maybe = stream_rx.recv() => {
+                if let Some(event) = maybe {
+                    match event {
+                        RunnerStreamEvent::Output(_) => {}
+                        RunnerStreamEvent::StartedWorking => {
+                            let _ = ui_tx.send(ParallelWorkerUiEvent::Started {
+                                channel_id: channel_id.clone(),
+                                label: label.clone(),
+                            });
+                        }
+                        RunnerStreamEvent::ParsedEvents { child_pid, events } => {
+                            persist_agent_events(
+                                &stream_invocation,
+                                child_pid,
+                                &events,
+                                wal_write_lock.clone(),
+                                false,
+                            )
+                            .await?;
+                            for event in events {
+                                let _ = ui_tx.send(ParallelWorkerUiEvent::Output {
+                                    chunk: format_event_notice(Some(&channel_id), &event),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn persist_agent_events(
+    invocation: &RunnerInvocation,
+    child_pid: u32,
+    events: &[ralph_core::ParsedAgentEvent],
+    wal_write_lock: Arc<AsyncMutex<()>>,
+    allow_loop_control: bool,
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    for event in events {
+        if !allow_loop_control && event.event.starts_with("loop-") {
+            return Err(anyhow!(
+                "parallel worker '{}' cannot emit loop-control event '{}'",
+                invocation.channel_id,
+                event.event
+            ));
+        }
+        validate_agent_event(&event.event, &event.body, Some(&invocation.prompt_path))?;
+    }
+
+    let _guard = wal_write_lock.lock().await;
+    for event in events {
+        append_agent_event(
+            &invocation.run_dir,
+            &AgentEventRecord {
+                v: 1,
+                ts_unix_ms: current_unix_timestamp_ms(),
+                run_id: invocation.run_id.clone(),
+                channel_id: invocation.channel_id.clone(),
+                event: event.event.clone(),
+                body: event.body.clone(),
+                project_dir: invocation.project_dir.clone(),
+                run_dir: invocation.run_dir.clone(),
+                prompt_path: invocation.prompt_path.clone(),
+                prompt_name: invocation.prompt_name.clone(),
+                pid: child_pid,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn current_unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn parallel_worker_label(channel_id: &str, worker: &WorkflowParallelWorkerDefinition) -> String {
+    worker
+        .title
+        .clone()
+        .unwrap_or_else(|| channel_id.to_owned())
+}
+
+fn parallel_output_log_path(run_dir: &Utf8Path, channel_id: &str) -> Utf8PathBuf {
+    run_dir
+        .join(".ralph-runtime")
+        .join("channels")
+        .join(channel_id)
+        .join("output.log")
+}
+
+fn write_parallel_output_log(path: &Utf8Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent.as_std_path())
+            .with_context(|| format!("failed to create {}", parent))?;
+    }
+    fs::write(path.as_std_path(), contents)
+        .with_context(|| format!("failed to write parallel output log {}", path))?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -632,6 +1065,7 @@ mod tests {
         invocations: Arc<Mutex<Vec<RunnerInvocation>>>,
         interactive_invocations: Arc<Mutex<Vec<InteractiveSessionInvocation>>>,
         events: Arc<Mutex<WorkflowEventQueue>>,
+        channel_events: Arc<Mutex<BTreeMap<String, WorkflowEventBatch>>>,
     }
 
     #[async_trait]
@@ -641,26 +1075,27 @@ mod tests {
             _config: &ralph_core::RunnerConfig,
             invocation: RunnerInvocation,
             _control: &RunControl,
-            _stream: Option<UnboundedSender<RunnerStreamEvent>>,
+            stream: Option<UnboundedSender<RunnerStreamEvent>>,
         ) -> Result<RunnerResult> {
             self.invocations.lock().unwrap().push(invocation.clone());
-            let events = self.events.lock().unwrap().remove(0);
-            for (event, body) in events {
-                ralph_core::append_agent_event(
-                    &invocation.run_dir,
-                    &ralph_core::AgentEventRecord {
-                        v: 1,
-                        ts_unix_ms: 1,
-                        run_id: invocation.run_id.clone(),
-                        event,
-                        body,
-                        project_dir: invocation.project_dir.clone(),
-                        run_dir: invocation.run_dir.clone(),
-                        prompt_path: invocation.prompt_path.clone(),
-                        prompt_name: invocation.prompt_name.clone(),
-                        pid: 1,
-                    },
-                )?;
+            let events = if invocation.channel_id != ralph_core::MAIN_CHANNEL_ID {
+                self.channel_events
+                    .lock()
+                    .unwrap()
+                    .remove(&invocation.channel_id)
+                    .unwrap_or_default()
+            } else {
+                self.events.lock().unwrap().remove(0)
+            };
+            if let Some(tx) = stream {
+                let _ = tx.send(RunnerStreamEvent::StartedWorking);
+                let _ = tx.send(RunnerStreamEvent::ParsedEvents {
+                    child_pid: 1,
+                    events: events
+                        .into_iter()
+                        .map(|(event, body)| ralph_core::ParsedAgentEvent { event, body })
+                        .collect(),
+                });
             }
             Ok(RunnerResult {
                 output: String::new(),
@@ -683,6 +1118,7 @@ mod tests {
                     v: 1,
                     ts_unix_ms: 1,
                     run_id: invocation.run_id.clone().unwrap_or_default(),
+                    channel_id: ralph_core::MAIN_CHANNEL_ID.to_owned(),
                     event: "loop-stop:ok".to_owned(),
                     body: "done".to_owned(),
                     project_dir: invocation.project_dir.clone(),
@@ -702,13 +1138,35 @@ mod tests {
     #[derive(Default)]
     struct TestDelegate {
         finished: Vec<(ralph_core::LastRunStatus, String)>,
+        parallel_events: Vec<String>,
+        outputs: Vec<String>,
     }
 
     #[async_trait]
     impl RunDelegate for TestDelegate {
         async fn on_event(&mut self, event: RunEvent) -> Result<()> {
-            if let RunEvent::Finished { status, summary } = event {
-                self.finished.push((status, summary));
+            match event {
+                RunEvent::Finished { status, summary } => {
+                    self.finished.push((status, summary));
+                }
+                RunEvent::ParallelWorkerLaunched { channel_id, .. } => {
+                    self.parallel_events.push(format!("launched:{channel_id}"));
+                }
+                RunEvent::ParallelWorkerStarted { channel_id, .. } => {
+                    self.parallel_events.push(format!("started:{channel_id}"));
+                }
+                RunEvent::ParallelWorkerFinished {
+                    channel_id,
+                    exit_code,
+                    ..
+                } => {
+                    self.parallel_events
+                        .push(format!("finished:{channel_id}:{exit_code}"));
+                }
+                RunEvent::Output(chunk) => {
+                    self.outputs.push(chunk);
+                }
+                _ => {}
             }
             Ok(())
         }
@@ -785,6 +1243,128 @@ prompts:
         assert!(invocations[0].prompt_text.contains("request=ship it"));
         assert!(invocations[1].prompt_text.contains(project_dir.as_str()));
         assert!(summary.run_dir.join("request.txt").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn parallel_prompt_records_channel_scoped_events_and_routes_to_fixer() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let config_home = temp.path().join("config-home");
+        fs::create_dir_all(config_home.join("workflows")).unwrap();
+        let _config_home = ScopedConfigHome::new(&config_home).await;
+        fs::write(
+            config_home.join("workflows/parallel-review.yml"),
+            r#"
+version: 1
+workflow_id: parallel-review
+title: Parallel Review
+entrypoint: reviews
+request:
+  runtime:
+    argv: true
+prompts:
+  reviews:
+    title: Reviews
+    is_interactive: false
+    fallback-route: fixer
+    parallel:
+      workers:
+        QT:
+          title: quality tester
+          prompt: |
+            quality {ralph-request}
+        OE:
+          title: over-engineering detector
+          prompt: |
+            overengineering {ralph-request}
+        CR:
+          title: correctness reviewer
+          prompt: |
+            correctness {ralph-request}
+  fixer:
+    title: Fixer
+    is_interactive: false
+    fallback-route: no-route-error
+    prompt: |
+      fix with all reviews
+"#,
+        )?;
+
+        let runner = WorkflowSpyRunner {
+            events: Arc::new(Mutex::new(vec![vec![(
+                "loop-stop:ok".to_owned(),
+                "done".to_owned(),
+            )]])),
+            channel_events: Arc::new(Mutex::new(BTreeMap::from([
+                (
+                    "CR".to_owned(),
+                    vec![("review".to_owned(), "cr-review".to_owned())],
+                ),
+                (
+                    "OE".to_owned(),
+                    vec![("review".to_owned(), "oe-review".to_owned())],
+                ),
+                (
+                    "QT".to_owned(),
+                    vec![("review".to_owned(), "qt-review".to_owned())],
+                ),
+            ]))),
+            ..Default::default()
+        };
+        let app = RalphApp::new(project_dir, AppConfig::default(), runner.clone());
+        let mut delegate = TestDelegate::default();
+
+        let summary = app
+            .run_workflow(
+                "parallel-review",
+                WorkflowRunInput {
+                    request: WorkflowRequestInput {
+                        argv: Some("ship it".to_owned()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                &mut delegate,
+            )
+            .await?;
+
+        assert_eq!(summary.status, ralph_core::LastRunStatus::Completed);
+        let invocations = runner.invocations.lock().unwrap().clone();
+        assert_eq!(invocations.len(), 4);
+        let mut channels = invocations
+            .iter()
+            .map(|invocation| invocation.channel_id.clone())
+            .collect::<Vec<_>>();
+        channels.sort();
+        assert_eq!(channels, vec!["CR", "OE", "QT", "main"]);
+
+        let wal = ralph_core::read_agent_events_since(&summary.run_dir, 0)?;
+        let reviews = wal
+            .records
+            .iter()
+            .filter(|record| record.event == "review")
+            .map(|record| (record.channel_id.clone(), record.body.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reviews,
+            vec![
+                ("CR".to_owned(), "cr-review".to_owned()),
+                ("OE".to_owned(), "oe-review".to_owned()),
+                ("QT".to_owned(), "qt-review".to_owned()),
+            ]
+        );
+        assert!(delegate.parallel_events.contains(&"launched:QT".to_owned()));
+        assert!(delegate.parallel_events.contains(&"started:QT".to_owned()));
+        assert!(
+            delegate
+                .parallel_events
+                .contains(&"finished:QT:0".to_owned())
+        );
+        let output = delegate.outputs.concat();
+        assert!(output.contains("◆ event emitted [QT]: review | qt-review"));
+        assert!(output.contains("◆ event emitted [OE]: review | oe-review"));
+        assert!(output.contains("◆ event emitted [CR]: review | cr-review"));
         Ok(())
     }
 
