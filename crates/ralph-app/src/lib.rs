@@ -44,6 +44,63 @@ pub enum RunEvent {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningQuestion {
+    pub question: String,
+    pub options: Vec<String>,
+    pub context: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanningAnswerSource {
+    Option,
+    Custom,
+}
+
+impl PlanningAnswerSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Option => "option",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningQuestionAnswer {
+    pub answer: String,
+    pub source: PlanningAnswerSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningDraftReview {
+    pub target_path: Utf8PathBuf,
+    pub draft: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanningDraftDecisionKind {
+    Accept,
+    Revise,
+    Reject,
+}
+
+impl PlanningDraftDecisionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Revise => "revise",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningDraftDecision {
+    pub kind: PlanningDraftDecisionKind,
+    pub feedback: Option<String>,
+}
+
 pub fn format_iteration_banner(
     prompt_name: &str,
     iteration: usize,
@@ -61,6 +118,24 @@ pub fn format_iteration_banner(
 #[async_trait]
 pub trait RunDelegate: Send {
     async fn on_event(&mut self, event: RunEvent) -> Result<()>;
+
+    async fn answer_planning_question(
+        &mut self,
+        _question: &PlanningQuestion,
+    ) -> Result<PlanningQuestionAnswer> {
+        Err(anyhow!(
+            "planning questions are not supported by this run delegate"
+        ))
+    }
+
+    async fn review_planning_draft(
+        &mut self,
+        _draft: &PlanningDraftReview,
+    ) -> Result<PlanningDraftDecision> {
+        Err(anyhow!(
+            "planning draft review is not supported by this run delegate"
+        ))
+    }
 
     async fn run_interactive_session(
         &mut self,

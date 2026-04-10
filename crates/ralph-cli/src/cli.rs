@@ -776,6 +776,7 @@ mod tests {
             let rendered = error.to_string();
 
             assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+            assert!(rendered.contains("plan"));
             assert!(rendered.contains("ipr"));
             assert!(!rendered.contains("test-workflow"));
 

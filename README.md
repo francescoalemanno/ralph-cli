@@ -86,6 +86,7 @@ ralph ls
 - `default`: use this when you want Ralph to keep a durable `PLAN.md`, execute one plan item per loop, and finish with a whole-project verification pass.
 - `dbv`: use this when you want a durable plan in `PLAN.md`, one-item-at-a-time execution, and a final whole-project verification pass before declaring success.
 - `task-based`: use this when the work already lives in a request list or `progress.txt` and you want one right-sized item completed per loop.
+- `plan`: use this when you want a host-mediated planning loop that explores the codebase, asks one clarifying question at a time, drafts a markdown plan, and only writes the exact accepted draft to disk.
 - `pdd`: use this when the idea is still rough and you need an interactive path to research, design, and an implementation plan before autonomous loops.
 
 ## Core Concepts
@@ -112,6 +113,7 @@ These open the runner UI:
 ralph run task-based "fix the failing tests"
 ralph run default "ship the auth refactor"
 ralph run dbv "ship the auth refactor"
+ralph run plan "add caching for API responses"
 ralph run pdd --file rough-idea.md
 ```
 
@@ -131,7 +133,7 @@ ralph run --cli task-based --progressfile progress.txt "finish the top task"
 cat REQ.md | ralph run --cli bare
 ```
 
-CLI mode also accepts piped stdin. For workflows with interactive prompts, do not use stdin; use argv text or `--file` so the terminal stays available.
+CLI mode also accepts piped stdin. For workflows with interactive prompts or host-collected planning questions, do not use stdin; use argv text or `--file` so the terminal stays available.
 
 ### Request Input Rules
 
@@ -161,6 +163,7 @@ If you provide more than one, Ralph exits with a usage error.
 | `default` | Repairs a durable `PLAN.md`, executes one plan item per loop, and verifies the whole project when the plan is complete. | `--planfile` (default: `PLAN.md`) |
 | `dbv` | Uses a durable `PLAN.md` as the control surface, decomposes when needed, builds one item per loop, and performs whole-project verification when the plan is complete. | `--planfile` (default: `PLAN.md`) |
 | `task-based` | Reads the request list, chooses one high-priority right-sized item, executes it, and updates a handoff file for the next loop. | `--progressfile` (default: `progress.txt`) |
+| `plan` | Runs a host-mediated planner loop that explores the repo, asks one clarifying question at a time, drafts a plan, and writes the accepted markdown file under `docs/plans/`. | `--plansdir` (default: `docs/plans`) |
 | `pdd` | Interactive prompt-driven development for turning a rough idea into research, design, and an implementation plan. | `--pdddir` (default: `docs/planning/{project_name}`) |
 
 List them at any time with:
@@ -319,6 +322,27 @@ Built-in workflows use this mechanism for loop control, for example:
 - `loop-stop:ok` with an optional success reason in the payload body
 - `loop-stop:error` with an optional failure reason in the payload body
 
+Planning workflows also use a host-intercepted event contract:
+
+Agent-emitted planning payloads:
+- `planning-question`: asks exactly one clarifying question; Ralph intercepts it, asks the user directly, and then appends host-side planning state into the WAL before rerouting
+- `planning-target-path`: the current proposed project-relative output path for the draft plan
+- `planning-draft`: the current proposed markdown plan; Ralph intercepts it for `accept` / `revise` / `reject`
+
+Host-emitted planning payloads on channel `host`:
+- `planning-answer`: the user's answer to the latest `planning-question`
+- `planning-review`: the user's latest `accept` / `revise` / `reject` decision for the current draft
+- `planning-progress`: cumulative host-maintained transcript of all answered questions and all draft review decisions in the order they happened
+- `planning-plan-file`: the final written plan path after the user accepts a draft
+
+Important planning rules:
+
+- `planning-question` and `planning-draft` are special host-intercepted payloads, not ordinary loop-control signals
+- do not emit `planning-question` and `planning-draft` in the same iteration
+- do not emit planning payloads together with `loop-route` or `loop-stop:*` in the same iteration
+- the latest `planning-draft` and `planning-target-path` in the WAL are the current working draft state
+- on `accept`, Ralph writes the exact latest `planning-draft` to `planning-target-path` and ends the workflow successfully
+
 See the built-in workflow definitions with `ralph show <workflow-id>` if you want to study how loop control works in practice.
 
 ## Parallel Prompts
@@ -355,7 +379,13 @@ Parallel workers emit events on their own channel automatically. Their text outp
 
 ## A Good Daily Flow
 
-If the work is still fuzzy, start with `pdd` and turn the idea into durable docs:
+If the work is still fuzzy but you already want a concrete implementation plan in the repo, start with `plan`:
+
+```bash
+ralph run plan "add SSO to the admin app"
+```
+
+If the work is still fuzzy and you want a broader research/design workflow with multiple planning artifacts, start with `pdd`:
 
 ```bash
 ralph run pdd --file rough-idea.md

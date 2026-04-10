@@ -548,9 +548,9 @@ fn decorate_visible_output(
     }
 
     if flush_pending {
-        if !rendered.is_empty() && !rendered.ends_with('\n') {
-            rendered.push('\n');
-        } else if rendered.is_empty() && !notice_state.last_visible_ended_with_newline {
+        let needs_separator_newline = (!rendered.is_empty() && !rendered.ends_with('\n'))
+            || (rendered.is_empty() && !notice_state.last_visible_ended_with_newline);
+        if needs_separator_newline {
             rendered.push('\n');
         }
         rendered.push_str(&drain_pending_notices(notice_state));

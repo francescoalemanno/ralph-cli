@@ -530,7 +530,9 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-            assert!(error.contains("opening the runner TUI requires both a workflow and a request"));
+            assert!(
+                error.contains("opening the runner TUI requires both a workflow and a request")
+            );
             assert!(error.contains("ralph run <workflow-id>"));
         });
     }

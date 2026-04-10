@@ -17,8 +17,9 @@ use crossterm::{
 };
 pub use editor::edit_file;
 use ralph_app::{
-    RalphApp, RunDelegate, RunEvent, WorkflowRequestInput, WorkflowRunInput,
-    format_iteration_banner,
+    PlanningDraftDecision, PlanningDraftDecisionKind, PlanningDraftReview, PlanningQuestion,
+    PlanningQuestionAnswer, RalphApp, RunDelegate, RunEvent, WorkflowRequestInput,
+    WorkflowRunInput, format_iteration_banner,
 };
 use ralph_core::{
     LastRunStatus, RunControl, RunnerConfig, WorkflowDefinition, WorkflowRunSummary,
@@ -31,7 +32,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use tokio::{runtime::Handle, sync::oneshot};
 use ui::{
@@ -103,6 +104,14 @@ pub fn run_tui_with_options(app: RalphApp, launch: TuiLaunchOptions) -> Result<(
 enum UiEvent {
     RunEvent(RunEvent),
     RunDone(Result<WorkflowRunSummary, String>),
+    PlanningQuestion {
+        question: PlanningQuestion,
+        reply: oneshot::Sender<Result<PlanningQuestionAnswer, String>>,
+    },
+    PlanningDraftReview {
+        draft: PlanningDraftReview,
+        reply: oneshot::Sender<Result<PlanningDraftDecision, String>>,
+    },
     InteractiveSession {
         config: RunnerConfig,
         invocation: InteractiveSessionInvocation,
@@ -223,6 +232,25 @@ impl RunningState {
     }
 }
 
+struct PlanningQuestionDialog {
+    question: PlanningQuestion,
+    selected: usize,
+    custom_answer: String,
+    reply: oneshot::Sender<Result<PlanningQuestionAnswer, String>>,
+}
+
+struct PlanningDraftDialog {
+    draft: PlanningDraftReview,
+    selected: usize,
+    feedback: String,
+    reply: oneshot::Sender<Result<PlanningDraftDecision, String>>,
+}
+
+enum ActiveDialog {
+    PlanningQuestion(PlanningQuestionDialog),
+    PlanningDraft(PlanningDraftDialog),
+}
+
 struct TuiApp {
     app: RalphApp,
     handle: Handle,
@@ -238,6 +266,7 @@ struct TuiApp {
     workflow_options: BTreeMap<String, String>,
     message: String,
     running: Option<RunningState>,
+    active_dialog: Option<ActiveDialog>,
     auto_start_run: bool,
 }
 
@@ -263,6 +292,7 @@ impl TuiApp {
             workflow_options: launch.workflow_options,
             message: String::new(),
             running: None,
+            active_dialog: None,
             auto_start_run: false,
         };
         let has_preloaded_request = launch.preloaded_request.is_some();
@@ -311,6 +341,10 @@ impl TuiApp {
         key: KeyEvent,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<bool> {
+        if self.active_dialog.is_some() {
+            return self.handle_dialog_key(key);
+        }
+
         if self.running.is_some() {
             return self.handle_running_key(key, terminal);
         }
@@ -394,8 +428,147 @@ impl TuiApp {
         Ok(true)
     }
 
+    fn handle_dialog_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            if let Some(running) = &self.running {
+                running.control.cancel();
+            }
+            self.cancel_active_dialog("planning interaction canceled");
+            self.message = "planning interaction canceled".to_owned();
+            return Ok(true);
+        }
+
+        let Some(dialog_state) = self.active_dialog.take() else {
+            return Ok(true);
+        };
+
+        match dialog_state {
+            ActiveDialog::PlanningQuestion(mut dialog) => {
+                let choice_count = dialog.question.options.len() + 1;
+                match key.code {
+                    KeyCode::Up => {
+                        dialog.selected = dialog.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        if dialog.selected + 1 < choice_count {
+                            dialog.selected += 1;
+                        }
+                    }
+                    KeyCode::Backspace if dialog.selected == dialog.question.options.len() => {
+                        dialog.custom_answer.pop();
+                    }
+                    KeyCode::Char(ch)
+                        if dialog.selected == dialog.question.options.len()
+                            && (key.modifiers.is_empty()
+                                || key.modifiers == KeyModifiers::SHIFT) =>
+                    {
+                        dialog.custom_answer.push(ch);
+                    }
+                    KeyCode::Enter => {
+                        if dialog.selected < dialog.question.options.len() {
+                            let answer = dialog.question.options[dialog.selected].clone();
+                            let reply = dialog.reply;
+                            let _ = reply.send(Ok(PlanningQuestionAnswer {
+                                answer,
+                                source: ralph_app::PlanningAnswerSource::Option,
+                            }));
+                            self.message = "planner answer captured".to_owned();
+                            return Ok(true);
+                        } else if !dialog.custom_answer.trim().is_empty() {
+                            let reply = dialog.reply;
+                            let _ = reply.send(Ok(PlanningQuestionAnswer {
+                                answer: dialog.custom_answer.trim().to_owned(),
+                                source: ralph_app::PlanningAnswerSource::Custom,
+                            }));
+                            self.message = "planner answer captured".to_owned();
+                            return Ok(true);
+                        } else {
+                            self.message = "enter a custom answer".to_owned();
+                        }
+                    }
+                    _ => {}
+                }
+                self.active_dialog = Some(ActiveDialog::PlanningQuestion(dialog));
+            }
+            ActiveDialog::PlanningDraft(mut dialog) => {
+                match key.code {
+                    KeyCode::Up => {
+                        dialog.selected = dialog.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        if dialog.selected < 2 {
+                            dialog.selected += 1;
+                        }
+                    }
+                    KeyCode::Backspace if dialog.selected == 1 => {
+                        dialog.feedback.pop();
+                    }
+                    KeyCode::Char(ch)
+                        if dialog.selected == 1
+                            && (key.modifiers.is_empty()
+                                || key.modifiers == KeyModifiers::SHIFT) =>
+                    {
+                        dialog.feedback.push(ch);
+                    }
+                    KeyCode::Enter => match dialog.selected {
+                        0 => {
+                            let reply = dialog.reply;
+                            let _ = reply.send(Ok(PlanningDraftDecision {
+                                kind: PlanningDraftDecisionKind::Accept,
+                                feedback: None,
+                            }));
+                            self.message = "accepted plan draft".to_owned();
+                            return Ok(true);
+                        }
+                        1 => {
+                            if dialog.feedback.trim().is_empty() {
+                                self.message = "enter revision feedback".to_owned();
+                            } else {
+                                let reply = dialog.reply;
+                                let _ = reply.send(Ok(PlanningDraftDecision {
+                                    kind: PlanningDraftDecisionKind::Revise,
+                                    feedback: Some(dialog.feedback.trim().to_owned()),
+                                }));
+                                self.message = "revision feedback captured".to_owned();
+                                return Ok(true);
+                            }
+                        }
+                        2 => {
+                            let reply = dialog.reply;
+                            let _ = reply.send(Ok(PlanningDraftDecision {
+                                kind: PlanningDraftDecisionKind::Reject,
+                                feedback: None,
+                            }));
+                            self.message = "rejected plan draft".to_owned();
+                            return Ok(true);
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+                self.active_dialog = Some(ActiveDialog::PlanningDraft(dialog));
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn cancel_active_dialog(&mut self, reason: &str) {
+        match self.active_dialog.take() {
+            Some(ActiveDialog::PlanningQuestion(dialog)) => {
+                let _ = dialog.reply.send(Err(reason.to_owned()));
+            }
+            Some(ActiveDialog::PlanningDraft(dialog)) => {
+                let _ = dialog.reply.send(Err(reason.to_owned()));
+            }
+            None => {}
+        }
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent, screen: Rect) {
-        if self.running.is_none() {
+        if self.running.is_none() || self.active_dialog.is_some() {
             return;
         }
 
@@ -492,6 +665,36 @@ impl TuiApp {
                     self.message = error;
                 }
             },
+            UiEvent::PlanningQuestion { question, reply } => {
+                if let Some(running) = self.running.as_mut() {
+                    running.push_terminal_text(&format!(
+                        "\n[planner question] {}\n",
+                        question.question
+                    ));
+                }
+                self.message = "planner is waiting for your answer".to_owned();
+                self.active_dialog = Some(ActiveDialog::PlanningQuestion(PlanningQuestionDialog {
+                    question,
+                    selected: 0,
+                    custom_answer: String::new(),
+                    reply,
+                }));
+            }
+            UiEvent::PlanningDraftReview { draft, reply } => {
+                if let Some(running) = self.running.as_mut() {
+                    running.push_terminal_text(&format!(
+                        "\n[plan draft ready] {}\n",
+                        draft.target_path
+                    ));
+                }
+                self.message = "review the plan draft".to_owned();
+                self.active_dialog = Some(ActiveDialog::PlanningDraft(PlanningDraftDialog {
+                    draft,
+                    selected: 0,
+                    feedback: String::new(),
+                    reply,
+                }));
+            }
             UiEvent::InteractiveSession {
                 config,
                 invocation,
@@ -993,6 +1196,9 @@ impl TuiApp {
             self.draw_idle_body(frame, chunks[2]);
         }
         self.draw_footer(frame, chunks[3]);
+        if self.active_dialog.is_some() {
+            self.draw_active_dialog(frame);
+        }
     }
 
     fn draw_header(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -1310,6 +1516,10 @@ impl TuiApp {
     }
 
     fn footer_text(&self) -> &'static str {
+        if self.active_dialog.is_some() {
+            return "Enter submit  •  ↑/↓ move  •  Esc cancel interaction";
+        }
+
         if let Some(running) = self.running.as_ref() {
             return match (running.is_finished(), self.can_edit_request()) {
                 (true, true) => {
@@ -1328,7 +1538,9 @@ impl TuiApp {
         }
 
         match (self.can_switch_request_source(), self.can_edit_request()) {
-            (true, true) => "Enter/R run  •  ←/→ switch request source  •  E edit request  •  A cycle agent  •  Q quit",
+            (true, true) => {
+                "Enter/R run  •  ←/→ switch request source  •  E edit request  •  A cycle agent  •  Q quit"
+            }
             (false, true) => "Enter/R run  •  E edit request  •  A cycle agent  •  Q quit",
             (_, false) => "A cycle agent  •  Q quit",
         }
@@ -1348,7 +1560,9 @@ impl TuiApp {
 
         if self.can_edit_request() {
             lines.push(Line::from("Press Enter or R to start the run."));
-            lines.push(Line::from("Use E to edit the request in a file-backed editor."));
+            lines.push(Line::from(
+                "Use E to edit the request in a file-backed editor.",
+            ));
         } else {
             lines.push(Line::from(
                 "This workflow starts immediately because it does not use a user request.",
@@ -1376,6 +1590,158 @@ impl TuiApp {
             .style(Style::default().fg(self.text_color()))
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
+    }
+
+    fn draw_active_dialog(&self, frame: &mut Frame<'_>) {
+        match &self.active_dialog {
+            Some(ActiveDialog::PlanningQuestion(dialog)) => {
+                let area = centered_rect(80, 18, frame.area());
+                frame.render_widget(Clear, area);
+                let mut lines = vec![
+                    Line::from(vec![
+                        Span::styled(
+                            "Question",
+                            Style::default()
+                                .fg(self.accent_color())
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            "planner needs one answer",
+                            Style::default().fg(self.muted_color()),
+                        ),
+                    ]),
+                    Line::from(""),
+                    Line::from(dialog.question.question.clone()),
+                ];
+                if let Some(context) = &dialog.question.context
+                    && !context.trim().is_empty()
+                {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(vec![
+                        Span::styled("Context ", Style::default().fg(self.subtle_color())),
+                        Span::styled(context.clone(), Style::default().fg(self.text_color())),
+                    ]));
+                }
+                lines.push(Line::from(""));
+                for (index, option) in dialog.question.options.iter().enumerate() {
+                    lines.push(self.dialog_option_line(
+                        dialog.selected == index,
+                        &format!("{}.", index + 1),
+                        option,
+                    ));
+                }
+                let custom_index = dialog.question.options.len();
+                lines.push(self.dialog_option_line(
+                    dialog.selected == custom_index,
+                    &format!("{}.", custom_index + 1),
+                    "Other (type your own answer)",
+                ));
+                if dialog.selected == custom_index {
+                    lines.push(Line::from(""));
+                    let mut custom = dialog.custom_answer.clone();
+                    custom.push('█');
+                    if dialog.custom_answer.is_empty() {
+                        custom = "Type your answer here█".to_owned();
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled("Custom ", Style::default().fg(self.subtle_color())),
+                        Span::styled(custom, Style::default().fg(self.text_color())),
+                    ]));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("Enter ", Style::default().fg(self.subtle_color())),
+                    Span::styled("submit", Style::default().fg(self.text_color())),
+                    Span::styled("  •  ", Style::default().fg(self.subtle_color())),
+                    Span::styled("↑/↓", Style::default().fg(self.text_color())),
+                    Span::styled(" move  •  ", Style::default().fg(self.subtle_color())),
+                    Span::styled("Esc", Style::default().fg(self.text_color())),
+                    Span::styled(" cancel", Style::default().fg(self.subtle_color())),
+                ]));
+                frame.render_widget(
+                    Paragraph::new(Text::from(lines))
+                        .block(
+                            self.panel_block()
+                                .title(self.title_line("Planning", "Question")),
+                        )
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
+            }
+            Some(ActiveDialog::PlanningDraft(dialog)) => {
+                let area = centered_rect(100, 24, frame.area());
+                frame.render_widget(Clear, area);
+                let mut lines = vec![
+                    Line::from(vec![
+                        Span::styled(
+                            "Draft Review",
+                            Style::default()
+                                .fg(self.accent_color())
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            dialog.draft.target_path.to_string(),
+                            Style::default().fg(self.muted_color()),
+                        ),
+                    ]),
+                    Line::from(""),
+                ];
+                lines.extend(dialog_preview_lines(&dialog.draft.draft, 10));
+                lines.push(Line::from(""));
+                lines.push(self.dialog_option_line(dialog.selected == 0, "1.", "Accept"));
+                lines.push(self.dialog_option_line(dialog.selected == 1, "2.", "Revise"));
+                lines.push(self.dialog_option_line(dialog.selected == 2, "3.", "Reject"));
+                if dialog.selected == 1 {
+                    lines.push(Line::from(""));
+                    let mut feedback = dialog.feedback.clone();
+                    feedback.push('█');
+                    if dialog.feedback.is_empty() {
+                        feedback = "Type revision feedback█".to_owned();
+                    }
+                    lines.push(Line::from(vec![
+                        Span::styled("Feedback ", Style::default().fg(self.subtle_color())),
+                        Span::styled(feedback, Style::default().fg(self.text_color())),
+                    ]));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("Enter ", Style::default().fg(self.subtle_color())),
+                    Span::styled("submit", Style::default().fg(self.text_color())),
+                    Span::styled("  •  ", Style::default().fg(self.subtle_color())),
+                    Span::styled("↑/↓", Style::default().fg(self.text_color())),
+                    Span::styled(" move  •  ", Style::default().fg(self.subtle_color())),
+                    Span::styled("Esc", Style::default().fg(self.text_color())),
+                    Span::styled(" cancel", Style::default().fg(self.subtle_color())),
+                ]));
+                frame.render_widget(
+                    Paragraph::new(Text::from(lines))
+                        .block(
+                            self.panel_block()
+                                .title(self.title_line("Planning", "Draft review")),
+                        )
+                        .wrap(Wrap { trim: false }),
+                    area,
+                );
+            }
+            None => {}
+        }
+    }
+
+    fn dialog_option_line(&self, selected: bool, prefix: &str, text: &str) -> Line<'static> {
+        let style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(self.accent_color())
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self.text_color())
+        };
+        Line::from(vec![
+            Span::styled(format!(" {prefix} "), style),
+            Span::styled(text.to_owned(), style),
+        ])
     }
 
     fn allowed_runtime_sources(&self, runtime: &WorkflowRuntimeRequest) -> String {
@@ -1483,6 +1849,32 @@ impl TuiApp {
     }
 }
 
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let popup_width = width.min(area.width.saturating_sub(2)).max(20);
+    let popup_height = height.min(area.height.saturating_sub(2)).max(8);
+    Rect {
+        x: area.x + (area.width.saturating_sub(popup_width)) / 2,
+        y: area.y + (area.height.saturating_sub(popup_height)) / 2,
+        width: popup_width,
+        height: popup_height,
+    }
+}
+
+fn dialog_preview_lines(text: &str, max_lines: usize) -> Vec<Line<'static>> {
+    let mut lines = text
+        .lines()
+        .take(max_lines)
+        .map(|line| Line::from(line.to_owned()))
+        .collect::<Vec<_>>();
+    if text.lines().count() > max_lines {
+        lines.push(Line::from("..."));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("<empty draft>"));
+    }
+    lines
+}
+
 struct TuiRunDelegate {
     tx: std::sync::mpsc::Sender<UiEvent>,
 }
@@ -1494,6 +1886,40 @@ impl RunDelegate for TuiRunDelegate {
             .send(UiEvent::RunEvent(event))
             .map_err(|_| anyhow!("TUI event channel closed"))?;
         Ok(())
+    }
+
+    async fn answer_planning_question(
+        &mut self,
+        question: &PlanningQuestion,
+    ) -> Result<PlanningQuestionAnswer> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(UiEvent::PlanningQuestion {
+                question: question.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("TUI event channel closed"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("planning question reply channel closed"))?
+            .map_err(anyhow::Error::msg)
+    }
+
+    async fn review_planning_draft(
+        &mut self,
+        draft: &PlanningDraftReview,
+    ) -> Result<PlanningDraftDecision> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(UiEvent::PlanningDraftReview {
+                draft: draft.clone(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("TUI event channel closed"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("planning draft reply channel closed"))?
+            .map_err(anyhow::Error::msg)
     }
 
     async fn run_interactive_session(
@@ -1701,10 +2127,14 @@ mod tests {
         assert!(!tui.can_edit_request());
         assert_eq!(tui.footer_text(), "A cycle agent  •  Q quit");
         assert!(
-            !tui.idle_output_panel_text().to_string().contains("Use E to edit the request")
+            !tui.idle_output_panel_text()
+                .to_string()
+                .contains("Use E to edit the request")
         );
         assert!(
-            !tui.request_panel_text().to_string().contains("Press Enter or R to run.")
+            !tui.request_panel_text()
+                .to_string()
+                .contains("Press Enter or R to run.")
         );
     }
 

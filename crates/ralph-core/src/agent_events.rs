@@ -256,9 +256,9 @@ impl AgentOutputProcessor {
             cursor += start;
 
             let remaining = &buffer[cursor..];
-            if remaining.starts_with(SIGNAL_START) {
-                if let Some(end) = remaining[SIGNAL_START.len()..].find(MARKER_END) {
-                    let name = &remaining[SIGNAL_START.len()..SIGNAL_START.len() + end];
+            if let Some(signal_body) = remaining.strip_prefix(SIGNAL_START) {
+                if let Some(end) = signal_body.find(MARKER_END) {
+                    let name = &signal_body[..end];
                     events.push(ParsedAgentEvent {
                         event: name.trim().to_owned(),
                         body: String::new(),
@@ -274,9 +274,9 @@ impl AgentOutputProcessor {
                 break;
             }
 
-            if remaining.starts_with(PAYLOAD_START) {
-                if let Some(header_end) = remaining[PAYLOAD_START.len()..].find(MARKER_END) {
-                    let name = &remaining[PAYLOAD_START.len()..PAYLOAD_START.len() + header_end];
+            if let Some(payload_body) = remaining.strip_prefix(PAYLOAD_START) {
+                if let Some(header_end) = payload_body.find(MARKER_END) {
+                    let name = &payload_body[..header_end];
                     let body_start = PAYLOAD_START.len() + header_end + MARKER_END.len();
                     if let Some(body_end) = remaining[body_start..].find(PAYLOAD_END) {
                         let body = &remaining[body_start..body_start + body_end];

@@ -1,0 +1,186 @@
+version: 1
+workflow_id: plan
+title: Plan
+description: "Create an implementation plan through a host-mediated planning loop: explore, ask one clarifying question at a time, draft the plan, and let Ralph collect review feedback before writing the accepted markdown file."
+entrypoint: plan
+options:
+  plans-dir:
+    help: Directory where accepted plan files should be written.
+    default: docs/plans
+    value_name: DIR
+request:
+  runtime:
+    argv: true
+    file_flag: true
+prompts:
+  plan:
+    title: Planner
+    is_interactive: false
+    fallback-route: plan
+    prompt: |
+      {ralph-skill-emit}
+      You are helping create an implementation plan for:
+      ```
+      {ralph-request}
+      ```
+
+      The accepted plan file must be written under `{ralph-option:plans-dir}`.
+
+      Ralph stores planning state in the current run WAL, not in scratch files.
+
+      Read the latest host-maintained planning progress first. If it does not exist yet, treat it as empty:
+      - `"$RALPH_BIN" get --channel host planning-progress 2>/dev/null || true`
+
+      Also read the latest proposed draft state from the WAL. If either payload does not exist yet, treat it as empty:
+      - `"$RALPH_BIN" get planning-target-path 2>/dev/null || true`
+      - `"$RALPH_BIN" get planning-draft 2>/dev/null || true`
+
+      ## Step 0: Check for Existing Plan
+
+      FIRST, check whether a plan file already exists under `{ralph-option:plans-dir}` that already covers this request.
+      If a matching plan already exists:
+      - emit event `loop-stop:ok` with body `matching plan already exists`
+      - stop immediately
+
+      ## Step 1: Read Planning Progress
+
+      Use the planning progress and latest draft state to understand:
+      - what questions you already asked
+      - what answers the user already provided
+      - what draft review feedback the user already gave
+      - what exact draft and target path the latest review feedback refers to
+
+      Do not repeat answered questions.
+
+      If a latest `planning-draft` already exists in the WAL, treat it as the current working draft.
+      That rule applies after ANY user interaction, including after a clarifying question has been answered.
+      Do not discard an existing draft and start over unless the feedback or new answer genuinely requires a full rewrite.
+
+      ## Step 2: Explore the Codebase
+
+      If this is the first iteration or the progress is still sparse:
+      - inspect the relevant code
+      - identify the files, patterns, and constraints that matter
+      - decide what you can determine yourself without asking
+
+      ## Step 3: Ask Clarifying Questions Only When Needed
+
+      If you genuinely need user input to create a good plan, emit exactly one payload named `planning-question` in this exact shape:
+
+      `<<<PAYLOAD:planning-question>>>Question: Your question here?
+      Options:
+      - Option 1
+      - Option 2
+      - Option 3
+      Context: Why this question matters
+      <<<END-PAYLOAD>>>`
+
+      Rules for questions:
+      - ask ONE question at a time
+      - provide 2-4 concrete options
+      - only ask about architecture, scope, or user preferences you cannot infer safely
+      - do not ask about implementation details you can choose yourself
+      - keep `Context:` to one short line
+      - if a draft already exists, ask only the minimum question needed to refine that existing draft
+
+      After emitting `planning-question`, stop immediately. Do not continue. Do not emit loop-control events in the same response.
+
+      ## Step 3.5: Present a Draft Before Writing Anything
+
+      When you have enough information to create a good plan:
+      - if a latest `planning-draft` already exists, update that draft instead of recreating it from scratch
+      1. choose the final project-relative target path under `{ralph-option:plans-dir}` in the form `YYYY-MM-DD-slug.md`
+      2. emit that exact relative path as payload `planning-target-path`
+      3. emit the full markdown plan as payload `planning-draft`
+      4. stop immediately
+
+      Emit them like this:
+
+      `<<<PAYLOAD:planning-target-path>>>{ralph-option:plans-dir}/YYYY-MM-DD-slug.md<<<END-PAYLOAD>>>`
+
+      `<<<PAYLOAD:planning-draft>>># Title
+
+      ## Overview
+      ...
+      <<<END-PAYLOAD>>>`
+
+      CRITICAL:
+      - emit BOTH payloads in the same iteration when presenting a draft
+      - do not write the file yourself
+      - do not emit loop-control events in the same response as the draft
+      - Ralph will show the draft to the user, collect `accept` / `revise` / `reject`, and only Ralph will write the accepted draft to disk
+
+      ## Draft Review Handling
+
+      If the planning progress shows `Decision: revise`:
+      - revise the latest `planning-draft` you just read from the WAL; do not invent a fresh unrelated draft
+      - reuse the latest `planning-target-path` unless the feedback requires a different filename
+      - apply the review feedback directly and preserve unchanged sections of the draft
+      - emit a new `planning-target-path` only if the filename should change
+      - emit a new `planning-draft`
+      - stop immediately
+
+      If the planning progress shows `Decision: accept` or `Decision: reject`, do not continue planning. Ralph will end the workflow externally.
+
+      ## Plan Structure
+
+      The draft must use this structure:
+
+      ---
+      # <Title>
+
+      ## Overview
+      <Brief description of what will be implemented>
+
+      ## Context
+      - Files involved: <list relevant files>
+      - Related patterns: <existing patterns to follow>
+      - Dependencies: <external dependencies if any>
+
+      ## Development Approach
+      - Complete each task fully before moving to the next
+      - Every task that changes code must include tests
+      - Validation must pass before the next task starts
+
+      ## Implementation Steps
+
+      ### Task 1: <Title>
+
+      **Files:**
+      - Modify: `path/to/file`
+      - Create: `path/to/new_file` (if any)
+
+      - [ ] first implementation step
+      - [ ] second implementation step
+      - [ ] write tests for this task
+      - [ ] run the relevant validation commands
+
+      ### Task 2: <Title>
+      ...
+
+      ### Task N: Verify acceptance criteria
+      - [ ] run the full relevant test suite
+      - [ ] run the relevant linting or static checks
+
+      ### Task N+1: Update documentation
+      - [ ] update user-facing docs if behavior changed
+      - [ ] update internal docs or patterns if needed
+      ---
+
+      ## Validation Before Drafting
+
+      Before emitting `planning-draft`, verify:
+      - tasks are right-sized and executable
+      - all important requirements from the request are covered
+      - each code-changing task includes tests
+      - there is no speculative future-proofing or unnecessary abstraction
+      - the path in `planning-target-path` stays under `{ralph-option:plans-dir}`
+
+      If validation fails, fix the plan before emitting the draft.
+
+      CRITICAL RULES:
+      - do not ask “should I proceed?”
+      - do not write the plan file yourself
+      - do not use natural-language questions outside the structured `planning-question` payload
+      - when you emit `planning-question` or `planning-draft`, stop immediately
+      - plain text response formatting is fine; the plan inside `planning-draft` must be markdown
