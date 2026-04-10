@@ -271,7 +271,7 @@ impl TuiApp {
         }
         this.sync_request_mode();
         this.focus = this.request_focus().unwrap_or(Focus::RequestText);
-        this.auto_start_run = has_preloaded_request;
+        this.auto_start_run = has_preloaded_request || !this.uses_user_request();
         Ok(this)
     }
 
@@ -319,9 +319,9 @@ impl TuiApp {
             KeyCode::Char('q') => return Ok(false),
             KeyCode::Char('a') => self.cycle_agent(None)?,
             KeyCode::Char('r') => self.start_run()?,
-            KeyCode::Char('e') => self.edit_request(terminal)?,
-            KeyCode::Left => self.request_mode_left(),
-            KeyCode::Right => self.request_mode_right(),
+            KeyCode::Char('e') if self.can_edit_request() => self.edit_request(terminal)?,
+            KeyCode::Left if self.can_switch_request_source() => self.request_mode_left(),
+            KeyCode::Right if self.can_switch_request_source() => self.request_mode_right(),
             KeyCode::Enter => self.start_run()?,
             KeyCode::Backspace => self.handle_backspace(),
             KeyCode::Char(ch)
@@ -365,7 +365,7 @@ impl TuiApp {
                     self.message.push_str(" (applies next iteration)");
                 }
             }
-            KeyCode::Char('e') => {
+            KeyCode::Char('e') if self.can_edit_request() => {
                 self.edit_request(terminal)?;
                 if !is_finished {
                     self.message = format!("{}; rerun to apply request edits", self.message);
@@ -440,6 +440,25 @@ impl TuiApp {
                             running.push_terminal_text("\n");
                         }
                         RunEvent::Output(chunk) => running.push_terminal_text(&chunk),
+                        RunEvent::ParallelWorkerLaunched { channel_id, label } => {
+                            running.push_terminal_text(&format!(
+                                "\n[parallel:{channel_id}] launched {label}\n"
+                            ));
+                        }
+                        RunEvent::ParallelWorkerStarted { channel_id, label } => {
+                            running.push_terminal_text(&format!(
+                                "\n[parallel:{channel_id}] started {label}\n"
+                            ));
+                        }
+                        RunEvent::ParallelWorkerFinished {
+                            channel_id,
+                            label,
+                            exit_code,
+                        } => {
+                            running.push_terminal_text(&format!(
+                                "\n[parallel:{channel_id}] finished {label} (exit={exit_code})\n"
+                            ));
+                        }
                         RunEvent::Note(note) => {
                             self.message = note.clone();
                             running.push_terminal_text(&format!("\n[{note}]\n"));
@@ -665,6 +684,10 @@ impl TuiApp {
     }
 
     fn request_input_for(&self, workflow: &WorkflowDefinition) -> Result<WorkflowRequestInput> {
+        if !workflow.uses_request_token() {
+            return Ok(WorkflowRequestInput::default());
+        }
+
         let Some(request) = workflow.request.as_ref() else {
             return Ok(WorkflowRequestInput::default());
         };
@@ -703,10 +726,27 @@ impl TuiApp {
     }
 
     fn runtime_request(&self) -> Option<&WorkflowRuntimeRequest> {
+        if !self.uses_user_request() {
+            return None;
+        }
+
         self.workflow
             .request
             .as_ref()
             .and_then(|request| request.runtime.as_ref())
+    }
+
+    fn uses_user_request(&self) -> bool {
+        self.workflow.uses_request_token()
+    }
+
+    fn can_edit_request(&self) -> bool {
+        self.uses_user_request()
+    }
+
+    fn can_switch_request_source(&self) -> bool {
+        self.runtime_request()
+            .is_some_and(|runtime| runtime.argv && runtime.file_flag)
     }
 
     fn can_edit_request_text(&self) -> bool {
@@ -723,6 +763,9 @@ impl TuiApp {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<()> {
+        if !self.can_edit_request() {
+            return Err(anyhow!("this workflow does not accept request edits"));
+        }
         let target = self.resolve_request_edit_target()?;
         self.prepare_request_edit_target(&target)?;
         suspend_terminal(terminal)?;
@@ -1046,15 +1089,7 @@ impl TuiApp {
     }
 
     fn draw_footer(&self, frame: &mut Frame<'_>, area: Rect) {
-        let footer = if let Some(running) = self.running.as_ref() {
-            if running.is_finished() {
-                "R rerun  •  E edit request  •  A cycle next agent  •  F/End follow  •  wheel/↑/↓/PgUp/PgDn scroll  •  Q quit"
-            } else {
-                "Ctrl-C cancel run  •  A cycle next agent  •  E edit request  •  F/End follow  •  wheel/↑/↓/PgUp/PgDn scroll  •  Q quit"
-            }
-        } else {
-            "Enter/R run  •  ←/→ switch request source  •  E edit request  •  A cycle agent  •  Q quit"
-        };
+        let footer = self.footer_text();
 
         let paragraph = Paragraph::new(footer)
             .style(Style::default().fg(self.muted_color()))
@@ -1077,11 +1112,19 @@ impl TuiApp {
     }
 
     fn request_panel_text(&self) -> Text<'static> {
+        if !self.uses_user_request() {
+            return Text::from(vec![
+                Line::from("This workflow does not use a user request."),
+                Line::from(""),
+                Line::from("The run starts immediately."),
+            ]);
+        }
+
         let Some(request) = self.workflow.request.as_ref() else {
             return Text::from(vec![
-                Line::from("This workflow does not require a request."),
+                Line::from("This workflow does not use a user request."),
                 Line::from(""),
-                Line::from("Press Enter or R to run."),
+                Line::from("The run starts immediately."),
             ]);
         };
 
@@ -1117,18 +1160,7 @@ impl TuiApp {
     }
 
     fn draw_idle_output_panel(&self, frame: &mut Frame<'_>, area: Rect) {
-        let text = Text::from(vec![
-            Line::from(vec![
-                Span::styled("workflow ", Style::default().fg(self.subtle_color())),
-                Span::styled(
-                    self.workflow_id.clone(),
-                    Style::default().fg(self.text_color()),
-                ),
-            ]),
-            Line::from(""),
-            Line::from("Press Enter or R to start the run."),
-            Line::from("Use E to edit the request in a file-backed editor."),
-        ]);
+        let text = self.idle_output_panel_text();
         let paragraph = Paragraph::new(text)
             .block(
                 self.panel_block()
@@ -1222,7 +1254,9 @@ impl TuiApp {
             .map(|running| running.prompt_name.as_str())
             .filter(|name| !name.is_empty())
             .unwrap_or("<pending>");
-        let note = if self.running.as_ref().is_some_and(RunningState::is_finished) {
+        let note = if !self.can_edit_request() {
+            "This workflow does not use a request."
+        } else if self.running.as_ref().is_some_and(RunningState::is_finished) {
             "E edits the request used for rerun."
         } else {
             "Agent switches apply on the next iteration only."
@@ -1273,6 +1307,55 @@ impl TuiApp {
                 .title(self.title_line("Context", "Current run")),
         );
         frame.render_widget(paragraph, area);
+    }
+
+    fn footer_text(&self) -> &'static str {
+        if let Some(running) = self.running.as_ref() {
+            return match (running.is_finished(), self.can_edit_request()) {
+                (true, true) => {
+                    "R rerun  •  E edit request  •  A cycle next agent  •  F/End follow  •  wheel/↑/↓/PgUp/PgDn scroll  •  Q quit"
+                }
+                (true, false) => {
+                    "R rerun  •  A cycle next agent  •  F/End follow  •  wheel/↑/↓/PgUp/PgDn scroll  •  Q quit"
+                }
+                (false, true) => {
+                    "Ctrl-C cancel run  •  A cycle next agent  •  E edit request  •  F/End follow  •  wheel/↑/↓/PgUp/PgDn scroll  •  Q quit"
+                }
+                (false, false) => {
+                    "Ctrl-C cancel run  •  A cycle next agent  •  F/End follow  •  wheel/↑/↓/PgUp/PgDn scroll  •  Q quit"
+                }
+            };
+        }
+
+        match (self.can_switch_request_source(), self.can_edit_request()) {
+            (true, true) => "Enter/R run  •  ←/→ switch request source  •  E edit request  •  A cycle agent  •  Q quit",
+            (false, true) => "Enter/R run  •  E edit request  •  A cycle agent  •  Q quit",
+            (_, false) => "A cycle agent  •  Q quit",
+        }
+    }
+
+    fn idle_output_panel_text(&self) -> Text<'static> {
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("workflow ", Style::default().fg(self.subtle_color())),
+                Span::styled(
+                    self.workflow_id.clone(),
+                    Style::default().fg(self.text_color()),
+                ),
+            ]),
+            Line::from(""),
+        ];
+
+        if self.can_edit_request() {
+            lines.push(Line::from("Press Enter or R to start the run."));
+            lines.push(Line::from("Use E to edit the request in a file-backed editor."));
+        } else {
+            lines.push(Line::from(
+                "This workflow starts immediately because it does not use a user request.",
+            ));
+        }
+
+        Text::from(lines)
     }
 
     fn draw_output_panel(&mut self, frame: &mut Frame<'_>, area: Rect) {
@@ -1591,6 +1674,38 @@ mod tests {
         assert_eq!(tui.request_text, "ship it");
         assert_eq!(tui.request_origin, RequestOrigin::Argv);
         assert!(tui.auto_start_run);
+    }
+
+    #[test]
+    fn workflows_without_request_token_ignore_request_input() {
+        let temp = temp_project_dir();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let app = RalphApp::load(project_dir).unwrap();
+        let tui = TuiApp::new(
+            app,
+            runtime.handle().clone(),
+            TuiLaunchOptions {
+                preset_workflow: Some("test-workflow".to_owned()),
+                preloaded_request: None,
+                workflow_options: Default::default(),
+            },
+        )
+        .unwrap();
+
+        let request_input = tui.request_input_for(&tui.workflow).unwrap();
+        assert!(request_input.argv.is_none());
+        assert!(request_input.stdin.is_none());
+        assert!(request_input.request_file.is_none());
+        assert!(tui.auto_start_run);
+        assert!(!tui.can_edit_request());
+        assert_eq!(tui.footer_text(), "A cycle agent  •  Q quit");
+        assert!(
+            !tui.idle_output_panel_text().to_string().contains("Use E to edit the request")
+        );
+        assert!(
+            !tui.request_panel_text().to_string().contains("Press Enter or R to run.")
+        );
     }
 
     #[test]
