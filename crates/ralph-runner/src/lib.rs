@@ -1,16 +1,14 @@
 use std::{
     path::Path,
     process::{Child as StdChild, Command as StdCommand, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use ralph_core::{
-    AgentEventRecord, AgentOutputProcessor, CommandMode, PromptInput, RunControl, RunnerConfig,
-    RunnerInvocation, RunnerResult, agent_events_wal_path, append_agent_event,
-    validate_agent_event,
+    AgentOutputProcessor, CommandMode, PromptInput, RunControl, RunnerConfig, RunnerInvocation,
+    RunnerResult, agent_events_wal_path,
 };
 use tempfile::NamedTempFile;
 use tokio::{
@@ -25,6 +23,11 @@ use tracing::debug;
 #[derive(Debug, Clone)]
 pub enum RunnerStreamEvent {
     Output(String),
+    StartedWorking,
+    ParsedEvents {
+        child_pid: u32,
+        events: Vec<ralph_core::ParsedAgentEvent>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -51,6 +54,7 @@ pub struct InteractiveSessionOutcome {
 #[derive(Debug, Clone)]
 struct TemplateContext {
     run_id: String,
+    channel_id: String,
     prompt_text: String,
     project_dir: Utf8PathBuf,
     run_dir: Utf8PathBuf,
@@ -62,6 +66,7 @@ impl TemplateContext {
     fn from_invocation(invocation: RunnerInvocation) -> Self {
         Self {
             run_id: invocation.run_id,
+            channel_id: invocation.channel_id,
             prompt_text: invocation.prompt_text,
             project_dir: invocation.project_dir,
             run_dir: invocation.run_dir,
@@ -73,6 +78,7 @@ impl TemplateContext {
     fn from_interactive(invocation: &InteractiveSessionInvocation) -> Self {
         Self {
             run_id: invocation.run_id.clone().unwrap_or_default(),
+            channel_id: ralph_core::MAIN_CHANNEL_ID.to_owned(),
             prompt_text: invocation.initial_prompt.clone(),
             project_dir: invocation.project_dir.clone(),
             run_dir: invocation.run_dir.clone(),
@@ -171,6 +177,7 @@ impl RunnerAdapter for CommandRunner {
             pending: Vec::new(),
             last_visible_ended_with_newline: true,
         };
+        let mut started_working = false;
         let exit_code = loop {
             if control.is_cancelled() {
                 let _ = child.start_kill();
@@ -182,11 +189,18 @@ impl RunnerAdapter for CommandRunner {
 
             if let Some(status) = child.try_wait().context("failed while polling runner")? {
                 while let Some(event) = chunk_rx.recv().await {
-                    let RunnerStreamEvent::Output(chunk) = event;
+                    let RunnerStreamEvent::Output(chunk) = event else {
+                        continue;
+                    };
+                    if !started_working {
+                        started_working = true;
+                        if let Some(tx) = &stream {
+                            let _ = tx.send(RunnerStreamEvent::StartedWorking);
+                        }
+                    }
                     handle_runner_output_chunk(
                         &mut processor,
                         &mut notice_state,
-                        &context,
                         child_pid,
                         &chunk,
                         &mut output_buffer,
@@ -199,11 +213,18 @@ impl RunnerAdapter for CommandRunner {
             tokio::select! {
                 maybe = chunk_rx.recv() => {
                     if let Some(event) = maybe {
-                        let RunnerStreamEvent::Output(chunk) = event;
+                        let RunnerStreamEvent::Output(chunk) = event else {
+                            continue;
+                        };
+                        if !started_working {
+                            started_working = true;
+                            if let Some(tx) = &stream {
+                                let _ = tx.send(RunnerStreamEvent::StartedWorking);
+                            }
+                        }
                         if let Err(error) = handle_runner_output_chunk(
                             &mut processor,
                             &mut notice_state,
-                            &context,
                             child_pid,
                             &chunk,
                             &mut output_buffer,
@@ -224,7 +245,6 @@ impl RunnerAdapter for CommandRunner {
         flush_runner_output_processor(
             &mut processor,
             &mut notice_state,
-            &context,
             child_pid,
             &mut output_buffer,
             &stream,
@@ -402,6 +422,7 @@ fn rendered_envs(
         resolved_prompt_path(context, prompt_file).to_owned(),
     ));
     envs.push(("RALPH_PROMPT_NAME".to_owned(), context.prompt_name.clone()));
+    envs.push(("RALPH_CHANNEL_ID".to_owned(), context.channel_id.clone()));
     envs.push((
         "RALPH_MODE".to_owned(),
         invocation_mode(&context.prompt_name),
@@ -424,14 +445,13 @@ async fn await_stream_task(task: JoinHandle<Result<()>>, name: &str) -> Result<(
 fn handle_runner_output_chunk(
     processor: &mut AgentOutputProcessor,
     notice_state: &mut EventNoticeState,
-    context: &TemplateContext,
     child_pid: u32,
     chunk: &str,
     output_buffer: &mut String,
     stream: &Option<UnboundedSender<RunnerStreamEvent>>,
 ) -> Result<()> {
     let parsed = processor.push_str(chunk);
-    persist_parsed_events(context, child_pid, &parsed.events)?;
+    forward_parsed_events(stream, child_pid, &parsed.events);
     enqueue_event_notices(notice_state, &parsed.events);
     forward_visible_output(
         notice_state,
@@ -446,13 +466,12 @@ fn handle_runner_output_chunk(
 fn flush_runner_output_processor(
     processor: &mut AgentOutputProcessor,
     notice_state: &mut EventNoticeState,
-    context: &TemplateContext,
     child_pid: u32,
     output_buffer: &mut String,
     stream: &Option<UnboundedSender<RunnerStreamEvent>>,
 ) -> Result<()> {
     let parsed = processor.finish();
-    persist_parsed_events(context, child_pid, &parsed.events)?;
+    forward_parsed_events(stream, child_pid, &parsed.events);
     enqueue_event_notices(notice_state, &parsed.events);
     forward_visible_output(
         notice_state,
@@ -464,36 +483,21 @@ fn flush_runner_output_processor(
     Ok(())
 }
 
-fn persist_parsed_events(
-    context: &TemplateContext,
+fn forward_parsed_events(
+    stream: &Option<UnboundedSender<RunnerStreamEvent>>,
     child_pid: u32,
     events: &[ralph_core::ParsedAgentEvent],
-) -> Result<()> {
-    for event in events {
-        validate_agent_event(
-            &event.event,
-            &event.body,
-            context.prompt_path.as_deref(),
-        )?;
-        append_agent_event(
-            &context.run_dir,
-            &AgentEventRecord {
-                v: 1,
-                ts_unix_ms: current_unix_timestamp_ms(),
-                run_id: context.run_id.clone(),
-                event: event.event.clone(),
-                body: event.body.clone(),
-                project_dir: context.project_dir.clone(),
-                run_dir: context.run_dir.clone(),
-                prompt_path: context.prompt_path.clone().unwrap_or_default(),
-                prompt_name: context.prompt_name.clone(),
-                pid: child_pid,
-            },
-        )?;
+) {
+    if events.is_empty() {
+        return;
     }
-    Ok(())
+    if let Some(tx) = stream {
+        let _ = tx.send(RunnerStreamEvent::ParsedEvents {
+            child_pid,
+            events: events.to_vec(),
+        });
+    }
 }
-
 fn enqueue_event_notices(
     notice_state: &mut EventNoticeState,
     events: &[ralph_core::ParsedAgentEvent],
@@ -563,25 +567,44 @@ fn drain_pending_notices(notice_state: &mut EventNoticeState) -> String {
     drained
 }
 
-fn render_event_notice(event: &ralph_core::ParsedAgentEvent) -> String {
+pub fn format_event_notice(
+    channel_id: Option<&str>,
+    event: &ralph_core::ParsedAgentEvent,
+) -> String {
     const ANSI_BOLD_RED: &str = "\x1b[1;31m";
     const ANSI_RESET: &str = "\x1b[0m";
 
-    let mut message = format!("◆ event emitted: {}", event.event);
+    let mut message = "◆ event emitted".to_owned();
+    if let Some(channel_id) = channel_id {
+        message.push(' ');
+        message.push('[');
+        message.push_str(channel_id);
+        message.push(']');
+    }
+    message.push_str(": ");
+    message.push_str(&event.event);
     if !event.body.is_empty() {
-        let escaped_body = event.body.replace('\n', "\\n");
-        message.push_str(" | ");
-        message.push_str(&escaped_body);
+        if event.body.contains('\n') {
+            message.push('\n');
+            message.push_str(
+                &event
+                    .body
+                    .lines()
+                    .map(|line| format!("  {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        } else {
+            message.push_str(" | ");
+            message.push_str(&event.body);
+        }
     }
 
     format!("{ANSI_BOLD_RED}{message}{ANSI_RESET}\n")
 }
 
-fn current_unix_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
+fn render_event_notice(event: &ralph_core::ParsedAgentEvent) -> String {
+    format_event_notice(None, event)
 }
 
 async fn read_stream<R>(mut reader: R, tx: UnboundedSender<RunnerStreamEvent>) -> Result<()>
@@ -830,6 +853,7 @@ mod tests {
     fn mode_template_uses_prompt_name_stem() {
         let context = TemplateContext::from_invocation(RunnerInvocation {
             run_id: "run-1".to_owned(),
+            channel_id: "main".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
             run_dir: "/tmp/project/.ralph/runs/fixture-flow/run-1".into(),
@@ -876,6 +900,7 @@ mod tests {
     fn env_templates_render_prompt_file_and_prompt() {
         let context = TemplateContext::from_invocation(RunnerInvocation {
             run_id: "run-1".to_owned(),
+            channel_id: "main".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
             run_dir: "/tmp/project/.ralph/runs/fixture-flow/run-1".into(),
@@ -890,6 +915,7 @@ mod tests {
     fn rendered_envs_include_current_binary_path() {
         let context = TemplateContext::from_invocation(RunnerInvocation {
             run_id: "run-1".to_owned(),
+            channel_id: "main".to_owned(),
             prompt_text: "hello".to_owned(),
             project_dir: "/tmp/project".into(),
             run_dir: "/tmp/project/.ralph/runs/fixture-flow/run-1".into(),
@@ -916,6 +942,10 @@ mod tests {
         assert!(envs.iter().any(|(key, value)| {
             key == "RALPH_RUN_DIR" && value == "/tmp/project/.ralph/runs/fixture-flow/run-1"
         }));
+        assert!(
+            envs.iter()
+                .any(|(key, value)| { key == "RALPH_CHANNEL_ID" && value == "main" })
+        );
         assert!(envs.iter().any(|(key, value)| {
             key == "RALPH_WAL_PATH"
                 && value
@@ -950,9 +980,12 @@ mod tests {
             last_visible_ended_with_newline: false,
         };
 
-        let rendered = super::decorate_visible_output(&mut state, "before\nafter".to_owned(), false);
+        let rendered =
+            super::decorate_visible_output(&mut state, "before\nafter".to_owned(), false);
 
-        assert!(rendered.starts_with("before\n\x1b[1;31m◆ event emitted: loop-stop:ok | done\x1b[0m\n"));
+        assert!(
+            rendered.starts_with("before\n\x1b[1;31m◆ event emitted: loop-stop:ok | done\x1b[0m\n")
+        );
         assert!(rendered.ends_with("after"));
         assert!(state.pending.is_empty());
     }
@@ -971,7 +1004,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "tail\n\x1b[1;31m◆ event emitted: handoff | alpha\\nbeta\x1b[0m\n"
+            "tail\n\x1b[1;31m◆ event emitted: handoff\n  alpha\n  beta\x1b[0m\n"
         );
         assert!(state.pending.is_empty());
     }
