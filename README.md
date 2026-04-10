@@ -294,6 +294,7 @@ That is why the workflow-specific help output looks slightly different from the 
 - `.ralph/config.toml`: project-level config
 - `.ralph/runs/<workflow-id>/<run-id>/request.txt`: saved request text for a run
 - `.ralph/runs/<workflow-id>/<run-id>/.ralph-runtime/agent-events.wal.ndjson`: loop-control event log
+- `.ralph/runs/<workflow-id>/<run-id>/.ralph-runtime/channels/<channel-id>/output.log`: suppressed text output for a parallel worker channel
 
 Files Ralph commonly reads or updates as part of the workflow itself:
 
@@ -308,7 +309,8 @@ Ralph can read events directly from the text output emitted by a non-interactive
 
 - Emit an event with no body by printing `<<<SIGNAL:event-name>>>`
 - Emit an event with a body by printing `<<<PAYLOAD:event-name>>>body<<<END-PAYLOAD>>>`
-- Read the latest stored payload for an event inside a Ralph agent run with `"$RALPH_BIN" get <event-name>`
+- Read the latest stored payload for an event across all channels in the current run with `"$RALPH_BIN" get <event-name>`
+- Read the latest stored payload for an event from one specific channel with `"$RALPH_BIN" get --channel <channel-id> <event-name>`
 
 Built-in workflows use this mechanism for loop control, for example:
 
@@ -318,6 +320,38 @@ Built-in workflows use this mechanism for loop control, for example:
 - `loop-stop:error` with an optional failure reason in the payload body
 
 See the built-in workflow definitions with `ralph show <workflow-id>` if you want to study how loop control works in practice.
+
+## Parallel Prompts
+
+Workflows can fan out non-interactive workers in parallel and then continue on a serial route:
+
+```yml
+prompts:
+  reviews:
+    title: Reviews
+    is_interactive: false
+    fallback-route: fixer
+    parallel:
+      workers:
+        QT:
+          title: quality tester
+          prompt: |
+            ...
+        OE:
+          title: over-engineering detector
+          prompt: |
+            ...
+  fixer:
+    title: Fixer
+    is_interactive: false
+    fallback-route: no-route-error
+    prompt: |
+      qt=$("$RALPH_BIN" get --channel QT review)
+      oe=$("$RALPH_BIN" get --channel OE review)
+      ...
+```
+
+Parallel workers emit events on their own channel automatically. Their text output is suppressed in the CLI and TUI, but saved under `.ralph-runtime/channels/<channel-id>/output.log`.
 
 ## A Good Daily Flow
 
