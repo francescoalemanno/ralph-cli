@@ -138,7 +138,8 @@ prompts:
 
       ## Development Approach
       - Complete each task fully before moving to the next
-      - Every task that changes code must include tests
+      - **CRITICAL: every task that changes code MUST include new/updated tests**
+      - **CRITICAL: all tests must pass before starting the next task**
       - Validation must pass before the next task starts
 
       ## Implementation Steps
@@ -169,10 +170,26 @@ prompts:
       ## Validation Before Drafting
 
       Before emitting `planning-draft`, verify:
-      - tasks are right-sized and executable
-      - all important requirements from the request are covered
-      - each code-changing task includes tests
-      - there is no speculative future-proofing or unnecessary abstraction
+
+      **Scope & Feasibility:**
+      - tasks are right-sized and executable (aim for 3-7 items; adjust if needed for coherence)
+      - each task focuses on one component or closely related files
+      - task dependencies are linear (no circular deps)
+      - external dependencies are minimized and clearly noted
+
+      **Completeness:**
+      - all requirements from the request are covered
+      - each task specifies file paths where known
+      - each task that modifies code includes test items
+      - task section checkboxes are automatable by the agent (no manual testing, deployment, or external verification items as `- [ ]` inside Task sections)
+
+      **Simplicity (YAGNI):**
+      - no unnecessary abstractions
+      - no "future-proofing" features not in the original request
+      - no backwards compatibility or fallbacks unless explicitly requested
+      - new files only for genuinely new components, not minor additions
+      - no over-engineered patterns when simpler solutions work
+
       - the path in `planning-target-path` stays under `{ralph-option:plans-dir}`
 
       If validation fails, fix the plan before emitting the draft.
