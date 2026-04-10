@@ -11,6 +11,7 @@ use crate::workflow::load_workflow_from_path;
 
 pub const RUNTIME_DIR_NAME: &str = ".ralph-runtime";
 pub const AGENT_EVENTS_WAL_FILE_NAME: &str = "agent-events.wal.ndjson";
+pub const MAIN_CHANNEL_ID: &str = "main";
 const MARKER_START: &str = "<<<";
 const SIGNAL_START: &str = "<<<SIGNAL:";
 const PAYLOAD_START: &str = "<<<PAYLOAD:";
@@ -22,6 +23,8 @@ pub struct AgentEventRecord {
     pub v: u8,
     pub ts_unix_ms: u64,
     pub run_id: String,
+    #[serde(default = "default_channel_id")]
+    pub channel_id: String,
     pub event: String,
     pub body: String,
     pub project_dir: Utf8PathBuf,
@@ -60,6 +63,10 @@ pub enum LoopControlDecision {
     StopOk(String),
     StopError(String),
     Route(String),
+}
+
+fn default_channel_id() -> String {
+    MAIN_CHANNEL_ID.to_owned()
 }
 
 pub fn agent_events_wal_path(run_dir: &Utf8Path) -> Utf8PathBuf {
@@ -107,6 +114,9 @@ pub fn reduce_loop_control(
 ) -> Option<LoopControlDecision> {
     let mut decision = None;
     for record in records {
+        if record.channel_id != MAIN_CHANNEL_ID {
+            continue;
+        }
         let next = match record.event.as_str() {
             "loop-continue" => Some(LoopControlDecision::Continue),
             "loop-stop:ok" => Some(LoopControlDecision::StopOk(record.body.clone())),
@@ -171,20 +181,30 @@ pub fn read_agent_events_since_path(wal_path: &Utf8Path, offset: u64) -> Result<
     })
 }
 
-pub fn latest_agent_event_body_from_wal(wal_path: &Utf8Path, event: &str) -> Result<Option<String>> {
+pub fn latest_agent_event_body_from_wal(
+    wal_path: &Utf8Path,
+    event: &str,
+) -> Result<Option<String>> {
+    latest_agent_event_body_from_wal_in_channel(wal_path, event, None)
+}
+
+pub fn latest_agent_event_body_from_wal_in_channel(
+    wal_path: &Utf8Path,
+    event: &str,
+    channel_id: Option<&str>,
+) -> Result<Option<String>> {
     let records = read_agent_events_since_path(wal_path, 0)?.records;
     Ok(records
         .into_iter()
         .rev()
-        .find(|record| record.event == event)
+        .find(|record| {
+            record.event == event
+                && channel_id.is_none_or(|channel_id| record.channel_id == channel_id)
+        })
         .map(|record| record.body))
 }
 
-pub fn validate_agent_event(
-    event: &str,
-    body: &str,
-    prompt_path: Option<&Utf8Path>,
-) -> Result<()> {
+pub fn validate_agent_event(event: &str, body: &str, prompt_path: Option<&Utf8Path>) -> Result<()> {
     let trimmed_event = event.trim();
     if trimmed_event.is_empty() {
         return Err(anyhow!("event name cannot be empty"));
@@ -223,7 +243,9 @@ impl AgentOutputProcessor {
                 let flush_len = if eof {
                     remaining.len()
                 } else {
-                    remaining.len().saturating_sub(partial_marker_prefix_len(remaining))
+                    remaining
+                        .len()
+                        .saturating_sub(partial_marker_prefix_len(remaining))
                 };
                 visible_text.push_str(&remaining[..flush_len]);
                 cursor += flush_len;
@@ -274,8 +296,7 @@ impl AgentOutputProcessor {
                 break;
             }
 
-            if !eof
-                && (SIGNAL_START.starts_with(remaining) || PAYLOAD_START.starts_with(remaining))
+            if !eof && (SIGNAL_START.starts_with(remaining) || PAYLOAD_START.starts_with(remaining))
             {
                 break;
             }
@@ -306,9 +327,11 @@ fn validate_loop_route_body(body: &str, prompt_path: Option<&Utf8Path>) -> Resul
 }
 
 fn available_routes(prompt_path: Option<&Utf8Path>) -> Result<Vec<String>> {
-    let prompt_path = prompt_path.filter(|path| !path.as_str().is_empty()).ok_or_else(|| {
-        anyhow!("missing RALPH_PROMPT_PATH; `loop-route` requires workflow source context")
-    })?;
+    let prompt_path = prompt_path
+        .filter(|path| !path.as_str().is_empty())
+        .ok_or_else(|| {
+            anyhow!("missing RALPH_PROMPT_PATH; `loop-route` requires workflow source context")
+        })?;
     let workflow = load_workflow_from_path(prompt_path)?;
     Ok(workflow
         .prompt_ids()
@@ -350,8 +373,9 @@ mod tests {
 
     use super::{
         AGENT_EVENTS_WAL_FILE_NAME, AgentEventRecord, AgentOutputProcessor, LoopControlDecision,
-        RUNTIME_DIR_NAME, agent_events_wal_path, append_agent_event, current_agent_events_offset,
-        latest_agent_event_body_from_wal, read_agent_events_since, reduce_loop_control,
+        MAIN_CHANNEL_ID, RUNTIME_DIR_NAME, agent_events_wal_path, append_agent_event,
+        current_agent_events_offset, latest_agent_event_body_from_wal,
+        latest_agent_event_body_from_wal_in_channel, read_agent_events_since, reduce_loop_control,
         validate_agent_event,
     };
 
@@ -360,6 +384,7 @@ mod tests {
             v: 1,
             ts_unix_ms: 42,
             run_id: run_id.to_owned(),
+            channel_id: MAIN_CHANNEL_ID.to_owned(),
             event: event.to_owned(),
             body: body.to_owned(),
             project_dir: Utf8PathBuf::from("/tmp/project"),
@@ -473,16 +498,39 @@ mod tests {
         append_agent_event(&run_dir, &sample_record("phase", "first", "run-1")).unwrap();
         append_agent_event(&run_dir, &sample_record("phase", "second", "run-1")).unwrap();
 
-        let latest = latest_agent_event_body_from_wal(&agent_events_wal_path(&run_dir), "phase")
-            .unwrap();
+        let latest =
+            latest_agent_event_body_from_wal(&agent_events_wal_path(&run_dir), "phase").unwrap();
         assert_eq!(latest.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn latest_event_can_filter_by_channel() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let mut first = sample_record("review", "qt", "run-1");
+        first.channel_id = "QT".to_owned();
+        append_agent_event(&run_dir, &first).unwrap();
+        let mut second = sample_record("review", "oe", "run-1");
+        second.channel_id = "OE".to_owned();
+        append_agent_event(&run_dir, &second).unwrap();
+
+        let global =
+            latest_agent_event_body_from_wal(&agent_events_wal_path(&run_dir), "review").unwrap();
+        let qt = latest_agent_event_body_from_wal_in_channel(
+            &agent_events_wal_path(&run_dir),
+            "review",
+            Some("QT"),
+        )
+        .unwrap();
+
+        assert_eq!(global.as_deref(), Some("oe"));
+        assert_eq!(qt.as_deref(), Some("qt"));
     }
 
     #[test]
     fn validates_route_events_against_workflow_prompt_ids() {
         let temp = tempfile::tempdir().unwrap();
-        let workflow_path =
-            Utf8PathBuf::from_path_buf(temp.path().join("route-test.yml")).unwrap();
+        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("route-test.yml")).unwrap();
         std::fs::write(
             workflow_path.as_std_path(),
             r#"
