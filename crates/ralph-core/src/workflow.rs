@@ -570,11 +570,10 @@ mod tests {
         list_all_workflows, list_workflows, load_workflow, load_workflow_from_path,
         seed_builtin_workflows_if_missing, workflow_config_dir,
     };
-    use crate::config::{configure_test_global_config_home, global_config_test_lock};
+    use crate::config::configure_test_global_config_home;
 
     fn with_test_workflow_home(test: impl FnOnce(Utf8PathBuf)) {
-        let _guard = global_config_test_lock();
-        let home = configure_test_global_config_home();
+        let (home, _guard) = configure_test_global_config_home();
         let workflow_dir = home.join("workflows");
         if workflow_dir.exists() {
             fs::remove_dir_all(&workflow_dir).unwrap();

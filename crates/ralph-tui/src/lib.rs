@@ -1874,27 +1874,39 @@ mod tests {
     use camino::Utf8PathBuf;
     use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
     use ralph_app::RalphApp;
-    use ralph_core::RunControl;
+    use ralph_core::{
+        RunControl, ScopedGlobalConfigDirOverride, scoped_global_config_dir_override,
+    };
     use ratatui::layout::Rect;
 
-    fn configure_test_config_home() -> Utf8PathBuf {
+    struct TestProjectDir {
+        _config_home: ScopedGlobalConfigDirOverride,
+        temp: tempfile::TempDir,
+    }
+
+    impl TestProjectDir {
+        fn path(&self) -> &std::path::Path {
+            self.temp.path()
+        }
+    }
+
+    fn configure_test_config_home() -> ScopedGlobalConfigDirOverride {
         let path = Utf8PathBuf::from_path_buf(
             std::env::temp_dir().join(format!("ralph-tui-test-config-{}", std::process::id())),
         )
         .unwrap();
         fs::create_dir_all(&path).unwrap();
-        unsafe {
-            std::env::set_var("RALPH_CONFIG_HOME", path.as_str());
+        scoped_global_config_dir_override(path)
+    }
+
+    fn temp_project_dir() -> TestProjectDir {
+        TestProjectDir {
+            _config_home: configure_test_config_home(),
+            temp: tempfile::tempdir().unwrap(),
         }
-        path
     }
 
-    fn temp_project_dir() -> tempfile::TempDir {
-        configure_test_config_home();
-        tempfile::tempdir().unwrap()
-    }
-
-    fn new_test_tui() -> TuiApp {
+    fn new_test_tui() -> (TuiApp, TestProjectDir) {
         let temp = temp_project_dir();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1913,8 +1925,7 @@ mod tests {
             },
         )
         .unwrap();
-        std::mem::forget(temp);
-        tui
+        (tui, temp)
     }
 
     fn output_for_scroll(running: &mut RunningState) -> String {
@@ -2117,7 +2128,7 @@ prompt_env_var = "PROMPT"
 
     #[test]
     fn running_scroll_changes_visible_output() {
-        let mut tui = new_test_tui();
+        let (mut tui, _temp) = new_test_tui();
         let mut running = RunningState::new(RunControl::new());
         running.ensure_terminal_size(4, 24);
         running.push_terminal_text("line 1\nline 2\nline 3\nline 4\nline 5\nline 6");
@@ -2150,7 +2161,7 @@ prompt_env_var = "PROMPT"
 
     #[test]
     fn mouse_wheel_scrolls_runner_output_panel() {
-        let mut tui = new_test_tui();
+        let (mut tui, _temp) = new_test_tui();
         let mut running = RunningState::new(RunControl::new());
         running.ensure_terminal_size(4, 24);
         running.push_terminal_text("line 1\nline 2\nline 3\nline 4\nline 5\nline 6");

@@ -1449,15 +1449,18 @@ mod tests {
     use std::{
         collections::BTreeMap,
         fs,
-        sync::{Arc, Mutex, OnceLock},
+        sync::{Arc, Mutex},
     };
 
     use anyhow::Result;
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
-    use ralph_core::{AppConfig, RunControl, RunnerInvocation, RunnerResult};
+    use ralph_core::{
+        AppConfig, RunControl, RunnerInvocation, RunnerResult, ScopedGlobalConfigDirOverride,
+        scoped_global_config_dir_override,
+    };
     use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
-    use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, mpsc::UnboundedSender};
+    use tokio::sync::mpsc::UnboundedSender;
 
     use crate::workflow_run::{
         HOST_CHANNEL_ID, PLANNING_ANSWER_EVENT, PLANNING_DRAFT_EVENT, PLANNING_PLAN_FILE_EVENT,
@@ -1469,34 +1472,18 @@ mod tests {
         WorkflowRunInput,
     };
 
-    const RALPH_CONFIG_HOME_ENV: &str = "RALPH_CONFIG_HOME";
     type WorkflowEvent = (String, String);
     type WorkflowEventBatch = Vec<WorkflowEvent>;
     type WorkflowEventQueue = Vec<WorkflowEventBatch>;
 
-    fn env_lock() -> &'static AsyncMutex<()> {
-        static ENV_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| AsyncMutex::new(()))
-    }
-
     struct ScopedConfigHome {
-        _guard: AsyncMutexGuard<'static, ()>,
+        _guard: ScopedGlobalConfigDirOverride,
     }
 
     impl ScopedConfigHome {
-        async fn new(config_home: &std::path::Path) -> Self {
-            let guard = env_lock().lock().await;
-            unsafe {
-                std::env::set_var(RALPH_CONFIG_HOME_ENV, config_home);
-            }
-            Self { _guard: guard }
-        }
-    }
-
-    impl Drop for ScopedConfigHome {
-        fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var(RALPH_CONFIG_HOME_ENV);
+        fn new(config_home: Utf8PathBuf) -> Self {
+            Self {
+                _guard: scoped_global_config_dir_override(config_home),
             }
         }
     }
@@ -1601,9 +1588,9 @@ mod tests {
     async fn run_workflow_routes_between_prompts_and_uses_project_dir() -> Result<()> {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let config_home = temp.path().join("config-home");
+        let config_home = Utf8PathBuf::from_path_buf(temp.path().join("config-home")).unwrap();
         fs::create_dir_all(config_home.join("workflows")).unwrap();
-        let _config_home = ScopedConfigHome::new(&config_home).await;
+        let _config_home = ScopedConfigHome::new(config_home.clone());
         fs::write(
             config_home.join("workflows/route-test.yml"),
             r#"
@@ -1673,9 +1660,9 @@ prompts:
     async fn parallel_prompt_records_channel_scoped_events_and_routes_to_fixer() -> Result<()> {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let config_home = temp.path().join("config-home");
+        let config_home = Utf8PathBuf::from_path_buf(temp.path().join("config-home")).unwrap();
         fs::create_dir_all(config_home.join("workflows")).unwrap();
-        let _config_home = ScopedConfigHome::new(&config_home).await;
+        let _config_home = ScopedConfigHome::new(config_home.clone());
         fs::write(
             config_home.join("workflows/parallel-review.yml"),
             r#"
@@ -1793,9 +1780,9 @@ prompts:
     async fn run_workflow_interpolates_declared_option_values() -> Result<()> {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let config_home = temp.path().join("config-home");
+        let config_home = Utf8PathBuf::from_path_buf(temp.path().join("config-home")).unwrap();
         fs::create_dir_all(config_home.join("workflows")).unwrap();
-        let _config_home = ScopedConfigHome::new(&config_home).await;
+        let _config_home = ScopedConfigHome::new(config_home.clone());
         fs::write(
             config_home.join("workflows/option-flow.yml"),
             r#"
@@ -1852,9 +1839,9 @@ prompts:
     async fn planning_question_is_answered_by_host_and_progress_is_persisted() -> Result<()> {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let config_home = temp.path().join("config-home");
+        let config_home = Utf8PathBuf::from_path_buf(temp.path().join("config-home")).unwrap();
         fs::create_dir_all(config_home.join("workflows")).unwrap();
-        let _config_home = ScopedConfigHome::new(&config_home).await;
+        let _config_home = ScopedConfigHome::new(config_home.clone());
         fs::write(
             config_home.join("workflows/plan-fixture.yml"),
             r#"
@@ -1937,9 +1924,9 @@ prompts:
     async fn accepted_planning_draft_is_written_by_host_verbatim() -> Result<()> {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let config_home = temp.path().join("config-home");
+        let config_home = Utf8PathBuf::from_path_buf(temp.path().join("config-home")).unwrap();
         fs::create_dir_all(config_home.join("workflows")).unwrap();
-        let _config_home = ScopedConfigHome::new(&config_home).await;
+        let _config_home = ScopedConfigHome::new(config_home.clone());
         fs::write(
             config_home.join("workflows/plan-fixture.yml"),
             r#"

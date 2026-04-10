@@ -15,7 +15,10 @@ pub use agent_events::{
     validate_agent_event,
 };
 pub use atomic::atomic_write;
-pub use config::{ARTIFACT_DIR_NAME, AppConfig, ConfigFileScope, ThemeConfig, global_config_dir};
+pub use config::{
+    ARTIFACT_DIR_NAME, AppConfig, ConfigFileScope, ScopedGlobalConfigDirOverride, ThemeConfig,
+    global_config_dir, scoped_global_config_dir_override,
+};
 pub use types::{LastRunStatus, RunControl, RunnerInvocation, RunnerResult, WorkflowRunSummary};
 pub use workflow::{
     NO_ROUTE_ERROR, NO_ROUTE_OK, WorkflowDefinition, WorkflowFileRequest, WorkflowOptionDefinition,

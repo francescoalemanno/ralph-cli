@@ -268,6 +268,16 @@ impl AgentOutputProcessor {
                 }
 
                 if eof {
+                    let partial_name = signal_body.trim();
+                    if !partial_name.is_empty() {
+                        events.push(ParsedAgentEvent {
+                            event: "truncated-signal".to_owned(),
+                            body: format!(
+                                "incomplete signal marker at end of stream: {}",
+                                partial_name
+                            ),
+                        });
+                    }
                     visible_text.push_str(remaining);
                     cursor = buffer.len();
                 }
@@ -286,6 +296,24 @@ impl AgentOutputProcessor {
                         });
                         cursor += body_start + body_end + PAYLOAD_END.len();
                         continue;
+                    }
+
+                    if eof {
+                        let partial_body = &remaining[body_start..];
+                        events.push(ParsedAgentEvent {
+                            event: name.trim().to_owned(),
+                            body: partial_body.to_owned(),
+                        });
+                        events.push(ParsedAgentEvent {
+                            event: "truncated-payload".to_owned(),
+                            body: format!(
+                                "payload '{}' was truncated at end of stream ({} bytes captured)",
+                                name.trim(),
+                                partial_body.len()
+                            ),
+                        });
+                        cursor = buffer.len();
+                        break;
                     }
                 }
 
@@ -481,14 +509,32 @@ mod tests {
     }
 
     #[test]
-    fn processor_flushes_incomplete_marker_as_text_on_finish() {
+    fn processor_flushes_incomplete_signal_with_truncation_warning_on_finish() {
         let mut processor = AgentOutputProcessor::default();
         let parsed = processor.push_str("hello<<<SIGNAL:loop-stop:ok");
         assert_eq!(parsed.visible_text, "hello");
 
         let finished = processor.finish();
         assert_eq!(finished.visible_text, "<<<SIGNAL:loop-stop:ok");
-        assert!(finished.events.is_empty());
+        assert_eq!(finished.events.len(), 1);
+        assert_eq!(finished.events[0].event, "truncated-signal");
+        assert!(finished.events[0].body.contains("loop-stop:ok"));
+    }
+
+    #[test]
+    fn processor_emits_partial_payload_with_truncation_warning_on_finish() {
+        let mut processor = AgentOutputProcessor::default();
+        let parsed = processor.push_str("before<<<PAYLOAD:test-phase>>>partial body content here");
+        assert_eq!(parsed.visible_text, "before");
+        assert!(parsed.events.is_empty());
+
+        let finished = processor.finish();
+        assert_eq!(finished.events.len(), 2);
+        assert_eq!(finished.events[0].event, "test-phase");
+        assert_eq!(finished.events[0].body, "partial body content here");
+        assert_eq!(finished.events[1].event, "truncated-payload");
+        assert!(finished.events[1].body.contains("test-phase"));
+        assert!(finished.events[1].body.contains("truncated"));
     }
 
     #[test]

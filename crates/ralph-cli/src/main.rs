@@ -269,6 +269,11 @@ fn required_env(key: &str) -> Result<String> {
 }
 
 fn env_utf8_path(key: &str) -> Result<Utf8PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = test_support::env_path_override(key) {
+        return Ok(path);
+    }
+
     Ok(Utf8PathBuf::from(required_env(key)?))
 }
 
@@ -392,24 +397,61 @@ fn init_tracing() {
 pub(crate) mod test_support {
     use std::{
         fs,
-        sync::{Mutex, OnceLock},
+        sync::{Mutex, OnceLock, RwLock},
     };
 
     use camino::Utf8PathBuf;
+    use ralph_core::ScopedGlobalConfigDirOverride;
 
-    const RALPH_CONFIG_HOME_ENV: &str = "RALPH_CONFIG_HOME";
+    fn wal_path_override() -> &'static RwLock<Option<Utf8PathBuf>> {
+        static WAL_PATH_OVERRIDE: OnceLock<RwLock<Option<Utf8PathBuf>>> = OnceLock::new();
+        WAL_PATH_OVERRIDE.get_or_init(|| RwLock::new(None))
+    }
 
-    fn env_lock() -> &'static Mutex<()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    fn wal_path_override_lock() -> &'static Mutex<()> {
+        static WAL_PATH_OVERRIDE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        WAL_PATH_OVERRIDE_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    pub(crate) fn env_path_override(key: &str) -> Option<Utf8PathBuf> {
+        match key {
+            "RALPH_WAL_PATH" => wal_path_override()
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            _ => None,
+        }
+    }
+
+    pub(crate) struct ScopedWalPathOverride {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedWalPathOverride {
+        pub(crate) fn new(path: Utf8PathBuf) -> Self {
+            let guard = wal_path_override_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *wal_path_override()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for ScopedWalPathOverride {
+        fn drop(&mut self) {
+            *wal_path_override()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
     }
 
     pub(crate) fn with_test_workflow_home(test: impl FnOnce()) {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let config_home = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let _config_home: ScopedGlobalConfigDirOverride =
+            ralph_core::scoped_global_config_dir_override(config_home.clone());
         fs::create_dir_all(config_home.join("workflows").as_std_path()).unwrap();
         fs::write(
             config_home.join("workflows/fixture-flow.yml").as_std_path(),
@@ -435,13 +477,7 @@ prompts:
 "#,
         )
         .unwrap();
-        unsafe {
-            std::env::set_var(RALPH_CONFIG_HOME_ENV, config_home.as_str());
-        }
         test();
-        unsafe {
-            std::env::remove_var(RALPH_CONFIG_HOME_ENV);
-        }
     }
 }
 
@@ -449,7 +485,7 @@ prompts:
 mod tests {
     use super::*;
     use crate::cli::{RunArgs, RuntimeArgs};
-    use crate::test_support::with_test_workflow_home;
+    use crate::test_support::{ScopedWalPathOverride, with_test_workflow_home};
     use std::fs;
 
     #[test]
@@ -492,21 +528,13 @@ mod tests {
         )
         .unwrap();
 
-        unsafe {
-            std::env::set_var(
-                "RALPH_WAL_PATH",
-                ralph_core::agent_events_wal_path(&run_dir).as_str(),
-            );
-        }
+        let _wal_path = ScopedWalPathOverride::new(ralph_core::agent_events_wal_path(&run_dir));
         let result = latest_agent_event_body_from_wal_in_channel(
             &ralph_core::agent_events_wal_path(&run_dir),
             "handoff",
             None,
         )
         .unwrap();
-        unsafe {
-            std::env::remove_var("RALPH_WAL_PATH");
-        }
 
         assert_eq!(result.as_deref(), Some("second"));
     }

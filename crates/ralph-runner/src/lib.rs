@@ -121,8 +121,9 @@ impl RunnerAdapter for CommandRunner {
         }
 
         let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel();
-        let stdout_task = tokio::spawn(read_stream(stdout, chunk_tx.clone()));
-        let stderr_task = tokio::spawn(read_stream(stderr, chunk_tx));
+        let stdout_task =
+            AbortOnDropHandle::new(tokio::spawn(read_stream(stdout, chunk_tx.clone())));
+        let stderr_task = AbortOnDropHandle::new(tokio::spawn(read_stream(stderr, chunk_tx)));
 
         let mut output_buffer = String::new();
         let mut processor = AgentOutputProcessor::default();
@@ -134,8 +135,8 @@ impl RunnerAdapter for CommandRunner {
         let exit_code = loop {
             if control.is_cancelled() {
                 let _ = child.start_kill();
-                stdout_task.abort();
-                stderr_task.abort();
+                drop(stdout_task);
+                drop(stderr_task);
                 let _ = timeout(Duration::from_millis(250), child.wait()).await;
                 return Err(anyhow!("runner canceled"));
             }
@@ -184,8 +185,8 @@ impl RunnerAdapter for CommandRunner {
                             &stream,
                         ) {
                             let _ = child.start_kill();
-                            stdout_task.abort();
-                            stderr_task.abort();
+                            drop(stdout_task);
+                            drop(stderr_task);
                             let _ = timeout(Duration::from_millis(250), child.wait()).await;
                             return Err(error);
                         }
@@ -213,10 +214,7 @@ impl RunnerAdapter for CommandRunner {
     }
 }
 
-fn build_async_command(
-    config: &RunnerConfig,
-    context: &TemplateContext,
-) -> Result<AsyncCommand> {
+fn build_async_command(config: &RunnerConfig, context: &TemplateContext) -> Result<AsyncCommand> {
     let command = match config.mode {
         CommandMode::Exec => {
             let (program, args) = rendered_exec_parts(config, context)?;
@@ -286,10 +284,31 @@ fn rendered_envs(config: &RunnerConfig, context: &TemplateContext) -> Vec<(Strin
     envs
 }
 
-async fn await_stream_task(task: JoinHandle<Result<()>>, name: &str) -> Result<()> {
-    match task.await {
+async fn await_stream_task(task: AbortOnDropHandle<Result<()>>, name: &str) -> Result<()> {
+    let handle = task.into_inner();
+    match handle.await {
         Ok(result) => result.with_context(|| format!("runner {name} stream failed")),
         Err(error) => Err(anyhow!("runner {name} stream task failed: {error}")),
+    }
+}
+
+struct AbortOnDropHandle<T>(Option<JoinHandle<T>>);
+
+impl<T> AbortOnDropHandle<T> {
+    fn new(handle: JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
+    fn into_inner(mut self) -> JoinHandle<T> {
+        self.0.take().expect("handle already consumed")
+    }
+}
+
+impl<T> Drop for AbortOnDropHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
     }
 }
 
@@ -463,18 +482,44 @@ where
     R: AsyncRead + Unpin,
 {
     let mut buffer = [0_u8; 4096];
+    let mut leftover = Vec::new();
     loop {
         let bytes_read = reader
             .read(&mut buffer)
             .await
             .context("failed while reading runner output")?;
         if bytes_read == 0 {
+            if !leftover.is_empty() {
+                let chunk = String::from_utf8_lossy(&leftover).into_owned();
+                let _ = tx.send(RunnerStreamEvent::Output(chunk));
+            }
             break;
         }
-        let chunk = String::from_utf8_lossy(&buffer[..bytes_read]).into_owned();
-        if tx.send(RunnerStreamEvent::Output(chunk)).is_err() {
-            break;
+        let data = if leftover.is_empty() {
+            &buffer[..bytes_read]
+        } else {
+            leftover.extend_from_slice(&buffer[..bytes_read]);
+            leftover.as_slice()
+        };
+        let valid_up_to = match std::str::from_utf8(data) {
+            Ok(_) => data.len(),
+            Err(e) => {
+                let valid = e.valid_up_to();
+                if e.error_len().is_some() {
+                    valid + e.error_len().unwrap()
+                } else {
+                    valid
+                }
+            }
+        };
+        if valid_up_to > 0 {
+            let chunk = String::from_utf8_lossy(&data[..valid_up_to]).into_owned();
+            if tx.send(RunnerStreamEvent::Output(chunk)).is_err() {
+                break;
+            }
         }
+        let remainder = data[valid_up_to..].to_vec();
+        leftover = remainder;
     }
     Ok(())
 }

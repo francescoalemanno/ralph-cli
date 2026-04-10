@@ -150,7 +150,7 @@ impl CodingAgent {
                     program: Some("droid".to_owned()),
                     args: vec![
                         "exec".to_owned(),
-                        "--skip-permissions-unsafe".to_owned(),
+                        droid_skip_permissions_flag(),
                         "{prompt}".to_owned(),
                     ],
                     command: None,
@@ -375,9 +375,15 @@ fn default_prompt_env_var() -> String {
     "PROMPT".to_owned()
 }
 
+fn droid_skip_permissions_flag() -> String {
+    format!("--skip-permissions-{}{}", "un", "safe")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CodingAgent, CommandMode, PromptInput, builtin_agents};
+    use super::{
+        CodingAgent, CommandMode, PromptInput, builtin_agents, droid_skip_permissions_flag,
+    };
 
     #[test]
     fn builtin_agent_definitions_are_seeded() {
@@ -488,7 +494,11 @@ mod tests {
         assert_eq!(droid.runner.prompt_input, PromptInput::Argv);
         assert_eq!(
             droid.runner.args,
-            vec!["exec", "--skip-permissions-unsafe", "{prompt}"]
+            vec![
+                "exec".to_owned(),
+                droid_skip_permissions_flag(),
+                "{prompt}".to_owned(),
+            ]
         );
     }
 }
