@@ -42,10 +42,6 @@ pub(crate) fn print_bare_file(path: &Utf8Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn print_emitted_event(event: &str) {
-    println!("event {event} emitted.");
-}
-
 pub(crate) fn print_workflow_run(summary: &WorkflowRunSummary) {
     println!(
         "{} [{}] prompt={} run_dir={}",

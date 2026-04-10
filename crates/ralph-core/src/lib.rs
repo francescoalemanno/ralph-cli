@@ -7,9 +7,11 @@ mod workflow;
 
 pub use agent::{AgentConfig, CodingAgent, CommandMode, PromptInput, RunnerConfig, builtin_agents};
 pub use agent_events::{
-    AGENT_EVENTS_WAL_FILE_NAME, AgentEventLogRead, AgentEventRecord, LoopControlDecision,
-    RUNTIME_DIR_NAME, agent_events_wal_path, append_agent_event, current_agent_events_offset,
-    read_agent_events_since, reduce_loop_control,
+    AGENT_EVENTS_WAL_FILE_NAME, AgentEventLogRead, AgentEventRecord, AgentOutputProcessor,
+    LoopControlDecision, ParsedAgentEvent, ParsedAgentOutput, RUNTIME_DIR_NAME,
+    agent_events_wal_path, append_agent_event, current_agent_events_offset,
+    latest_agent_event_body_from_wal, read_agent_events_since, read_agent_events_since_path,
+    reduce_loop_control, validate_agent_event,
 };
 pub use atomic::atomic_write;
 pub use config::{ARTIFACT_DIR_NAME, AppConfig, ConfigFileScope, ThemeConfig, global_config_dir};

@@ -1,13 +1,16 @@
 use std::{
     path::Path,
     process::{Child as StdChild, Command as StdCommand, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use ralph_core::{
-    CommandMode, PromptInput, RunControl, RunnerConfig, RunnerInvocation, RunnerResult,
+    AgentEventRecord, AgentOutputProcessor, CommandMode, PromptInput, RunControl, RunnerConfig,
+    RunnerInvocation, RunnerResult, agent_events_wal_path, append_agent_event,
+    validate_agent_event,
 };
 use tempfile::NamedTempFile;
 use tokio::{
@@ -22,6 +25,12 @@ use tracing::debug;
 #[derive(Debug, Clone)]
 pub enum RunnerStreamEvent {
     Output(String),
+}
+
+#[derive(Debug, Default)]
+struct EventNoticeState {
+    pending: Vec<String>,
+    last_visible_ended_with_newline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +136,7 @@ impl RunnerAdapter for CommandRunner {
         );
 
         let mut child = command.spawn().context("failed to spawn runner process")?;
+        let child_pid = child.id().unwrap_or_default();
         let stdout = child
             .stdout
             .take()
@@ -156,6 +166,11 @@ impl RunnerAdapter for CommandRunner {
         let stderr_task = tokio::spawn(read_stream(stderr, chunk_tx));
 
         let mut output_buffer = String::new();
+        let mut processor = AgentOutputProcessor::default();
+        let mut notice_state = EventNoticeState {
+            pending: Vec::new(),
+            last_visible_ended_with_newline: true,
+        };
         let exit_code = loop {
             if control.is_cancelled() {
                 let _ = child.start_kill();
@@ -168,10 +183,15 @@ impl RunnerAdapter for CommandRunner {
             if let Some(status) = child.try_wait().context("failed while polling runner")? {
                 while let Some(event) = chunk_rx.recv().await {
                     let RunnerStreamEvent::Output(chunk) = event;
-                    output_buffer.push_str(&chunk);
-                    if let Some(tx) = &stream {
-                        let _ = tx.send(RunnerStreamEvent::Output(chunk));
-                    }
+                    handle_runner_output_chunk(
+                        &mut processor,
+                        &mut notice_state,
+                        &context,
+                        child_pid,
+                        &chunk,
+                        &mut output_buffer,
+                        &stream,
+                    )?;
                 }
                 break status.code().unwrap_or(-1);
             }
@@ -180,15 +200,35 @@ impl RunnerAdapter for CommandRunner {
                 maybe = chunk_rx.recv() => {
                     if let Some(event) = maybe {
                         let RunnerStreamEvent::Output(chunk) = event;
-                        output_buffer.push_str(&chunk);
-                        if let Some(tx) = &stream {
-                            let _ = tx.send(RunnerStreamEvent::Output(chunk));
+                        if let Err(error) = handle_runner_output_chunk(
+                            &mut processor,
+                            &mut notice_state,
+                            &context,
+                            child_pid,
+                            &chunk,
+                            &mut output_buffer,
+                            &stream,
+                        ) {
+                            let _ = child.start_kill();
+                            stdout_task.abort();
+                            stderr_task.abort();
+                            let _ = timeout(Duration::from_millis(250), child.wait()).await;
+                            return Err(error);
                         }
                     }
                 }
                 _ = sleep(Duration::from_millis(40)) => {}
             }
         };
+
+        flush_runner_output_processor(
+            &mut processor,
+            &mut notice_state,
+            &context,
+            child_pid,
+            &mut output_buffer,
+            &stream,
+        )?;
 
         await_stream_task(stdout_task, "stdout").await?;
         await_stream_task(stderr_task, "stderr").await?;
@@ -354,6 +394,10 @@ fn rendered_envs(
     }
     envs.push(("RALPH_RUN_DIR".to_owned(), context.run_dir.to_string()));
     envs.push((
+        "RALPH_WAL_PATH".to_owned(),
+        agent_events_wal_path(&context.run_dir).to_string(),
+    ));
+    envs.push((
         "RALPH_PROMPT_PATH".to_owned(),
         resolved_prompt_path(context, prompt_file).to_owned(),
     ));
@@ -375,6 +419,169 @@ async fn await_stream_task(task: JoinHandle<Result<()>>, name: &str) -> Result<(
         Ok(result) => result.with_context(|| format!("runner {name} stream failed")),
         Err(error) => Err(anyhow!("runner {name} stream task failed: {error}")),
     }
+}
+
+fn handle_runner_output_chunk(
+    processor: &mut AgentOutputProcessor,
+    notice_state: &mut EventNoticeState,
+    context: &TemplateContext,
+    child_pid: u32,
+    chunk: &str,
+    output_buffer: &mut String,
+    stream: &Option<UnboundedSender<RunnerStreamEvent>>,
+) -> Result<()> {
+    let parsed = processor.push_str(chunk);
+    persist_parsed_events(context, child_pid, &parsed.events)?;
+    enqueue_event_notices(notice_state, &parsed.events);
+    forward_visible_output(
+        notice_state,
+        parsed.visible_text,
+        false,
+        output_buffer,
+        stream,
+    );
+    Ok(())
+}
+
+fn flush_runner_output_processor(
+    processor: &mut AgentOutputProcessor,
+    notice_state: &mut EventNoticeState,
+    context: &TemplateContext,
+    child_pid: u32,
+    output_buffer: &mut String,
+    stream: &Option<UnboundedSender<RunnerStreamEvent>>,
+) -> Result<()> {
+    let parsed = processor.finish();
+    persist_parsed_events(context, child_pid, &parsed.events)?;
+    enqueue_event_notices(notice_state, &parsed.events);
+    forward_visible_output(
+        notice_state,
+        parsed.visible_text,
+        true,
+        output_buffer,
+        stream,
+    );
+    Ok(())
+}
+
+fn persist_parsed_events(
+    context: &TemplateContext,
+    child_pid: u32,
+    events: &[ralph_core::ParsedAgentEvent],
+) -> Result<()> {
+    for event in events {
+        validate_agent_event(
+            &event.event,
+            &event.body,
+            context.prompt_path.as_deref(),
+        )?;
+        append_agent_event(
+            &context.run_dir,
+            &AgentEventRecord {
+                v: 1,
+                ts_unix_ms: current_unix_timestamp_ms(),
+                run_id: context.run_id.clone(),
+                event: event.event.clone(),
+                body: event.body.clone(),
+                project_dir: context.project_dir.clone(),
+                run_dir: context.run_dir.clone(),
+                prompt_path: context.prompt_path.clone().unwrap_or_default(),
+                prompt_name: context.prompt_name.clone(),
+                pid: child_pid,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn enqueue_event_notices(
+    notice_state: &mut EventNoticeState,
+    events: &[ralph_core::ParsedAgentEvent],
+) {
+    notice_state
+        .pending
+        .extend(events.iter().map(render_event_notice));
+}
+
+fn forward_visible_output(
+    notice_state: &mut EventNoticeState,
+    visible_text: String,
+    flush_pending: bool,
+    output_buffer: &mut String,
+    stream: &Option<UnboundedSender<RunnerStreamEvent>>,
+) {
+    let decorated = decorate_visible_output(notice_state, visible_text, flush_pending);
+    if decorated.is_empty() {
+        return;
+    }
+    notice_state.last_visible_ended_with_newline = decorated.ends_with('\n');
+    output_buffer.push_str(&decorated);
+    if let Some(tx) = stream {
+        let _ = tx.send(RunnerStreamEvent::Output(decorated));
+    }
+}
+
+fn decorate_visible_output(
+    notice_state: &mut EventNoticeState,
+    visible_text: String,
+    flush_pending: bool,
+) -> String {
+    let mut rendered = visible_text;
+    if notice_state.pending.is_empty() {
+        return rendered;
+    }
+
+    if notice_state.last_visible_ended_with_newline {
+        let notices = drain_pending_notices(notice_state);
+        rendered.insert_str(0, &notices);
+        return rendered;
+    }
+
+    if let Some(newline_index) = rendered.find('\n') {
+        let notices = drain_pending_notices(notice_state);
+        rendered.insert_str(newline_index + 1, &notices);
+        return rendered;
+    }
+
+    if flush_pending {
+        if !rendered.is_empty() && !rendered.ends_with('\n') {
+            rendered.push('\n');
+        } else if rendered.is_empty() && !notice_state.last_visible_ended_with_newline {
+            rendered.push('\n');
+        }
+        rendered.push_str(&drain_pending_notices(notice_state));
+    }
+
+    rendered
+}
+
+fn drain_pending_notices(notice_state: &mut EventNoticeState) -> String {
+    let mut drained = String::new();
+    for notice in notice_state.pending.drain(..) {
+        drained.push_str(&notice);
+    }
+    drained
+}
+
+fn render_event_notice(event: &ralph_core::ParsedAgentEvent) -> String {
+    const ANSI_BOLD_RED: &str = "\x1b[1;31m";
+    const ANSI_RESET: &str = "\x1b[0m";
+
+    let mut message = format!("◆ event emitted: {}", event.event);
+    if !event.body.is_empty() {
+        let escaped_body = event.body.replace('\n', "\\n");
+        message.push_str(" | ");
+        message.push_str(&escaped_body);
+    }
+
+    format!("{ANSI_BOLD_RED}{message}{ANSI_RESET}\n")
+}
+
+fn current_unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 async fn read_stream<R>(mut reader: R, tx: UnboundedSender<RunnerStreamEvent>) -> Result<()>
@@ -709,6 +916,64 @@ mod tests {
         assert!(envs.iter().any(|(key, value)| {
             key == "RALPH_RUN_DIR" && value == "/tmp/project/.ralph/runs/fixture-flow/run-1"
         }));
+        assert!(envs.iter().any(|(key, value)| {
+            key == "RALPH_WAL_PATH"
+                && value
+                    == "/tmp/project/.ralph/runs/fixture-flow/run-1/.ralph-runtime/agent-events.wal.ndjson"
+        }));
+    }
+
+    #[test]
+    fn decorates_event_notice_immediately_when_already_at_line_start() {
+        let mut state = super::EventNoticeState {
+            pending: vec![super::render_event_notice(&ralph_core::ParsedAgentEvent {
+                event: "loop-route".to_owned(),
+                body: "beta".to_owned(),
+            })],
+            last_visible_ended_with_newline: true,
+        };
+
+        let rendered = super::decorate_visible_output(&mut state, "hello\n".to_owned(), false);
+
+        assert!(rendered.starts_with("\x1b[1;31m◆ event emitted: loop-route | beta\x1b[0m\n"));
+        assert!(rendered.ends_with("hello\n"));
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn decorates_event_notice_after_first_newline_when_mid_line() {
+        let mut state = super::EventNoticeState {
+            pending: vec![super::render_event_notice(&ralph_core::ParsedAgentEvent {
+                event: "loop-stop:ok".to_owned(),
+                body: "done".to_owned(),
+            })],
+            last_visible_ended_with_newline: false,
+        };
+
+        let rendered = super::decorate_visible_output(&mut state, "before\nafter".to_owned(), false);
+
+        assert!(rendered.starts_with("before\n\x1b[1;31m◆ event emitted: loop-stop:ok | done\x1b[0m\n"));
+        assert!(rendered.ends_with("after"));
+        assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn flushes_pending_event_notice_with_newline_at_end_of_stream() {
+        let mut state = super::EventNoticeState {
+            pending: vec![super::render_event_notice(&ralph_core::ParsedAgentEvent {
+                event: "handoff".to_owned(),
+                body: "alpha\nbeta".to_owned(),
+            })],
+            last_visible_ended_with_newline: false,
+        };
+
+        let rendered = super::decorate_visible_output(&mut state, "tail".to_owned(), true);
+
+        assert_eq!(
+            rendered,
+            "tail\n\x1b[1;31m◆ event emitted: handoff | alpha\\nbeta\x1b[0m\n"
+        );
+        assert!(state.pending.is_empty());
     }
 
     #[test]

@@ -302,16 +302,20 @@ Files Ralph commonly reads or updates as part of the workflow itself:
 - `docs/planning/<project>/design/detailed-design.md`: design output from `pdd`
 - `docs/planning/<project>/implementation/plan.md`: execution-ready plan output from `pdd`
 
-## Advanced: `ralph emit`
+## Advanced: Agent Events
 
-`ralph emit` is mainly for workflow authors and the agent processes Ralph launches. Most users can ignore it.
+Ralph can read events directly from the text output emitted by a non-interactive agent run.
 
-It only works inside an active Ralph run and appends events to the current run's WAL. Built-in workflows use it to control looping behavior, for example:
+- Emit an event with no body by printing `<<<SIGNAL:event-name>>>`
+- Emit an event with a body by printing `<<<PAYLOAD:event-name>>>body<<<END-PAYLOAD>>>`
+- Read the latest stored payload for an event inside a Ralph agent run with `"$RALPH_BIN" get <event-name>`
+
+Built-in workflows use this mechanism for loop control, for example:
 
 - `loop-continue`
-- `loop-route <prompt-id>`
-- `loop-stop:ok <reason>`
-- `loop-stop:error <reason>`
+- `loop-route` with the target prompt id in the payload body
+- `loop-stop:ok` with an optional success reason in the payload body
+- `loop-stop:error` with an optional failure reason in the payload body
 
 See the built-in workflow definitions with `ralph show <workflow-id>` if you want to study how loop control works in practice.
 

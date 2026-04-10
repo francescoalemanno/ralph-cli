@@ -216,7 +216,12 @@ impl CodingAgent {
                 non_interactive: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("raijin".to_owned()),
-                    args: vec!["-ephemeral".to_owned(), "{prompt}".to_owned()],
+                    args: vec![
+                        "-ephemeral".to_owned(),
+                        "-no-echo".to_owned(),
+                        "-no-thinking".to_owned(),
+                        "{prompt}".to_owned(),
+                    ],
                     command: None,
                     prompt_input: PromptInput::Argv,
                     prompt_env_var: default_prompt_env_var(),
@@ -540,7 +545,10 @@ mod tests {
     fn raijin_builtin_commands_match_expected_shapes() {
         let raijin = CodingAgent::Raijin.definition();
         assert_eq!(raijin.non_interactive.prompt_input, PromptInput::Argv);
-        assert_eq!(raijin.non_interactive.args, vec!["-ephemeral", "{prompt}"]);
+        assert_eq!(
+            raijin.non_interactive.args,
+            vec!["-ephemeral", "-no-echo", "-no-thinking", "{prompt}"]
+        );
         assert_eq!(raijin.interactive.prompt_input, PromptInput::Argv);
         assert_eq!(raijin.interactive.args, vec!["-new", "{prompt}"]);
     }

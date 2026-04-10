@@ -40,6 +40,8 @@ fn hidden_test_workflow_runs_end_to_end_via_the_cli_binary() {
     assert!(stdout.contains("finalize after 4 rounds"));
     assert!(stdout.contains("Workflow complete: completed 4 coordinated rounds"));
     assert!(stdout.contains("test-workflow [completed] prompt=finalize"));
+    assert!(!stdout.contains("<<<PAYLOAD:"));
+    assert!(!stdout.contains("<<<SIGNAL:"));
 
     let run_root = project_dir
         .join(".ralph")

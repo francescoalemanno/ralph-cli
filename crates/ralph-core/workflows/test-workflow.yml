@@ -18,8 +18,8 @@ prompts:
       : > "$log_file"
       echo "init workflow state in $RALPH_RUN_DIR"
       printf '%s\n' "init" >> "$log_file"
-      "$RALPH_BIN" emit test-phase init
-      "$RALPH_BIN" emit loop-route alpha
+      printf '<<<PAYLOAD:test-phase>>>init<<<END-PAYLOAD>>>\n'
+      printf '<<<PAYLOAD:loop-route>>>alpha<<<END-PAYLOAD>>>\n'
   alpha:
     title: Alpha
     is_interactive: false
@@ -32,8 +32,8 @@ prompts:
       echo "alpha round $round"
       printf '%s\n' "alpha:$round" >> "$log_file"
       printf '%s\n' "alpha artifact round $round" > "$state_dir/alpha-$round.txt"
-      "$RALPH_BIN" emit test-phase "alpha:$round"
-      "$RALPH_BIN" emit loop-route beta
+      printf '<<<PAYLOAD:test-phase>>>alpha:%s<<<END-PAYLOAD>>>\n' "$round"
+      printf '<<<PAYLOAD:loop-route>>>beta<<<END-PAYLOAD>>>\n'
   beta:
     title: Beta
     is_interactive: false
@@ -43,11 +43,13 @@ prompts:
       state_dir="$RALPH_RUN_DIR/state"
       log_file="$RALPH_RUN_DIR/worklog.txt"
       round=$(cat "$state_dir/round.txt")
+      prev_phase=$("$RALPH_BIN" get test-phase)
+      test "$prev_phase" = "alpha:$round"
       echo "beta round $round"
       printf '%s\n' "beta:$round" >> "$log_file"
       printf '%s\n' "beta artifact round $round" > "$state_dir/beta-$round.txt"
-      "$RALPH_BIN" emit test-phase "beta:$round"
-      "$RALPH_BIN" emit loop-route gamma
+      printf '<<<PAYLOAD:test-phase>>>beta:%s<<<END-PAYLOAD>>>\n' "$round"
+      printf '<<<PAYLOAD:loop-route>>>gamma<<<END-PAYLOAD>>>\n'
   gamma:
     title: Gamma
     is_interactive: false
@@ -57,16 +59,18 @@ prompts:
       state_dir="$RALPH_RUN_DIR/state"
       log_file="$RALPH_RUN_DIR/worklog.txt"
       round=$(cat "$state_dir/round.txt")
+      prev_phase=$("$RALPH_BIN" get test-phase)
+      test "$prev_phase" = "beta:$round"
       echo "gamma round $round"
       printf '%s\n' "gamma:$round" >> "$log_file"
       printf '%s\n' "gamma artifact round $round" > "$state_dir/gamma-$round.txt"
-      "$RALPH_BIN" emit test-phase "gamma:$round"
+      printf '<<<PAYLOAD:test-phase>>>gamma:%s<<<END-PAYLOAD>>>\n' "$round"
       if [ "$round" -ge 4 ]; then
-        "$RALPH_BIN" emit loop-route finalize
+        printf '<<<PAYLOAD:loop-route>>>finalize<<<END-PAYLOAD>>>\n'
       else
         next_round=$((round + 1))
         printf '%s\n' "$next_round" > "$state_dir/round.txt"
-        "$RALPH_BIN" emit loop-route alpha
+        printf '<<<PAYLOAD:loop-route>>>alpha<<<END-PAYLOAD>>>\n'
       fi
   finalize:
     title: Finalize
@@ -77,6 +81,8 @@ prompts:
       state_dir="$RALPH_RUN_DIR/state"
       log_file="$RALPH_RUN_DIR/worklog.txt"
       round=$(cat "$state_dir/round.txt")
+      prev_phase=$("$RALPH_BIN" get test-phase)
+      test "$prev_phase" = "gamma:$round"
       echo "finalize after $round rounds"
       printf '%s\n' "finalize:$round" >> "$log_file"
       entries=$(wc -l < "$log_file" | tr -d '[:space:]')
@@ -84,5 +90,5 @@ prompts:
         printf 'rounds=%s\n' "$round"
         printf 'entries=%s\n' "$entries"
       } > "$RALPH_RUN_DIR/summary.txt"
-      "$RALPH_BIN" emit test-phase "finalize:$round"
-      "$RALPH_BIN" emit loop-stop:ok "completed $round coordinated rounds"
+      printf '<<<PAYLOAD:test-phase>>>finalize:%s<<<END-PAYLOAD>>>\n' "$round"
+      printf '<<<PAYLOAD:loop-stop:ok>>>completed %s coordinated rounds<<<END-PAYLOAD>>>\n' "$round"

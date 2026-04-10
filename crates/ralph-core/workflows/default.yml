@@ -94,7 +94,7 @@ prompts:
 
       # PHASE: ROUTING
       Since the whole plan is complete, add a single line to `{ralph-option:plan-file}` with "<< PLAN COMPLETE >>".
-      Then run {ralph-route:verify}
+      Then {ralph-route:verify}.
 
       <<< USER REQUEST
       {ralph-request}
@@ -114,13 +114,13 @@ prompts:
       4. Run the checks and tests needed to verify that the whole project works as expected for the request, not just one item.
          - If there is no single obvious command, use your judgment and run the best available whole-project validation set.
       5. Decide exactly once:
-         - If the project works as expected, run {ralph-stop:ok:verification-passed}, then goto 6. Stop.
-         - Else run {ralph-stop:error:verification-failed}, then goto 6. Stop.
+         - If the project works as expected, {ralph-stop:ok:verification-passed}, then goto 6. Stop.
+         - Else {ralph-stop:error:verification-failed}, then goto 6. Stop.
       6. Stop.
 
       # Constraints
       - Verification only. Do not implement. Do not replan. Do not update `{ralph-option:plan-file}`.
-      - You MUST emit either `loop-stop:ok` or `loop-stop:error`.
+      - You MUST emit exactly one loop-stop event in this step.
       - Prefer whole-project validation over narrow item-local checks.
 
       <<< USER REQUEST

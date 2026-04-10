@@ -11,7 +11,6 @@ const RALPH_OPTION_PREFIX_TOKEN: &str = "option:";
 const RALPH_SKILL_EMIT_TOKEN: &str = "skill-emit";
 const RALPH_ROUTE_PREFIX_TOKEN: &str = "route:";
 const RALPH_STOP_PREFIX_TOKEN: &str = "stop:";
-const RALPH_EMIT_COMMAND_PREFIX: &str = "$RALPH_BIN emit";
 const RALPH_SKILL_EMIT_NAME: &str = "Ralph event emission";
 
 pub(crate) fn interpolate_workflow_prompt(
@@ -104,7 +103,7 @@ fn render_route_macro(route: &str) -> Result<String> {
             "workflow token '{{ralph-route:...}}' requires a route"
         ));
     }
-    Ok(render_emit_command("loop-route", Some(route)))
+    Ok(render_payload_instruction("loop-route", route))
 }
 
 fn render_stop_macro(spec: &str) -> Result<String> {
@@ -119,26 +118,51 @@ fn render_stop_macro(spec: &str) -> Result<String> {
         ));
     }
 
-    Ok(render_emit_command(
-        &format!("loop-stop:{status}"),
-        Some(body),
-    ))
+    let event = format!("loop-stop:{status}");
+    Ok(if body.is_empty() {
+        render_signal_instruction(&event)
+    } else {
+        render_payload_instruction(&event, body)
+    })
 }
 
-fn render_emit_command(event: &str, body: Option<&str>) -> String {
-    match body.map(str::trim).filter(|body| !body.is_empty()) {
-        Some(body) => format!("`{RALPH_EMIT_COMMAND_PREFIX} {event} {body}`"),
-        None => format!("`{RALPH_EMIT_COMMAND_PREFIX} {event}`"),
-    }
+fn render_signal_instruction(event: &str) -> String {
+    format!(
+        "emit event `{event}` with no body by writing `{}`",
+        render_signal_marker(event)
+    )
+}
+
+fn render_payload_instruction(event: &str, body: &str) -> String {
+    format!(
+        "emit event `{event}` with body `{body}` by writing `{}`",
+        render_payload_marker(event, body)
+    )
+}
+
+fn render_signal_marker(event: &str) -> String {
+    format!("<<<SIGNAL:{event}>>>")
+}
+
+fn render_payload_marker(event: &str, body: &str) -> String {
+    format!("<<<PAYLOAD:{event}>>>{body}<<<END-PAYLOAD>>>")
 }
 
 fn render_skill_emit_content() -> String {
     format!(
         r#"<skill name="{RALPH_SKILL_EMIT_NAME}">
-- RALPH_BIN is an environment variable which point to the ralph binary path.
-- running the command {} will emit the event.
+definitions:
+event-name = the name of the event to emit
+event-body = the body of the event and payload to emit
+- To emit an event without a body, write `{}`
+- To emit an event with a body, write `{}`
+- Event bodies may span multiple lines.
+- Do not explain the event in prose; output the marker itself.
+- `RALPH_BIN` points to the Ralph binary for this run.
+- To read the latest payload for a previous event, run `"$RALPH_BIN" get <event-name>`.
 </skill>"#,
-        render_emit_command("<event-name>", Some("<event-body>"))
+        render_signal_marker("event-name"),
+        render_payload_marker("event-name", "event-body"),
     )
 }
 
@@ -172,7 +196,11 @@ mod tests {
         .unwrap();
 
         assert!(rendered.contains("<skill name=\"Ralph event emission\">"));
-        assert!(rendered.contains("$RALPH_BIN emit <event-name> <event-body>"));
+        assert!(rendered.contains("<<<SIGNAL:event-name>>>"));
+        assert!(rendered.contains("<<<PAYLOAD:event-name>>>"));
+        assert!(rendered.contains("event-body"));
+        assert!(rendered.contains("<<<END-PAYLOAD>>>"));
+        assert!(rendered.contains("\"$RALPH_BIN\" get <event-name>"));
         assert!(rendered.contains("project=/tmp/project"));
         assert!(rendered.contains("request=ship it"));
         assert!(rendered.contains("progress=progress.txt"));
@@ -188,9 +216,15 @@ mod tests {
         )
         .unwrap();
 
-        assert!(rendered.contains("`$RALPH_BIN emit loop-route build`"));
-        assert!(rendered.contains("`$RALPH_BIN emit loop-stop:ok verification-passed`"));
-        assert!(rendered.contains("`$RALPH_BIN emit loop-stop:error`"));
+        assert!(rendered.contains(
+            "emit event `loop-route` with body `build` by writing `<<<PAYLOAD:loop-route>>>build<<<END-PAYLOAD>>>`"
+        ));
+        assert!(rendered.contains(
+            "emit event `loop-stop:ok` with body `verification-passed` by writing `<<<PAYLOAD:loop-stop:ok>>>verification-passed<<<END-PAYLOAD>>>`"
+        ));
+        assert!(rendered.contains(
+            "emit event `loop-stop:error` with no body by writing `<<<SIGNAL:loop-stop:error>>>`"
+        ));
     }
 
     #[test]

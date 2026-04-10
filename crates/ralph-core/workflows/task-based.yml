@@ -34,7 +34,7 @@ prompts:
       7. Update `{ralph-option:progress-file}` truthfully so the next worker can continue seamlessly.
          - Record what was completed, what remains open, and any new findings or blockers.
          - If your understanding of the work changed, rewrite the file so it reflects reality.
-      8. If `{ralph-option:progress-file}` still contains open items, run {ralph-route:worker}, then goto 9. Stop.
+      8. If `{ralph-option:progress-file}` still contains open items, {ralph-route:worker}, then goto 9. Stop.
       9. Stop.
 
       # Constraints
@@ -58,16 +58,16 @@ prompts:
       2. Study `{ralph-option:progress-file}` if it exists.
       3. Decide whether the request and `{ralph-option:progress-file}` are aligned enough for continued execution.
       4. Route exactly once:
-         - If `{ralph-option:progress-file}` is missing, stale, contradictory, not right-sized, or otherwise not aligned with the request, remove it if it exists, run {ralph-route:worker}, then goto 5. Stop.
-         - Else if `{ralph-option:progress-file}` still contains one or more actionable open items, run {ralph-route:worker}, then goto 5. Stop.
-         - Else if `{ralph-option:progress-file}` is aligned with the request and clearly indicates that all actionable work is complete, run {ralph-stop:ok:progress-complete}, then goto 5. Stop.
+         - If `{ralph-option:progress-file}` is missing, stale, contradictory, not right-sized, or otherwise not aligned with the request, remove it if it exists, {ralph-route:worker}, then goto 5. Stop.
+         - Else if `{ralph-option:progress-file}` still contains one or more actionable open items, {ralph-route:worker}, then goto 5. Stop.
+         - Else if `{ralph-option:progress-file}` is aligned with the request and clearly indicates that all actionable work is complete, {ralph-stop:ok:progress-complete}, then goto 5. Stop.
       5. Stop.
 
       # Constraints
       - Verification and routing only. Do not implement. Do not update source code.
       - Only judge alignment and remaining actionable work in `{ralph-option:progress-file}`.
       - If you determine the file is not aligned, remove it and do not recreate it in this step.
-      - You MUST emit either `loop-route worker` or `loop-stop:ok`.
+      - You MUST emit exactly one loop-control event in this step.
 
       <<< USER REQUEST
       {ralph-request}

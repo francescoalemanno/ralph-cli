@@ -29,8 +29,7 @@ const REQUEST_HELP: &str = "Provide the request as argv text";
 const RUN_CLI_HELP: &str = "Run in CLI mode instead of opening the TUI";
 const RUN_AGENT_HELP: &str = "Override the configured coding agent for this run";
 const RUN_MAX_ITERATIONS_HELP: &str = "Override the configured workflow iteration limit";
-const EMIT_EVENT_HELP: &str = "Event name to append to the current run WAL";
-const EMIT_BODY_HELP: &str = "Optional event body text";
+const GET_EVENT_HELP: &str = "Event name whose latest payload should be printed";
 const CONFIG_SCOPE_WRITE_HELP: &str = "Config scope to update";
 const CONFIG_SCOPE_VIEW_HELP: &str = "Config view to render";
 const INIT_AGENT_HELP: &str = "Persist this agent as the project default";
@@ -43,8 +42,8 @@ Examples:
   ralph run task-based \"fix the failing tests\"
   ralph run task-based --file REQ.md
   cat REQ.md | ralph run --cli task-based";
-const EMIT_LONG_ABOUT: &str = "\
-Emit an agent event into the current Ralph run WAL.
+const GET_LONG_ABOUT: &str = "\
+Print the most recent payload stored for an event in the current Ralph run WAL.
 
 This command only works inside a Ralph agent run.";
 
@@ -55,7 +54,6 @@ const MAX_ITERATIONS_ARG: &str = "max_iterations";
 const REQUEST_FILE_ARG: &str = "request_file";
 const REQUEST_ARG: &str = "request";
 const EVENT_ARG: &str = "event";
-const BODY_ARG: &str = "body";
 const WORKFLOW_ID_ARG: &str = "workflow_id";
 const SCOPE_ARG: &str = "scope";
 const EDITOR_ARG: &str = "editor";
@@ -137,7 +135,7 @@ impl Cli {
         let project_dir = matches.get_one::<Utf8PathBuf>(PROJECT_DIR_ARG).cloned();
         let command = match matches.subcommand() {
             Some(("run", submatches)) => Commands::Run(parse_run_args(submatches)?),
-            Some(("emit", submatches)) => Commands::Emit(parse_emit_args(submatches)?),
+            Some(("get", submatches)) => Commands::Get(parse_get_args(submatches)?),
             Some(("ls", _)) => Commands::Ls,
             Some(("show", submatches)) => Commands::Show(parse_show_args(submatches)?),
             Some(("edit", submatches)) => Commands::Edit(parse_edit_args(submatches)?),
@@ -180,7 +178,7 @@ pub(crate) fn render_run_workflow_help(workflow_id: &str) -> Result<String> {
 #[derive(Debug, Clone)]
 pub(crate) enum Commands {
     Run(RunArgs),
-    Emit(EmitArgs),
+    Get(GetArgs),
     Ls,
     Show(ShowArgs),
     Edit(EditArgs),
@@ -220,9 +218,8 @@ impl RequestArgs {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct EmitArgs {
+pub(crate) struct GetArgs {
     pub(crate) event: String,
-    pub(crate) body: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -304,23 +301,15 @@ fn build_cli_command() -> Result<Command> {
         )
         .subcommand(build_run_command()?)
         .subcommand(
-            Command::new("emit")
-                .about("Emit an agent event into the current Ralph run WAL")
-                .long_about(EMIT_LONG_ABOUT)
+            Command::new("get")
+                .about("Print the latest payload for an event in the current Ralph run WAL")
+                .long_about(GET_LONG_ABOUT)
                 .arg_required_else_help(true)
                 .arg(
                     Arg::new(EVENT_ARG)
                         .value_name("EVENT")
                         .required(true)
-                        .help(EMIT_EVENT_HELP),
-                )
-                .arg(
-                    Arg::new(BODY_ARG)
-                        .value_name("BODY")
-                        .trailing_var_arg(true)
-                        .allow_hyphen_values(true)
-                        .num_args(1..)
-                        .help(EMIT_BODY_HELP),
+                        .help(GET_EVENT_HELP),
                 ),
         )
         .subcommand(
@@ -563,13 +552,9 @@ fn parse_run_args(matches: &ArgMatches) -> Result<RunArgs> {
     })
 }
 
-fn parse_emit_args(matches: &ArgMatches) -> Result<EmitArgs> {
-    Ok(EmitArgs {
+fn parse_get_args(matches: &ArgMatches) -> Result<GetArgs> {
+    Ok(GetArgs {
         event: required_string_result(matches, EVENT_ARG)?,
-        body: matches
-            .get_many::<String>(BODY_ARG)
-            .map(|values| values.cloned().collect())
-            .unwrap_or_default(),
     })
 }
 
@@ -802,18 +787,30 @@ mod tests {
     }
 
     #[test]
-    fn emit_without_event_surfaces_help_instead_of_panicking() {
+    fn get_subcommand_parses_event_name() {
         with_test_workflow_home(|| {
-            let error = Cli::try_parse_from(["ralph", "emit"]).unwrap_err();
+            let cli = Cli::try_parse_from(["ralph", "get", "handoff"]).unwrap();
+
+            let Commands::Get(args) = cli.command else {
+                panic!("expected get subcommand");
+            };
+            assert_eq!(args.event, "handoff");
+        });
+    }
+
+    #[test]
+    fn get_without_event_surfaces_help_instead_of_panicking() {
+        with_test_workflow_home(|| {
+            let error = Cli::try_parse_from(["ralph", "get"]).unwrap_err();
             let rendered = error.to_string();
 
             assert_eq!(
                 error.kind(),
                 ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
             );
-            assert!(rendered.contains("Emit an agent event into the current Ralph run WAL"));
+            assert!(rendered.contains("Print the latest payload for an event in the current Ralph run WAL"));
             assert!(rendered.contains("Usage:"));
-            assert!(rendered.contains("ralph emit"));
+            assert!(rendered.contains("ralph get"));
             assert!(rendered.contains("<EVENT>"));
         });
     }
