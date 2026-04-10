@@ -99,6 +99,8 @@ impl CodingAgent {
                         r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#
                             .to_owned(),
                     )]),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
             Self::Codex => AgentConfig {
@@ -118,6 +120,8 @@ impl CodingAgent {
                     prompt_input: PromptInput::Stdin,
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::new(),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
             Self::Claude => AgentConfig {
@@ -138,6 +142,8 @@ impl CodingAgent {
                     prompt_input: PromptInput::Argv,
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::new(),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
             Self::Droid => AgentConfig {
@@ -157,6 +163,8 @@ impl CodingAgent {
                     prompt_input: PromptInput::Argv,
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::new(),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
             Self::Raijin => AgentConfig {
@@ -177,6 +185,8 @@ impl CodingAgent {
                     prompt_input: PromptInput::Argv,
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::new(),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
             Self::Gemini => AgentConfig {
@@ -192,6 +202,8 @@ impl CodingAgent {
                     prompt_input: PromptInput::Argv,
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::new(),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
             Self::Pi => AgentConfig {
@@ -211,6 +223,8 @@ impl CodingAgent {
                     prompt_input: PromptInput::Argv,
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::new(),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
         }
@@ -245,6 +259,10 @@ pub struct RunnerConfig {
     pub prompt_env_var: String,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub session_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 impl Default for RunnerConfig {
@@ -320,6 +338,8 @@ fn test_shell_agent_definition() -> AgentConfig {
         prompt_input: PromptInput::Argv,
         prompt_env_var: default_prompt_env_var(),
         env: BTreeMap::new(),
+        session_timeout_secs: None,
+        idle_timeout_secs: None,
     };
     AgentConfig {
         id: "__test_shell".to_owned(),

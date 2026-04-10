@@ -528,7 +528,7 @@ struct BuiltinWorkflow {
     contents: &'static str,
 }
 
-fn builtin_workflows() -> [BuiltinWorkflow; 6] {
+fn builtin_workflows() -> [BuiltinWorkflow; 7] {
     [
         BuiltinWorkflow {
             file_name: "bare.yml",
@@ -553,6 +553,10 @@ fn builtin_workflows() -> [BuiltinWorkflow; 6] {
         BuiltinWorkflow {
             file_name: "test-workflow.yml",
             contents: include_str!("../workflows/test-workflow.yml"),
+        },
+        BuiltinWorkflow {
+            file_name: "test-timeout-workflow.yml",
+            contents: include_str!("../workflows/test-timeout-workflow.yml"),
         },
     ]
 }

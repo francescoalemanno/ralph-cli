@@ -749,6 +749,8 @@ mod tests {
             prompt_input: PromptInput::Argv,
             prompt_env_var: "PROMPT".to_owned(),
             env: Default::default(),
+            session_timeout_secs: None,
+            idle_timeout_secs: None,
         };
         AgentConfig {
             id: id.to_owned(),
@@ -768,6 +770,8 @@ mod tests {
             prompt_input: PromptInput::Argv,
             prompt_env_var: "PROMPT".to_owned(),
             env: Default::default(),
+            session_timeout_secs: None,
+            idle_timeout_secs: None,
         };
         AgentConfig {
             id: id.to_owned(),

@@ -12,7 +12,7 @@ use tokio::{
     process::Command as AsyncCommand,
     sync::mpsc::{self, UnboundedSender},
     task::JoinHandle,
-    time::{Duration, sleep, timeout},
+    time::{Duration, Instant, sleep, timeout},
 };
 use tracing::debug;
 
@@ -132,6 +132,8 @@ impl RunnerAdapter for CommandRunner {
             last_visible_ended_with_newline: true,
         };
         let mut started_working = false;
+        let started_at = Instant::now();
+        let mut last_output_at = started_at;
         let exit_code = loop {
             if control.is_cancelled() {
                 let _ = child.start_kill();
@@ -139,6 +141,32 @@ impl RunnerAdapter for CommandRunner {
                 drop(stderr_task);
                 let _ = timeout(Duration::from_millis(250), child.wait()).await;
                 return Err(anyhow!("runner canceled"));
+            }
+            if let Some(session_timeout_secs) = config.session_timeout_secs {
+                let session_timeout = Duration::from_secs(session_timeout_secs);
+                if started_at.elapsed() >= session_timeout {
+                    let _ = child.start_kill();
+                    drop(stdout_task);
+                    drop(stderr_task);
+                    let _ = timeout(Duration::from_millis(250), child.wait()).await;
+                    return Err(anyhow!(
+                        "runner session timeout after {}",
+                        format_timeout_duration(session_timeout_secs)
+                    ));
+                }
+            }
+            if let Some(idle_timeout_secs) = config.idle_timeout_secs {
+                let idle_timeout = Duration::from_secs(idle_timeout_secs);
+                if last_output_at.elapsed() >= idle_timeout {
+                    let _ = child.start_kill();
+                    drop(stdout_task);
+                    drop(stderr_task);
+                    let _ = timeout(Duration::from_millis(250), child.wait()).await;
+                    return Err(anyhow!(
+                        "runner idle timeout after {}",
+                        format_timeout_duration(idle_timeout_secs)
+                    ));
+                }
             }
 
             if let Some(status) = child.try_wait().context("failed while polling runner")? {
@@ -170,6 +198,7 @@ impl RunnerAdapter for CommandRunner {
                         let RunnerStreamEvent::Output(chunk) = event else {
                             continue;
                         };
+                        last_output_at = Instant::now();
                         if !started_working {
                             started_working = true;
                             if let Some(tx) = &stream {
@@ -533,6 +562,16 @@ fn render_template(template: &str, context: &TemplateContext) -> String {
     rendered
 }
 
+fn format_timeout_duration(total_seconds: u64) -> String {
+    if total_seconds % 3600 == 0 {
+        return format!("{}h", total_seconds / 3600);
+    }
+    if total_seconds % 60 == 0 {
+        return format!("{}m", total_seconds / 60);
+    }
+    format!("{}s", total_seconds)
+}
+
 fn resolved_prompt_path(context: &TemplateContext) -> &str {
     context
         .prompt_path
@@ -625,6 +664,8 @@ mod tests {
             prompt_input: PromptInput::Argv,
             prompt_env_var: "PROMPT".to_owned(),
             env: BTreeMap::new(),
+            session_timeout_secs: None,
+            idle_timeout_secs: None,
         };
 
         let envs = super::rendered_envs(&config, &context);
@@ -741,6 +782,8 @@ mod tests {
             prompt_input: PromptInput::Argv,
             prompt_env_var: "PROMPT".to_owned(),
             env: BTreeMap::new(),
+            session_timeout_secs: None,
+            idle_timeout_secs: None,
         };
         assert_eq!(config.command_preview(), "cat prompt.txt | myagent");
     }
