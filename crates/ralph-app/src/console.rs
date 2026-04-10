@@ -23,6 +23,19 @@ impl RunDelegate for ConsoleDelegate {
             RunEvent::Output(chunk) => {
                 print!("{chunk}");
             }
+            RunEvent::ParallelWorkerLaunched { channel_id, label } => {
+                println!("[parallel:{channel_id}] launched {label}");
+            }
+            RunEvent::ParallelWorkerStarted { channel_id, label } => {
+                println!("[parallel:{channel_id}] started {label}");
+            }
+            RunEvent::ParallelWorkerFinished {
+                channel_id,
+                label,
+                exit_code,
+            } => {
+                println!("[parallel:{channel_id}] finished {label} (exit={exit_code})");
+            }
             RunEvent::Note(note) => {
                 eprintln!("{note}");
             }
