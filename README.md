@@ -82,12 +82,9 @@ ralph ls
 ## Choose The Right Workflow
 
 - `bare`: use this when your request already contains the exact loop discipline you want and you just need Ralph to run it durably.
-- `simple`: use this when you want Ralph to study the request and current codebase, then take the single highest-leverage next step each loop.
 - `default`: use this when you want Ralph to keep a durable `PLAN.md`, execute one plan item per loop, and finish with a whole-project verification pass.
 - `dbv`: use this when you want a durable plan in `PLAN.md`, one-item-at-a-time execution, and a final whole-project verification pass before declaring success.
-- `task-based`: use this when the work already lives in a request list or `progress.txt` and you want one right-sized item completed per loop.
 - `plan`: use this when you want a host-mediated planning loop that explores the codebase, asks one clarifying question at a time, drafts a markdown plan, and only writes the exact accepted draft to disk.
-- `pdd`: use this when the idea is still rough and you need an interactive path to research, design, and an implementation plan before autonomous loops.
 
 ## Core Concepts
 
@@ -96,7 +93,6 @@ ralph ls
 - Request: the task text for the workflow
 - Design docs/specs: optional durable reference material when the request needs them
 - Plan file: a prioritized list of right-sized build items, usually `PLAN.md`
-- Progress file: the handoff memory for the next loop, usually `progress.txt`
 - User config: `~/.config/ralph/config.toml`
 - Workflow registry: `~/.config/ralph/workflows/`
 - Project config: `.ralph/config.toml`
@@ -110,11 +106,10 @@ Every command also accepts `--project-dir <PATH>` if you want to operate on a di
 These open the runner UI:
 
 ```bash
-ralph run task-based "fix the failing tests"
+ralph run bare "fix the failing tests"
 ralph run default "ship the auth refactor"
 ralph run dbv "ship the auth refactor"
 ralph run plan "add caching for API responses"
-ralph run pdd --file rough-idea.md
 ```
 
 Important behavior:
@@ -129,11 +124,11 @@ Use `--cli` for a plain terminal run:
 
 ```bash
 ralph run --cli bare "summarize the current repository"
-ralph run --cli task-based --progressfile progress.txt "finish the top task"
+ralph run --cli default "finish the top task"
 cat REQ.md | ralph run --cli bare
 ```
 
-CLI mode also accepts piped stdin. For workflows with interactive prompts or host-collected planning questions, do not use stdin; use argv text or `--file` so the terminal stays available.
+CLI mode also accepts piped stdin.
 
 ### Request Input Rules
 
@@ -148,8 +143,8 @@ If you provide more than one, Ralph exits with a usage error.
 ## Writing Better Ralph Requests
 
 - Define success criteria in observable terms: what should work, what should pass, and what files or docs should be updated.
-- Keep the active loop narrow. If the work is broad or ambiguous, start with `pdd` to design it first or `dbv` to repair the plan before building.
-- Point Ralph at durable memory such as `PLAN.md`, design docs, or `progress.txt`.
+- Keep the active loop narrow. If the work is broad or ambiguous, start with `plan` or `dbv` before building.
+- Point Ralph at durable memory such as `PLAN.md` or design docs.
 - Tell Ralph to study the code before deciding something is missing. This is one of the most common failure modes in agentic loops.
 - Ask for the relevant checks after each change so the loop has real backpressure.
 - Treat plan and progress files as living control surfaces. If they get stale, rewrite them and keep looping.
@@ -159,12 +154,9 @@ If you provide more than one, Ralph exits with a usage error.
 | Workflow | What it does | Useful options |
 | --- | --- | --- |
 | `bare` | Minimal wrapper when your request already contains the loop discipline you want. | None |
-| `simple` | Studies the request and project state, then executes the single highest-leverage next step toward completion each pass. | None |
 | `default` | Repairs a durable `PLAN.md`, executes one plan item per loop, and verifies the whole project when the plan is complete. | `--planfile` (default: `PLAN.md`) |
 | `dbv` | Uses a durable `PLAN.md` as the control surface, decomposes when needed, builds one item per loop, and performs whole-project verification when the plan is complete. | `--planfile` (default: `PLAN.md`) |
-| `task-based` | Reads the request list, chooses one high-priority right-sized item, executes it, and updates a handoff file for the next loop. | `--progressfile` (default: `progress.txt`) |
 | `plan` | Runs a host-mediated planner loop that explores the repo, asks one clarifying question at a time, drafts a plan, and writes the accepted markdown file under `docs/plans/`. | `--plansdir` (default: `docs/plans`) |
-| `pdd` | Interactive prompt-driven development for turning a rough idea into research, design, and an implementation plan. | `--pdddir` (default: `docs/planning/{project_name}`) |
 
 List them at any time with:
 
@@ -260,13 +252,13 @@ ralph ls
 Print the raw YAML for one workflow:
 
 ```bash
-ralph show task-based
+ralph show default
 ```
 
 Edit a workflow in place:
 
 ```bash
-ralph edit task-based
+ralph edit default
 ```
 
 Editor resolution order:
@@ -284,9 +276,8 @@ Workflow option ids are turned into long flags by removing `-` and `_`.
 
 Examples:
 
-- `progress-file` becomes `--progressfile`
 - `plan-file` becomes `--planfile`
-- `pdd-dir` becomes `--pdddir`
+- `base-ref` becomes `--baseref`
 
 That is why the workflow-specific help output looks slightly different from the YAML option ids.
 
@@ -302,13 +293,11 @@ That is why the workflow-specific help output looks slightly different from the 
 Files Ralph commonly reads or updates as part of the workflow itself:
 
 - `PLAN.md`: durable execution plan for `default` and `dbv`
-- `progress.txt`: task handoff memory for `task-based`
-- `docs/planning/<project>/design/detailed-design.md`: design output from `pdd`
-- `docs/planning/<project>/implementation/plan.md`: execution-ready plan output from `pdd`
+- `docs/plans/*.md`: accepted plan drafts written by `plan`
 
 ## Advanced: Agent Events
 
-Ralph can read events directly from the text output emitted by a non-interactive agent run.
+Ralph can read events directly from the text output emitted by an agent run.
 
 - Emit an event with no body by printing `<<<SIGNAL:event-name>>>`
 - Emit an event with a body by printing `<<<PAYLOAD:event-name>>>body<<<END-PAYLOAD>>>`
@@ -353,7 +342,6 @@ Workflows can fan out non-interactive workers in parallel and then continue on a
 prompts:
   reviews:
     title: Reviews
-    is_interactive: false
     fallback-route: fixer
     parallel:
       workers:
@@ -367,7 +355,6 @@ prompts:
             ...
   fixer:
     title: Fixer
-    is_interactive: false
     fallback-route: no-route-error
     prompt: |
       qt=$("$RALPH_BIN" get --channel QT review)
@@ -385,12 +372,6 @@ If the work is still fuzzy but you already want a concrete implementation plan i
 ralph run plan "add SSO to the admin app"
 ```
 
-If the work is still fuzzy and you want a broader research/design workflow with multiple planning artifacts, start with `pdd`:
-
-```bash
-ralph run pdd --file rough-idea.md
-```
-
 If the work is implementation-ready and you want a durable plan plus one-item-at-a-time execution, use `default`:
 
 ```bash
@@ -401,12 +382,6 @@ If you want the more explicit dispatcher-style plan gating, use `dbv`:
 
 ```bash
 ralph run dbv "add SSO to the admin app"
-```
-
-If you already have a request list and want one-item handoffs, use `task-based` with a maintained `progress.txt`:
-
-```bash
-ralph run task-based "work through the next highest-priority backlog item"
 ```
 
 If you want plain terminal output instead of the UI, or you are scripting a run:

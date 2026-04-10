@@ -96,7 +96,7 @@ pub(crate) fn agent_list_rows(agents: &[AgentConfig]) -> Vec<AgentListRow> {
         .map(|agent| AgentListRow {
             agent: format!("{} ({})", agent.name, agent.id),
             detected: agent.is_available(),
-            command: agent.non_interactive.command_preview(),
+            command: agent.runner.command_preview(),
         })
         .collect()
 }

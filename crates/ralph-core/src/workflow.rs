@@ -118,13 +118,6 @@ impl WorkflowDefinition {
                     self.validate_prompt_text(prompt_id, prompt_text)?;
                 }
                 (None, Some(parallel)) => {
-                    if prompt.is_interactive {
-                        return Err(anyhow!(
-                            "workflow '{}' prompt '{}' cannot be interactive when it uses parallel workers",
-                            self.workflow_id,
-                            prompt_id
-                        ));
-                    }
                     if parallel.workers.is_empty() {
                         return Err(anyhow!(
                             "workflow '{}' prompt '{}' must define at least one parallel worker",
@@ -232,10 +225,6 @@ impl WorkflowDefinition {
         })
     }
 
-    pub fn has_interactive_prompts(&self) -> bool {
-        self.prompts.values().any(|prompt| prompt.is_interactive)
-    }
-
     pub fn option(&self, option_id: &str) -> Option<&WorkflowOptionDefinition> {
         self.options.get(option_id)
     }
@@ -299,7 +288,6 @@ fn validate_worker_id(worker_id: &str) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowPromptDefinition {
     pub title: String,
-    pub is_interactive: bool,
     #[serde(rename = "fallback-route")]
     pub fallback_route: String,
     #[serde(default)]
@@ -540,15 +528,11 @@ struct BuiltinWorkflow {
     contents: &'static str,
 }
 
-fn builtin_workflows() -> [BuiltinWorkflow; 9] {
+fn builtin_workflows() -> [BuiltinWorkflow; 6] {
     [
         BuiltinWorkflow {
             file_name: "bare.yml",
             contents: include_str!("../workflows/bare.yml"),
-        },
-        BuiltinWorkflow {
-            file_name: "simple.yml",
-            contents: include_str!("../workflows/simple.yml"),
         },
         BuiltinWorkflow {
             file_name: "dbv.yml",
@@ -557,14 +541,6 @@ fn builtin_workflows() -> [BuiltinWorkflow; 9] {
         BuiltinWorkflow {
             file_name: "default.yml",
             contents: include_str!("../workflows/default.yml"),
-        },
-        BuiltinWorkflow {
-            file_name: "task-based.yml",
-            contents: include_str!("../workflows/task-based.yml"),
-        },
-        BuiltinWorkflow {
-            file_name: "pdd.yml",
-            contents: include_str!("../workflows/pdd.yml"),
         },
         BuiltinWorkflow {
             file_name: "plan.yml",
@@ -614,11 +590,8 @@ mod tests {
 
             let workflow_dir = home.join("workflows");
             assert!(workflow_dir.join("bare.yml").exists());
-            assert!(workflow_dir.join("simple.yml").exists());
             assert!(workflow_dir.join("dbv.yml").exists());
             assert!(workflow_dir.join("default.yml").exists());
-            assert!(workflow_dir.join("task-based.yml").exists());
-            assert!(workflow_dir.join("pdd.yml").exists());
             assert!(workflow_dir.join("plan.yml").exists());
             assert!(workflow_dir.join("ipr.yml").exists());
             assert!(workflow_dir.join("test-workflow.yml").exists());
@@ -637,27 +610,12 @@ mod tests {
             assert!(
                 workflows
                     .iter()
-                    .any(|workflow| workflow.workflow_id == "simple")
-            );
-            assert!(
-                workflows
-                    .iter()
                     .any(|workflow| workflow.workflow_id == "dbv")
             );
             assert!(
                 workflows
                     .iter()
                     .any(|workflow| workflow.workflow_id == "default")
-            );
-            assert!(
-                workflows
-                    .iter()
-                    .any(|workflow| workflow.workflow_id == "task-based")
-            );
-            assert!(
-                workflows
-                    .iter()
-                    .any(|workflow| workflow.workflow_id == "pdd")
             );
             assert!(
                 workflows
@@ -694,11 +652,6 @@ mod tests {
             assert!(
                 workflows
                     .iter()
-                    .any(|workflow| workflow.workflow_id == "simple")
-            );
-            assert!(
-                workflows
-                    .iter()
                     .any(|workflow| workflow.workflow_id == "plan")
             );
             assert!(
@@ -729,7 +682,6 @@ entrypoint: main
 prompts:
   main:
     title: Main
-    is_interactive: false
     fallback-route: no-route-error
     prompt: hello
 "#,
@@ -755,7 +707,6 @@ entrypoint: main
 prompts:
   main:
     title: Main
-    is_interactive: false
     fallback-route: no-route-error
     prompt: "{ralph-request}"
 "#,
@@ -791,7 +742,6 @@ prompts:
                 "main".to_owned(),
                 WorkflowPromptDefinition {
                     title: "Main".to_owned(),
-                    is_interactive: false,
                     fallback_route: NO_ROUTE_ERROR.to_owned(),
                     prompt: Some("hello".to_owned()),
                     parallel: None,
@@ -819,7 +769,6 @@ prompts:
                 "main".to_owned(),
                 WorkflowPromptDefinition {
                     title: "Main".to_owned(),
-                    is_interactive: false,
                     fallback_route: NO_ROUTE_ERROR.to_owned(),
                     prompt: Some("{ralph-env:RUN_DIR}/progress.txt".to_owned()),
                     parallel: None,
@@ -848,7 +797,6 @@ prompts:
                 "main".to_owned(),
                 WorkflowPromptDefinition {
                     title: "Main".to_owned(),
-                    is_interactive: false,
                     fallback_route: NO_ROUTE_ERROR.to_owned(),
                     prompt: Some("{ralph-option:progress-file}".to_owned()),
                     parallel: None,
@@ -893,7 +841,6 @@ prompts:
                 "main".to_owned(),
                 WorkflowPromptDefinition {
                     title: "Main".to_owned(),
-                    is_interactive: false,
                     fallback_route: NO_ROUTE_ERROR.to_owned(),
                     prompt: Some("hello".to_owned()),
                     parallel: None,

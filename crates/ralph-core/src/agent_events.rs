@@ -541,12 +541,10 @@ entrypoint: alpha
 prompts:
   alpha:
     title: Alpha
-    is_interactive: false
     fallback-route: no-route-error
     prompt: hello
   beta:
     title: Beta
-    is_interactive: false
     fallback-route: no-route-error
     prompt: world
 "#,

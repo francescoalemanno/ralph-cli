@@ -16,7 +16,6 @@ request:
 prompts:
   decompose:
     title: Decomposer
-    is_interactive: false
     fallback-route: builder
     prompt: |
       # OPERATIONAL PROGRAM
@@ -63,7 +62,6 @@ prompts:
 
   builder:
     title: Builder
-    is_interactive: false
     fallback-route: builder
     prompt: |
       {ralph-skill-emit}
@@ -103,7 +101,6 @@ prompts:
 
   verify:
     title: Verifier
-    is_interactive: false
     fallback-route: verify
     prompt: |
       {ralph-skill-emit}

@@ -6,12 +6,10 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
-    AgentConfig, AppConfig, LastRunStatus, RunnerConfig, WorkflowDefinition, WorkflowSummary,
-    list_workflows, load_workflow,
+    AgentConfig, AppConfig, LastRunStatus, WorkflowDefinition, WorkflowSummary, list_workflows,
+    load_workflow,
 };
-use ralph_runner::{
-    CommandRunner, InteractiveSessionInvocation, InteractiveSessionOutcome, RunnerAdapter,
-};
+use ralph_runner::CommandRunner;
 
 pub use console::ConsoleDelegate;
 pub use workflow_run::{WorkflowRequestInput, WorkflowRunInput};
@@ -136,14 +134,6 @@ pub trait RunDelegate: Send {
             "planning draft review is not supported by this run delegate"
         ))
     }
-
-    async fn run_interactive_session(
-        &mut self,
-        _config: &RunnerConfig,
-        _invocation: &InteractiveSessionInvocation,
-    ) -> Result<Option<InteractiveSessionOutcome>> {
-        Ok(None)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -238,18 +228,5 @@ impl<R> RalphApp<R> {
 
     pub fn read_utf8_file(&self, path: &Utf8Path) -> Result<String> {
         std::fs::read_to_string(path).map_err(|error| anyhow!("failed to read {}: {error}", path))
-    }
-}
-
-impl<R> RalphApp<R>
-where
-    R: RunnerAdapter,
-{
-    pub fn run_interactive_session_with_config(
-        &self,
-        config: &RunnerConfig,
-        invocation: &InteractiveSessionInvocation,
-    ) -> Result<InteractiveSessionOutcome> {
-        self.runner.run_interactive_session(config, invocation)
     }
 }

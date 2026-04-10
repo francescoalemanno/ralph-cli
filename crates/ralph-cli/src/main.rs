@@ -182,7 +182,6 @@ fn is_run_usage_error(error: &anyhow::Error) -> bool {
         "opening the runner TUI accepts at most one preloaded request source",
         "stdin preloading is not supported in TUI mode",
         "provide the workflow request in exactly one runtime form",
-        "cannot use stdin as the request source because interactive prompts need the terminal",
         "does not accept argv requests",
         "does not accept stdin requests",
         "does not accept --request-file",
@@ -429,7 +428,6 @@ request:
 prompts:
   main:
     title: Main
-    is_interactive: false
     fallback-route: no-route-error
     prompt: |
       state={ralph-option:state-file}

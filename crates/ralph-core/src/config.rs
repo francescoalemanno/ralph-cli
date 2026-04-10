@@ -599,8 +599,7 @@ mod tests {
                     name: "Custom".to_owned(),
                     builtin: false,
                     hidden: false,
-                    non_interactive: crate::CodingAgent::Codex.definition().non_interactive,
-                    interactive: crate::CodingAgent::Codex.definition().interactive,
+                    runner: crate::CodingAgent::Codex.definition().runner,
                 }]),
                 ..Default::default()
             },
@@ -685,8 +684,7 @@ mod tests {
                     name: "Custom".to_owned(),
                     builtin: false,
                     hidden: false,
-                    non_interactive: crate::CodingAgent::Codex.definition().non_interactive,
-                    interactive: crate::CodingAgent::Codex.definition().interactive,
+                    runner: crate::CodingAgent::Codex.definition().runner,
                 }]),
                 default_agent: Some("custom".to_owned()),
                 ..Default::default()
@@ -717,8 +715,7 @@ mod tests {
             name: name.to_owned(),
             builtin: false,
             hidden: false,
-            non_interactive: runner.clone(),
-            interactive: runner,
+            runner,
         }
     }
 
@@ -737,8 +734,7 @@ mod tests {
             name: name.to_owned(),
             builtin: false,
             hidden: false,
-            non_interactive: runner.clone(),
-            interactive: runner,
+            runner,
         }
     }
 }

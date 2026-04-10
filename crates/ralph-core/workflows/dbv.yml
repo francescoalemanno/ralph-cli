@@ -16,7 +16,6 @@ request:
 prompts:
   dispatch:
     title: Dispatcher
-    is_interactive: false
     fallback-route: dispatch
     prompt: |
       {ralph-skill-emit}
@@ -44,7 +43,6 @@ prompts:
       END USER REQUEST >>> 
   build:
     title: Builder
-    is_interactive: false
     fallback-route: dispatch
     prompt: |
       # Execution policy
@@ -72,7 +70,6 @@ prompts:
 
   decompose:
     title: Decomposer
-    is_interactive: false
     fallback-route: dispatch
     prompt: |
       # Execution policy
@@ -100,7 +97,6 @@ prompts:
 
   verify:
     title: Verifier
-    is_interactive: false
     fallback-route: verify
     prompt: |
       {ralph-skill-emit}

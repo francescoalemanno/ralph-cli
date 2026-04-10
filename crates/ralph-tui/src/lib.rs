@@ -22,10 +22,9 @@ use ralph_app::{
     WorkflowRunInput, format_iteration_banner,
 };
 use ralph_core::{
-    LastRunStatus, RunControl, RunnerConfig, WorkflowDefinition, WorkflowRunSummary,
-    WorkflowRuntimeRequest, atomic_write,
+    LastRunStatus, RunControl, WorkflowDefinition, WorkflowRunSummary, WorkflowRuntimeRequest,
+    atomic_write,
 };
-use ralph_runner::{InteractiveSessionInvocation, InteractiveSessionOutcome};
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
@@ -111,11 +110,6 @@ enum UiEvent {
     PlanningDraftReview {
         draft: PlanningDraftReview,
         reply: oneshot::Sender<Result<PlanningDraftDecision, String>>,
-    },
-    InteractiveSession {
-        config: RunnerConfig,
-        invocation: InteractiveSessionInvocation,
-        reply: oneshot::Sender<Result<InteractiveSessionOutcome, String>>,
     },
 }
 
@@ -591,7 +585,7 @@ impl TuiApp {
     fn handle_ui_event(
         &mut self,
         event: UiEvent,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        _terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<()> {
         match event {
             UiEvent::RunEvent(event) => {
@@ -695,63 +689,9 @@ impl TuiApp {
                     reply,
                 }));
             }
-            UiEvent::InteractiveSession {
-                config,
-                invocation,
-                reply,
-            } => {
-                if let Some(running) = self.running.as_mut() {
-                    running.push_terminal_text(&format!(
-                        "\n[interactive session: {}]\n",
-                        invocation.session_name
-                    ));
-                }
-
-                let outcome =
-                    self.run_interactive_session_in_terminal(terminal, &config, &invocation);
-
-                if let Some(running) = self.running.as_mut() {
-                    match &outcome {
-                        Ok(result) => {
-                            running.push_terminal_text(&format!(
-                                "\n[interactive session exited with code {}]\n",
-                                result.exit_code.unwrap_or(-1)
-                            ));
-                        }
-                        Err(error) => {
-                            running.push_terminal_text(&format!(
-                                "\n[interactive session failed: {error}]\n"
-                            ));
-                        }
-                    }
-                }
-
-                let _ = reply.send(outcome);
-            }
         }
 
         Ok(())
-    }
-
-    fn run_interactive_session_in_terminal(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-        config: &RunnerConfig,
-        invocation: &InteractiveSessionInvocation,
-    ) -> Result<InteractiveSessionOutcome, String> {
-        suspend_terminal(terminal).map_err(|error| error.to_string())?;
-        let outcome = self
-            .app
-            .run_interactive_session_with_config(config, invocation)
-            .map_err(|error| error.to_string());
-        let resume_result = resume_terminal(terminal).map_err(|error| error.to_string());
-
-        match (outcome, resume_result) {
-            (Ok(outcome), Ok(())) => Ok(outcome),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(error), Err(resume_error)) => Err(format!("{error}; {resume_error}")),
-        }
     }
 
     fn apply_preloaded_request(&mut self, preload: TuiPreloadedRequest) {
@@ -1921,26 +1861,6 @@ impl RunDelegate for TuiRunDelegate {
             .map_err(|_| anyhow!("planning draft reply channel closed"))?
             .map_err(anyhow::Error::msg)
     }
-
-    async fn run_interactive_session(
-        &mut self,
-        config: &RunnerConfig,
-        invocation: &InteractiveSessionInvocation,
-    ) -> Result<Option<InteractiveSessionOutcome>> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(UiEvent::InteractiveSession {
-                config: config.clone(),
-                invocation: invocation.clone(),
-                reply: reply_tx,
-            })
-            .map_err(|_| anyhow!("TUI event channel closed"))?;
-        let outcome = reply_rx
-            .await
-            .map_err(|_| anyhow!("interactive session reply channel closed"))?
-            .map_err(anyhow::Error::msg)?;
-        Ok(Some(outcome))
-    }
 }
 
 #[cfg(test)]
@@ -2085,7 +2005,7 @@ mod tests {
             app,
             runtime.handle().clone(),
             TuiLaunchOptions {
-                preset_workflow: Some("task-based".to_owned()),
+                preset_workflow: Some("default".to_owned()),
                 preloaded_request: Some(TuiPreloadedRequest {
                     source: TuiRequestSource::Argv,
                     text: "ship it".to_owned(),
@@ -2096,7 +2016,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(tui.workflow_id, "task-based");
+        assert_eq!(tui.workflow_id, "default");
         assert_eq!(tui.request_text, "ship it");
         assert_eq!(tui.request_origin, RequestOrigin::Argv);
         assert!(tui.auto_start_run);
@@ -2154,13 +2074,7 @@ id = "one"
 name = "One"
 builtin = false
 
-[agents.non_interactive]
-mode = "shell"
-command = "echo ok"
-prompt_input = "argv"
-prompt_env_var = "PROMPT"
-
-[agents.interactive]
+[agents.runner]
 mode = "shell"
 command = "echo ok"
 prompt_input = "argv"
@@ -2171,13 +2085,7 @@ id = "two"
 name = "Two"
 builtin = false
 
-[agents.non_interactive]
-mode = "shell"
-command = "echo ok"
-prompt_input = "argv"
-prompt_env_var = "PROMPT"
-
-[agents.interactive]
+[agents.runner]
 mode = "shell"
 command = "echo ok"
 prompt_input = "argv"

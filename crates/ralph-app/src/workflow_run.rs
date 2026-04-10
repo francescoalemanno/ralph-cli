@@ -16,9 +16,7 @@ use ralph_core::{
     latest_agent_event_body_from_wal_in_channel, load_workflow, read_agent_events_since,
     reduce_loop_control, validate_agent_event, workflow_option_flag,
 };
-use ralph_runner::{
-    InteractiveSessionInvocation, RunnerAdapter, RunnerStreamEvent, format_event_notice,
-};
+use ralph_runner::{RunnerAdapter, RunnerStreamEvent, format_event_notice};
 use tokio::{
     sync::{Mutex as AsyncMutex, mpsc::unbounded_channel},
     task::JoinSet,
@@ -173,42 +171,26 @@ where
                 )?;
 
                 let wal_offset = current_agent_events_offset(&run_dir)?;
-                let exit_code = if prompt.is_interactive {
-                    self.run_interactive_workflow_prompt(
-                        InteractiveSessionInvocation {
-                            session_name: current_prompt_id.clone(),
-                            initial_prompt: prompt_text,
-                            project_dir: self.project_dir.clone(),
-                            run_dir: run_dir.clone(),
-                            run_id: Some(run_id.clone()),
-                            prompt_path: Some(workflow_path.clone()),
-                        },
-                        &control,
-                        delegate,
-                    )
-                    .await?
-                } else {
-                    let config = self.non_interactive_runner_config_for(&control)?;
-                    execute_runner(
-                        &self.runner,
-                        &config,
-                        RunnerInvocation {
-                            run_id: run_id.clone(),
-                            channel_id: MAIN_CHANNEL_ID.to_owned(),
-                            prompt_text,
-                            project_dir: self.project_dir.clone(),
-                            run_dir: run_dir.clone(),
-                            prompt_path: workflow_path.clone(),
-                            prompt_name: current_prompt_id.clone(),
-                        },
-                        &control,
-                        wal_write_lock.clone(),
-                        true,
-                        delegate,
-                    )
-                    .await?
-                    .exit_code
-                };
+                let config = self.runner_config_for(&control)?;
+                let exit_code = execute_runner(
+                    &self.runner,
+                    &config,
+                    RunnerInvocation {
+                        run_id: run_id.clone(),
+                        channel_id: MAIN_CHANNEL_ID.to_owned(),
+                        prompt_text,
+                        project_dir: self.project_dir.clone(),
+                        run_dir: run_dir.clone(),
+                        prompt_path: workflow_path.clone(),
+                        prompt_name: current_prompt_id.clone(),
+                    },
+                    &control,
+                    wal_write_lock.clone(),
+                    true,
+                    delegate,
+                )
+                .await?
+                .exit_code;
 
                 if exit_code != 0 {
                     let message = format!("runner exited with code {}", exit_code);
@@ -586,7 +568,7 @@ where
             return Err(anyhow!("operation canceled"));
         }
 
-        let config = self.non_interactive_runner_config_for(control)?;
+        let config = self.runner_config_for(control)?;
         let (ui_tx, mut ui_rx) = unbounded_channel();
         let mut join_set = JoinSet::new();
         let mut worker_count = 0usize;
@@ -760,12 +742,6 @@ where
         }
 
         if let Some(runtime) = &request.runtime {
-            if workflow.has_interactive_prompts() && request_input.stdin.is_some() {
-                return Err(anyhow!(
-                    "workflow '{}' cannot use stdin as the request source because interactive prompts need the terminal; use argv or --request-file instead",
-                    workflow.workflow_id
-                ));
-            }
             return self.resolve_runtime_request(workflow, runtime, request_input);
         }
 
@@ -889,7 +865,7 @@ where
             .join(run_id)
     }
 
-    fn non_interactive_runner_config_for(&self, control: &RunControl) -> Result<RunnerConfig> {
+    fn runner_config_for(&self, control: &RunControl) -> Result<RunnerConfig> {
         let agent_id = control
             .agent_id()
             .unwrap_or_else(|| self.config.agent_id().to_owned());
@@ -897,42 +873,7 @@ where
             .config
             .agent_definition(&agent_id)
             .ok_or_else(|| anyhow!("agent '{}' is not defined", agent_id))?;
-        Ok(agent.non_interactive.clone())
-    }
-
-    fn interactive_runner_config_for(&self, control: &RunControl) -> Result<RunnerConfig> {
-        let agent_id = control
-            .agent_id()
-            .unwrap_or_else(|| self.config.agent_id().to_owned());
-        let agent = self
-            .config
-            .agent_definition(&agent_id)
-            .ok_or_else(|| anyhow!("agent '{}' is not defined", agent_id))?;
-        Ok(agent.interactive.clone())
-    }
-
-    async fn run_interactive_workflow_prompt<D>(
-        &self,
-        invocation: InteractiveSessionInvocation,
-        control: &RunControl,
-        delegate: &mut D,
-    ) -> Result<i32>
-    where
-        D: RunDelegate,
-    {
-        if control.is_cancelled() {
-            return Err(anyhow!("operation canceled"));
-        }
-        let config = self.interactive_runner_config_for(control)?;
-        let outcome = if let Some(outcome) = delegate
-            .run_interactive_session(&config, &invocation)
-            .await?
-        {
-            outcome
-        } else {
-            self.runner.run_interactive_session(&config, &invocation)?
-        };
-        Ok(outcome.exit_code.unwrap_or(-1))
+        Ok(agent.runner.clone())
     }
 }
 
@@ -1515,9 +1456,7 @@ mod tests {
     use async_trait::async_trait;
     use camino::Utf8PathBuf;
     use ralph_core::{AppConfig, RunControl, RunnerInvocation, RunnerResult};
-    use ralph_runner::{
-        InteractiveSessionInvocation, InteractiveSessionOutcome, RunnerAdapter, RunnerStreamEvent,
-    };
+    use ralph_runner::{RunnerAdapter, RunnerStreamEvent};
     use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, mpsc::UnboundedSender};
 
     use crate::workflow_run::{
@@ -1565,7 +1504,6 @@ mod tests {
     #[derive(Clone, Default)]
     struct WorkflowSpyRunner {
         invocations: Arc<Mutex<Vec<RunnerInvocation>>>,
-        interactive_invocations: Arc<Mutex<Vec<InteractiveSessionInvocation>>>,
         events: Arc<Mutex<WorkflowEventQueue>>,
         channel_events: Arc<Mutex<BTreeMap<String, WorkflowEventBatch>>>,
     }
@@ -1603,37 +1541,6 @@ mod tests {
                 output: String::new(),
                 exit_code: 0,
             })
-        }
-
-        fn run_interactive_session(
-            &self,
-            _config: &ralph_core::RunnerConfig,
-            invocation: &InteractiveSessionInvocation,
-        ) -> Result<InteractiveSessionOutcome> {
-            self.interactive_invocations
-                .lock()
-                .unwrap()
-                .push(invocation.clone());
-            ralph_core::append_agent_event(
-                &invocation.run_dir,
-                &ralph_core::AgentEventRecord {
-                    v: 1,
-                    ts_unix_ms: 1,
-                    run_id: invocation.run_id.clone().unwrap_or_default(),
-                    channel_id: ralph_core::MAIN_CHANNEL_ID.to_owned(),
-                    event: "loop-stop:ok".to_owned(),
-                    body: "done".to_owned(),
-                    project_dir: invocation.project_dir.clone(),
-                    run_dir: invocation.run_dir.clone(),
-                    prompt_path: invocation
-                        .prompt_path
-                        .clone()
-                        .unwrap_or_else(|| invocation.project_dir.clone()),
-                    prompt_name: invocation.session_name.clone(),
-                    pid: 1,
-                },
-            )?;
-            Ok(InteractiveSessionOutcome { exit_code: Some(0) })
         }
     }
 
@@ -1710,13 +1617,11 @@ request:
 prompts:
   alpha:
     title: Alpha
-    is_interactive: false
     fallback-route: no-route-error
     prompt: |
       request={ralph-request}
   beta:
     title: Beta
-    is_interactive: false
     fallback-route: no-route-error
     prompt: |
       project={ralph-env:PROJECT_DIR}
@@ -1784,7 +1689,6 @@ request:
 prompts:
   reviews:
     title: Reviews
-    is_interactive: false
     fallback-route: fixer
     parallel:
       workers:
@@ -1802,7 +1706,6 @@ prompts:
             correctness {ralph-request}
   fixer:
     title: Fixer
-    is_interactive: false
     fallback-route: no-route-error
     prompt: |
       fix with all reviews
@@ -1887,118 +1790,6 @@ prompts:
     }
 
     #[tokio::test]
-    async fn interactive_workflow_prompts_pass_run_id_and_prompt_path() -> Result<()> {
-        let temp = tempfile::tempdir().unwrap();
-        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let config_home = temp.path().join("config-home");
-        fs::create_dir_all(config_home.join("workflows")).unwrap();
-        let _config_home = ScopedConfigHome::new(&config_home).await;
-        fs::write(
-            config_home.join("workflows/interactive-flow.yml"),
-            r#"
-version: 1
-workflow_id: interactive-flow
-title: Interactive Flow
-entrypoint: main
-request:
-  runtime:
-    argv: true
-prompts:
-  main:
-    title: Main
-    is_interactive: true
-    fallback-route: no-route-ok
-    prompt: |
-      hello {ralph-request}
-"#,
-        )?;
-
-        let runner = WorkflowSpyRunner::default();
-        let app = RalphApp::new(project_dir, AppConfig::default(), runner.clone());
-        let mut delegate = TestDelegate::default();
-        let summary = app
-            .run_workflow(
-                "interactive-flow",
-                WorkflowRunInput {
-                    request: WorkflowRequestInput {
-                        argv: Some("rough idea".to_owned()),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-                &mut delegate,
-            )
-            .await?;
-
-        let invocation = runner
-            .interactive_invocations
-            .lock()
-            .unwrap()
-            .first()
-            .cloned()
-            .unwrap();
-        assert_eq!(summary.status, ralph_core::LastRunStatus::Completed);
-        assert_eq!(invocation.run_id.as_deref(), Some(summary.run_id.as_str()));
-        assert!(invocation.prompt_path.is_some());
-        assert!(invocation.initial_prompt.contains("rough idea"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn interactive_workflow_rejects_stdin_request_source() {
-        let temp = tempfile::tempdir().unwrap();
-        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
-        let config_home = temp.path().join("config-home");
-        fs::create_dir_all(config_home.join("workflows")).unwrap();
-        let _config_home = ScopedConfigHome::new(&config_home).await;
-        fs::write(
-            config_home.join("workflows/interactive-flow.yml"),
-            r#"
-version: 1
-workflow_id: interactive-flow
-title: Interactive Flow
-entrypoint: main
-request:
-  runtime:
-    argv: true
-    stdin: true
-prompts:
-  main:
-    title: Main
-    is_interactive: true
-    fallback-route: no-route-ok
-    prompt: |
-      hello {ralph-request}
-"#,
-        )
-        .unwrap();
-
-        let app = RalphApp::new(
-            project_dir,
-            AppConfig::default(),
-            WorkflowSpyRunner::default(),
-        );
-        let mut delegate = TestDelegate::default();
-        let error = app
-            .run_workflow(
-                "interactive-flow",
-                WorkflowRunInput {
-                    request: WorkflowRequestInput {
-                        stdin: Some("rough idea".to_owned()),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-                &mut delegate,
-            )
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("cannot use stdin as the request source"));
-    }
-
-    #[tokio::test]
     async fn run_workflow_interpolates_declared_option_values() -> Result<()> {
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
@@ -2021,7 +1812,6 @@ request:
 prompts:
   main:
     title: Main
-    is_interactive: false
     fallback-route: no-route-error
     prompt: |
       state={ralph-option:state-file}
@@ -2078,7 +1868,6 @@ request:
 prompts:
   plan:
     title: Plan
-    is_interactive: false
     fallback-route: no-route-error
     prompt: plan {ralph-request}
 "#,
@@ -2167,7 +1956,6 @@ request:
 prompts:
   plan:
     title: Plan
-    is_interactive: false
     fallback-route: no-route-error
     prompt: plan {ralph-request}
 "#,

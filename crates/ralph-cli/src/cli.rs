@@ -40,9 +40,9 @@ const INIT_MAX_ITERATIONS_HELP: &str =
 const FORCE_HELP: &str = "Overwrite an existing project config file";
 const RUN_AFTER_HELP: &str = "\
 Examples:
-  ralph run task-based \"fix the failing tests\"
-  ralph run task-based --file REQ.md
-  cat REQ.md | ralph run --cli task-based";
+  ralph run default \"fix the failing tests\"
+  ralph run default --file REQ.md
+  cat REQ.md | ralph run --cli bare";
 const GET_LONG_ABOUT: &str = "\
 Print the most recent payload stored for an event in the current Ralph run WAL.
 

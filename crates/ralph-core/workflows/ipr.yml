@@ -18,7 +18,6 @@ options:
 prompts:
   task:
     title: Task executor
-    is_interactive: false
     fallback-route: task
     prompt: |
       {ralph-skill-emit}
@@ -61,7 +60,6 @@ prompts:
 
   review-first-fanout:
     title: First review fanout
-    is_interactive: false
     fallback-route: review-first-fix
     parallel:
       workers:
@@ -296,7 +294,6 @@ prompts:
 
   review-first-fix:
     title: First review fix pass
-    is_interactive: false
     fallback-route: no-route-error
     prompt: |
       {ralph-skill-emit}
@@ -340,7 +337,6 @@ prompts:
 
   review-second-fanout:
     title: Second review fanout
-    is_interactive: false
     fallback-route: review-second-fix
     parallel:
       workers:
@@ -425,7 +421,6 @@ prompts:
 
   review-second-fix:
     title: Second review evaluation
-    is_interactive: false
     fallback-route: no-route-error
     prompt: |
       {ralph-skill-emit}
@@ -467,7 +462,6 @@ prompts:
 
   finalize:
     title: Finalize
-    is_interactive: false
     fallback-route: no-route-error
     prompt: |
       {ralph-skill-emit}

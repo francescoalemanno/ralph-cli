@@ -809,7 +809,6 @@ dependencies = [
  "camino",
  "libc",
  "ralph-core",
- "tempfile",
  "tokio",
  "tracing",
 ]

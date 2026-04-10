@@ -15,7 +15,6 @@ request:
 prompts:
   plan:
     title: Planner
-    is_interactive: false
     fallback-route: plan
     prompt: |
       {ralph-skill-emit}
