@@ -113,22 +113,47 @@ impl WorkflowDefinition {
                     prompt.fallback_route
                 ));
             }
-            if prompt.prompt.contains(REMOVED_RUN_DIR_TOKEN) {
-                return Err(anyhow!(
-                    "workflow '{}' prompt '{}' uses unsupported interpolation '{}'; use '{}' or plain project-relative paths instead",
-                    self.workflow_id,
-                    prompt_id,
-                    REMOVED_RUN_DIR_TOKEN,
-                    PROJECT_DIR_TOKEN
-                ));
-            }
-            for option_id in referenced_option_ids(&prompt.prompt) {
-                if !self.options.contains_key(option_id) {
+            match (&prompt.prompt, &prompt.parallel) {
+                (Some(prompt_text), None) => {
+                    self.validate_prompt_text(prompt_id, prompt_text)?;
+                }
+                (None, Some(parallel)) => {
+                    if prompt.is_interactive {
+                        return Err(anyhow!(
+                            "workflow '{}' prompt '{}' cannot be interactive when it uses parallel workers",
+                            self.workflow_id,
+                            prompt_id
+                        ));
+                    }
+                    if parallel.workers.is_empty() {
+                        return Err(anyhow!(
+                            "workflow '{}' prompt '{}' must define at least one parallel worker",
+                            self.workflow_id,
+                            prompt_id
+                        ));
+                    }
+                    for (worker_id, worker) in &parallel.workers {
+                        validate_worker_id(worker_id).with_context(|| {
+                            format!(
+                                "workflow '{}' prompt '{}' has invalid worker id '{}'",
+                                self.workflow_id, prompt_id, worker_id
+                            )
+                        })?;
+                        self.validate_prompt_text(prompt_id, &worker.prompt)?;
+                    }
+                }
+                (Some(_), Some(_)) => {
                     return Err(anyhow!(
-                        "workflow '{}' prompt '{}' references undefined option '{}'",
+                        "workflow '{}' prompt '{}' must define exactly one of 'prompt' or 'parallel'",
                         self.workflow_id,
-                        prompt_id,
-                        option_id
+                        prompt_id
+                    ));
+                }
+                (None, None) => {
+                    return Err(anyhow!(
+                        "workflow '{}' prompt '{}' must define either 'prompt' or 'parallel'",
+                        self.workflow_id,
+                        prompt_id
                     ));
                 }
             }
@@ -193,9 +218,18 @@ impl WorkflowDefinition {
     }
 
     pub fn uses_request_token(&self) -> bool {
-        self.prompts
-            .values()
-            .any(|prompt| prompt.prompt.contains(REQUEST_TOKEN))
+        self.prompts.values().any(|prompt| {
+            prompt
+                .prompt
+                .as_deref()
+                .is_some_and(|prompt_text| prompt_text.contains(REQUEST_TOKEN))
+                || prompt.parallel.as_ref().is_some_and(|parallel| {
+                    parallel
+                        .workers
+                        .values()
+                        .any(|worker| worker.prompt.contains(REQUEST_TOKEN))
+                })
+        })
     }
 
     pub fn has_interactive_prompts(&self) -> bool {
@@ -217,6 +251,49 @@ impl WorkflowDefinition {
     fn is_valid_route(&self, route: &str) -> bool {
         matches!(route, NO_ROUTE_OK | NO_ROUTE_ERROR) || self.prompts.contains_key(route)
     }
+
+    fn validate_prompt_text(&self, prompt_id: &str, prompt_text: &str) -> Result<()> {
+        if prompt_text.contains(REMOVED_RUN_DIR_TOKEN) {
+            return Err(anyhow!(
+                "workflow '{}' prompt '{}' uses unsupported interpolation '{}'; use '{}' or plain project-relative paths instead",
+                self.workflow_id,
+                prompt_id,
+                REMOVED_RUN_DIR_TOKEN,
+                PROJECT_DIR_TOKEN
+            ));
+        }
+        for option_id in referenced_option_ids(prompt_text) {
+            if !self.options.contains_key(option_id) {
+                return Err(anyhow!(
+                    "workflow '{}' prompt '{}' references undefined option '{}'",
+                    self.workflow_id,
+                    prompt_id,
+                    option_id
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_worker_id(worker_id: &str) -> Result<()> {
+    let trimmed = worker_id.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("worker id cannot be empty"));
+    }
+
+    for ch in trimmed.chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => {}
+            _ => {
+                return Err(anyhow!(
+                    "worker ids may only use ASCII letters, digits, '-' or '_'"
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +302,32 @@ pub struct WorkflowPromptDefinition {
     pub is_interactive: bool,
     #[serde(rename = "fallback-route")]
     pub fallback_route: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub parallel: Option<WorkflowParallelDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowParallelJoin {
+    #[default]
+    WaitAll,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowParallelDefinition {
+    #[serde(default)]
+    pub join: WorkflowParallelJoin,
+    #[serde(default)]
+    pub fail_fast: bool,
+    pub workers: BTreeMap<String, WorkflowParallelWorkerDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowParallelWorkerDefinition {
+    #[serde(default)]
+    pub title: Option<String>,
     pub prompt: String,
 }
 
@@ -437,7 +540,7 @@ struct BuiltinWorkflow {
     contents: &'static str,
 }
 
-fn builtin_workflows() -> [BuiltinWorkflow; 7] {
+fn builtin_workflows() -> [BuiltinWorkflow; 8] {
     [
         BuiltinWorkflow {
             file_name: "bare.yml",
@@ -462,6 +565,10 @@ fn builtin_workflows() -> [BuiltinWorkflow; 7] {
         BuiltinWorkflow {
             file_name: "pdd.yml",
             contents: include_str!("../workflows/pdd.yml"),
+        },
+        BuiltinWorkflow {
+            file_name: "ipr.yml",
+            contents: include_str!("../workflows/ipr.yml"),
         },
         BuiltinWorkflow {
             file_name: "test-workflow.yml",
@@ -508,6 +615,7 @@ mod tests {
             assert!(workflow_dir.join("default.yml").exists());
             assert!(workflow_dir.join("task-based.yml").exists());
             assert!(workflow_dir.join("pdd.yml").exists());
+            assert!(workflow_dir.join("ipr.yml").exists());
             assert!(workflow_dir.join("test-workflow.yml").exists());
         });
     }
@@ -549,6 +657,11 @@ mod tests {
             assert!(
                 workflows
                     .iter()
+                    .any(|workflow| workflow.workflow_id == "ipr")
+            );
+            assert!(
+                workflows
+                    .iter()
                     .all(|workflow| workflow.workflow_id != "test-workflow")
             );
         });
@@ -572,6 +685,11 @@ mod tests {
                 workflows
                     .iter()
                     .any(|workflow| workflow.workflow_id == "simple")
+            );
+            assert!(
+                workflows
+                    .iter()
+                    .any(|workflow| workflow.workflow_id == "ipr")
             );
             assert!(
                 workflows
@@ -660,7 +778,8 @@ prompts:
                     title: "Main".to_owned(),
                     is_interactive: false,
                     fallback_route: NO_ROUTE_ERROR.to_owned(),
-                    prompt: "hello".to_owned(),
+                    prompt: Some("hello".to_owned()),
+                    parallel: None,
                 },
             )]),
             source_path: None,
@@ -687,7 +806,8 @@ prompts:
                     title: "Main".to_owned(),
                     is_interactive: false,
                     fallback_route: NO_ROUTE_ERROR.to_owned(),
-                    prompt: "{ralph-env:RUN_DIR}/progress.txt".to_owned(),
+                    prompt: Some("{ralph-env:RUN_DIR}/progress.txt".to_owned()),
+                    parallel: None,
                 },
             )]),
             source_path: None,
@@ -715,7 +835,8 @@ prompts:
                     title: "Main".to_owned(),
                     is_interactive: false,
                     fallback_route: NO_ROUTE_ERROR.to_owned(),
-                    prompt: "{ralph-option:progress-file}".to_owned(),
+                    prompt: Some("{ralph-option:progress-file}".to_owned()),
+                    parallel: None,
                 },
             )]),
             source_path: None,
@@ -759,7 +880,8 @@ prompts:
                     title: "Main".to_owned(),
                     is_interactive: false,
                     fallback_route: NO_ROUTE_ERROR.to_owned(),
-                    prompt: "hello".to_owned(),
+                    prompt: Some("hello".to_owned()),
+                    parallel: None,
                 },
             )]),
             source_path: None,
@@ -784,18 +906,20 @@ prompts:
             load_workflow_from_path_for_test(&path, include_str!("../workflows/dbv.yml")).unwrap();
 
         let dispatch = workflow.prompt("dispatch").expect("dispatch prompt");
-        assert!(dispatch.prompt.contains(
+        let dispatch_prompt = dispatch.prompt.as_deref().expect("dispatch prompt text");
+        assert!(dispatch_prompt.contains(
             "Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST appear explicitly"
         ));
-        assert!(dispatch.prompt.contains(
+        assert!(dispatch_prompt.contains(
             "If any material part of the request is missing from the plan or only implicitly covered"
         ));
 
         let decompose = workflow.prompt("decompose").expect("decompose prompt");
-        assert!(decompose.prompt.contains(
+        let decompose_prompt = decompose.prompt.as_deref().expect("decompose prompt text");
+        assert!(decompose_prompt.contains(
             "Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST become explicit"
         ));
-        assert!(decompose.prompt.contains(
+        assert!(decompose_prompt.contains(
             "If any material part of the request is not represented explicitly in the plan"
         ));
     }
