@@ -30,6 +30,7 @@ const RUN_CLI_HELP: &str = "Run in CLI mode instead of opening the TUI";
 const RUN_AGENT_HELP: &str = "Override the configured coding agent for this run";
 const RUN_MAX_ITERATIONS_HELP: &str = "Override the configured workflow iteration limit";
 const GET_EVENT_HELP: &str = "Event name whose latest payload should be printed";
+const GET_CHANNEL_HELP: &str = "Optional channel ID to filter the event lookup";
 const CONFIG_SCOPE_WRITE_HELP: &str = "Config scope to update";
 const CONFIG_SCOPE_VIEW_HELP: &str = "Config view to render";
 const INIT_AGENT_HELP: &str = "Persist this agent as the project default";
@@ -45,6 +46,8 @@ Examples:
 const GET_LONG_ABOUT: &str = "\
 Print the most recent payload stored for an event in the current Ralph run WAL.
 
+Without `--channel`, the lookup scans all channels in the current run.
+
 This command only works inside a Ralph agent run.";
 
 const PROJECT_DIR_ARG: &str = "project_dir";
@@ -54,6 +57,7 @@ const MAX_ITERATIONS_ARG: &str = "max_iterations";
 const REQUEST_FILE_ARG: &str = "request_file";
 const REQUEST_ARG: &str = "request";
 const EVENT_ARG: &str = "event";
+const CHANNEL_ARG: &str = "channel";
 const WORKFLOW_ID_ARG: &str = "workflow_id";
 const SCOPE_ARG: &str = "scope";
 const EDITOR_ARG: &str = "editor";
@@ -220,6 +224,7 @@ impl RequestArgs {
 #[derive(Debug, Clone)]
 pub(crate) struct GetArgs {
     pub(crate) event: String,
+    pub(crate) channel: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -305,6 +310,12 @@ fn build_cli_command() -> Result<Command> {
                 .about("Print the latest payload for an event in the current Ralph run WAL")
                 .long_about(GET_LONG_ABOUT)
                 .arg_required_else_help(true)
+                .arg(
+                    Arg::new(CHANNEL_ARG)
+                        .long("channel")
+                        .value_name("CHANNEL")
+                        .help(GET_CHANNEL_HELP),
+                )
                 .arg(
                     Arg::new(EVENT_ARG)
                         .value_name("EVENT")
@@ -555,6 +566,7 @@ fn parse_run_args(matches: &ArgMatches) -> Result<RunArgs> {
 fn parse_get_args(matches: &ArgMatches) -> Result<GetArgs> {
     Ok(GetArgs {
         event: required_string_result(matches, EVENT_ARG)?,
+        channel: matches.get_one::<String>(CHANNEL_ARG).cloned(),
     })
 }
 
@@ -764,6 +776,7 @@ mod tests {
             let rendered = error.to_string();
 
             assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+            assert!(rendered.contains("ipr"));
             assert!(!rendered.contains("test-workflow"));
 
             let cli = Cli::try_parse_from(["ralph", "run", "test-workflow"]).unwrap();
@@ -795,6 +808,20 @@ mod tests {
                 panic!("expected get subcommand");
             };
             assert_eq!(args.event, "handoff");
+            assert_eq!(args.channel, None);
+        });
+    }
+
+    #[test]
+    fn get_subcommand_parses_optional_channel_filter() {
+        with_test_workflow_home(|| {
+            let cli = Cli::try_parse_from(["ralph", "get", "--channel", "QT", "handoff"]).unwrap();
+
+            let Commands::Get(args) = cli.command else {
+                panic!("expected get subcommand");
+            };
+            assert_eq!(args.event, "handoff");
+            assert_eq!(args.channel.as_deref(), Some("QT"));
         });
     }
 
@@ -808,7 +835,10 @@ mod tests {
                 error.kind(),
                 ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
             );
-            assert!(rendered.contains("Print the latest payload for an event in the current Ralph run WAL"));
+            assert!(
+                rendered
+                    .contains("Print the latest payload for an event in the current Ralph run WAL")
+            );
             assert!(rendered.contains("Usage:"));
             assert!(rendered.contains("ralph get"));
             assert!(rendered.contains("<EVENT>"));

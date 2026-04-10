@@ -21,8 +21,8 @@ use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_app::{ConsoleDelegate, RalphApp, WorkflowRequestInput, WorkflowRunInput};
 use ralph_core::{
-    AppConfig, ConfigFileScope, atomic_write, latest_agent_event_body_from_wal,
-    seed_builtin_workflows_if_missing,
+    AppConfig, ConfigFileScope, atomic_write, latest_agent_event_body_from_wal_in_channel,
+    load_workflow, seed_builtin_workflows_if_missing,
 };
 use ralph_tui::{
     TuiLaunchOptions, TuiPreloadedRequest, TuiRequestSource, edit_file, run_tui_with_options,
@@ -51,11 +51,18 @@ fn build_tui_launch_options(
     project_dir: &Utf8Path,
     args: &cli::RunArgs,
 ) -> Result<TuiLaunchOptions> {
+    let workflow = load_workflow(&args.workflow)
+        .with_context(|| format!("failed to load workflow '{}'", args.workflow))?;
     let argv = args.request_args.argv_text();
     let provided = args.request_args.provided_count();
-    if provided != 1 {
+    if workflow.uses_request_token() && provided == 0 {
         return Err(anyhow!(
             "opening the runner TUI requires both a workflow and a request; use `ralph run <workflow-id> \"your request\"` or `ralph run <workflow-id> --file REQ.md`"
+        ));
+    }
+    if provided > 1 {
+        return Err(anyhow!(
+            "opening the runner TUI accepts at most one preloaded request source; use argv text or `--file`, not both"
         ));
     }
 
@@ -78,7 +85,7 @@ fn build_tui_launch_options(
         (None, None) => None,
         _ => {
             return Err(anyhow!(
-                "opening the runner TUI requires both a workflow and a request; use `ralph run <workflow-id> \"your request\"` or `ralph run <workflow-id> --file REQ.md`"
+                "opening the runner TUI accepts at most one preloaded request source; use argv text or `--file`, not both"
             ));
         }
     };
@@ -172,6 +179,7 @@ fn is_run_usage_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     [
         "opening the runner TUI requires both a workflow and a request",
+        "opening the runner TUI accepts at most one preloaded request source",
         "stdin preloading is not supported in TUI mode",
         "provide the workflow request in exactly one runtime form",
         "cannot use stdin as the request source because interactive prompts need the terminal",
@@ -249,8 +257,9 @@ fn run_get(args: GetArgs) -> Result<()> {
     }
 
     let wal_path = env_utf8_path("RALPH_WAL_PATH")?;
-    let body = latest_agent_event_body_from_wal(&wal_path, &event)?
-        .ok_or_else(|| anyhow!("no event with name {event}"))?;
+    let body =
+        latest_agent_event_body_from_wal_in_channel(&wal_path, &event, args.channel.as_deref())?
+            .ok_or_else(|| anyhow!("no event with name {event}"))?;
     println!("{body}");
     Ok(())
 }
@@ -456,6 +465,7 @@ mod tests {
                 v: 1,
                 ts_unix_ms: 1,
                 run_id: "run-1".to_owned(),
+                channel_id: ralph_core::MAIN_CHANNEL_ID.to_owned(),
                 event: "handoff".to_owned(),
                 body: "first".to_owned(),
                 project_dir: Utf8PathBuf::from("/tmp/project"),
@@ -472,6 +482,7 @@ mod tests {
                 v: 1,
                 ts_unix_ms: 2,
                 run_id: "run-1".to_owned(),
+                channel_id: ralph_core::MAIN_CHANNEL_ID.to_owned(),
                 event: "handoff".to_owned(),
                 body: "second".to_owned(),
                 project_dir: Utf8PathBuf::from("/tmp/project"),
@@ -489,9 +500,10 @@ mod tests {
                 ralph_core::agent_events_wal_path(&run_dir).as_str(),
             );
         }
-        let result = latest_agent_event_body_from_wal(
+        let result = latest_agent_event_body_from_wal_in_channel(
             &ralph_core::agent_events_wal_path(&run_dir),
             "handoff",
+            None,
         )
         .unwrap();
         unsafe {
@@ -502,48 +514,73 @@ mod tests {
     }
 
     #[test]
-    fn tui_launch_options_require_exactly_one_request_form() {
-        let project_dir = Utf8Path::new("/tmp/project");
-        let error = build_tui_launch_options(
-            project_dir,
-            &RunArgs {
-                cli: false,
-                runtime: RuntimeArgs::default(),
-                workflow: "fixture-flow".to_owned(),
-                workflow_options: Default::default(),
-                request_args: RequestArgs::default(),
-            },
-        )
-        .unwrap_err()
-        .to_string();
+    fn tui_launch_options_require_request_for_workflows_using_request_token() {
+        with_test_workflow_home(|| {
+            let project_dir = Utf8Path::new("/tmp/project");
+            let error = build_tui_launch_options(
+                project_dir,
+                &RunArgs {
+                    cli: false,
+                    runtime: RuntimeArgs::default(),
+                    workflow: "fixture-flow".to_owned(),
+                    workflow_options: Default::default(),
+                    request_args: RequestArgs::default(),
+                },
+            )
+            .unwrap_err()
+            .to_string();
 
-        assert!(error.contains("opening the runner TUI requires both a workflow and a request"));
-        assert!(error.contains("ralph run <workflow-id>"));
+            assert!(error.contains("opening the runner TUI requires both a workflow and a request"));
+            assert!(error.contains("ralph run <workflow-id>"));
+        });
+    }
+
+    #[test]
+    fn tui_launch_options_allow_missing_request_for_workflows_without_request_token() {
+        with_test_workflow_home(|| {
+            let project_dir = Utf8Path::new("/tmp/project");
+            let launch = build_tui_launch_options(
+                project_dir,
+                &RunArgs {
+                    cli: false,
+                    runtime: RuntimeArgs::default(),
+                    workflow: "test-workflow".to_owned(),
+                    workflow_options: Default::default(),
+                    request_args: RequestArgs::default(),
+                },
+            )
+            .unwrap();
+
+            assert_eq!(launch.preset_workflow.as_deref(), Some("test-workflow"));
+            assert!(launch.preloaded_request.is_none());
+        });
     }
 
     #[test]
     fn tui_launch_options_preserve_positional_workflow_and_argv_request() {
-        let project_dir = Utf8Path::new("/tmp/project");
-        let launch = build_tui_launch_options(
-            project_dir,
-            &RunArgs {
-                cli: false,
-                runtime: RuntimeArgs::default(),
-                workflow: "fixture-flow".to_owned(),
-                workflow_options: Default::default(),
-                request_args: RequestArgs {
-                    request_file: None,
-                    request: vec!["fix".to_owned(), "tests".to_owned()],
+        with_test_workflow_home(|| {
+            let project_dir = Utf8Path::new("/tmp/project");
+            let launch = build_tui_launch_options(
+                project_dir,
+                &RunArgs {
+                    cli: false,
+                    runtime: RuntimeArgs::default(),
+                    workflow: "fixture-flow".to_owned(),
+                    workflow_options: Default::default(),
+                    request_args: RequestArgs {
+                        request_file: None,
+                        request: vec!["fix".to_owned(), "tests".to_owned()],
+                    },
                 },
-            },
-        )
-        .unwrap();
+            )
+            .unwrap();
 
-        assert_eq!(launch.preset_workflow.as_deref(), Some("fixture-flow"));
-        let preload = launch.preloaded_request.expect("preloaded request");
-        assert_eq!(preload.source, TuiRequestSource::Argv);
-        assert_eq!(preload.text, "fix tests");
-        assert!(preload.file_path.is_none());
+            assert_eq!(launch.preset_workflow.as_deref(), Some("fixture-flow"));
+            let preload = launch.preloaded_request.expect("preloaded request");
+            assert_eq!(preload.source, TuiRequestSource::Argv);
+            assert_eq!(preload.text, "fix tests");
+            assert!(preload.file_path.is_none());
+        });
     }
 
     #[test]
