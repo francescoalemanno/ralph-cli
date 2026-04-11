@@ -21,12 +21,10 @@ prompts:
           note: "task completion ignored: plan still contains unchecked items"
     prompt: |
       {ralph-skill-emit}
-      Read the plan file at `{ralph-option:plan-file}`. Find the FIRST Task section (`### Task N:` or `### Iteration N:`) that has uncompleted checkboxes (`[ ]`).
-
+      Read the plan file at `{ralph-option:plan-file}`. 
+      Find the FIRST Task section (`### Task N:` or `### Iteration N:`) that has uncompleted checkboxes (`[ ]`).
       If the plan file is missing, unreadable, or too malformed to identify the current task truthfully, {ralph-stop:error:plan-file-unreadable} and stop immediately.
-
       If NO Task section has `[ ]` but `## Success criteria`, `## Overview`, or `## Context` still has `[ ]`: either satisfy those items and mark them `[x]` if actionable, or {ralph-stop:ok:task-stage-complete-manual-follow-up} and stop if they are verification-only items such as manual testing, deployment, or external checks. Do not loop indefinitely when the remaining items are not automatable by you.
-
       If a Task section has `[ ]` checkboxes you cannot complete because they require manual testing, deployment verification, or external systems: mark them `[x]` with a short note such as `[x] manual test (skipped - not automatable)` and proceed. Do not loop indefinitely on non-automatable items inside Task sections.
 
       CRITICAL CONSTRAINT: Complete ONE Task section per iteration.
@@ -51,7 +49,7 @@ prompts:
       - If Task sections are complete but `## Success criteria`, `## Overview`, or `## Context` has `[ ]` items that the implementation now satisfies, mark them `[x]` in the same edit.
       - Commit all changes, including the updated plan, with message: `feat: <brief task description>`.
       - Check whether any `[ ]` checkboxes remain in Task sections.
-      - If more Task sections still have `[ ]` checkboxes, STOP HERE and do not emit any loop-control event. The fallback route will rerun this prompt for the next task section.
+      - If more Task sections still have `[ ]` checkboxes, STOP HERE and do not emit any loop-control event. 
       - Else-If NO more `[ ]` checkboxes remain in Task sections, {ralph-stop:ok:task-stage-complete} and stop.
 
       If any phase fails after reasonable fix attempts, {ralph-stop:error:task-failed}.
