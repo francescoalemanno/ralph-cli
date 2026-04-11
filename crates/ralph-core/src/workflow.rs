@@ -528,7 +528,7 @@ struct BuiltinWorkflow {
     contents: &'static str,
 }
 
-fn builtin_workflows() -> [BuiltinWorkflow; 7] {
+fn builtin_workflows() -> [BuiltinWorkflow; 9] {
     [
         BuiltinWorkflow {
             file_name: "bare.yml",
@@ -543,12 +543,20 @@ fn builtin_workflows() -> [BuiltinWorkflow; 7] {
             contents: include_str!("../workflows/default.yml"),
         },
         BuiltinWorkflow {
+            file_name: "finalize.yml",
+            contents: include_str!("../workflows/finalize.yml"),
+        },
+        BuiltinWorkflow {
             file_name: "plan.yml",
             contents: include_str!("../workflows/plan.yml"),
         },
         BuiltinWorkflow {
-            file_name: "ipr.yml",
-            contents: include_str!("../workflows/ipr.yml"),
+            file_name: "review.yml",
+            contents: include_str!("../workflows/review.yml"),
+        },
+        BuiltinWorkflow {
+            file_name: "task.yml",
+            contents: include_str!("../workflows/task.yml"),
         },
         BuiltinWorkflow {
             file_name: "test-workflow.yml",
@@ -595,8 +603,10 @@ mod tests {
             assert!(workflow_dir.join("bare.yml").exists());
             assert!(workflow_dir.join("dbv.yml").exists());
             assert!(workflow_dir.join("default.yml").exists());
+            assert!(workflow_dir.join("finalize.yml").exists());
             assert!(workflow_dir.join("plan.yml").exists());
-            assert!(workflow_dir.join("ipr.yml").exists());
+            assert!(workflow_dir.join("review.yml").exists());
+            assert!(workflow_dir.join("task.yml").exists());
             assert!(workflow_dir.join("test-workflow.yml").exists());
         });
     }
@@ -623,12 +633,22 @@ mod tests {
             assert!(
                 workflows
                     .iter()
+                    .any(|workflow| workflow.workflow_id == "finalize")
+            );
+            assert!(
+                workflows
+                    .iter()
                     .any(|workflow| workflow.workflow_id == "plan")
             );
             assert!(
                 workflows
                     .iter()
-                    .any(|workflow| workflow.workflow_id == "ipr")
+                    .any(|workflow| workflow.workflow_id == "review")
+            );
+            assert!(
+                workflows
+                    .iter()
+                    .any(|workflow| workflow.workflow_id == "task")
             );
             assert!(
                 workflows
@@ -655,12 +675,22 @@ mod tests {
             assert!(
                 workflows
                     .iter()
+                    .any(|workflow| workflow.workflow_id == "finalize")
+            );
+            assert!(
+                workflows
+                    .iter()
                     .any(|workflow| workflow.workflow_id == "plan")
             );
             assert!(
                 workflows
                     .iter()
-                    .any(|workflow| workflow.workflow_id == "ipr")
+                    .any(|workflow| workflow.workflow_id == "review")
+            );
+            assert!(
+                workflows
+                    .iter()
+                    .any(|workflow| workflow.workflow_id == "task")
             );
             assert!(
                 workflows
@@ -890,7 +920,7 @@ prompts:
     }
 
     #[test]
-    fn plan_workflow_requires_wal_reads_and_disallows_probimg_ralph_bin() {
+    fn plan_workflow_requires_wal_reads_and_uses_planner_specific_state_contract() {
         let temp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(temp.path().join("plan.yml")).unwrap();
         let workflow =
@@ -902,7 +932,7 @@ prompts:
             "execute these exact commands in order to read the planning state from the WAL"
         ));
         assert!(
-            prompt.contains("do not inspect, print, `cat`, or otherwise probe `$RALPH_BIN` itself")
+            prompt.contains("those three reads are the canonical planning-state inputs for this iteration")
         );
         assert!(prompt.contains(
             "if any of those commands return content, you MUST use that content before deciding what to do next"

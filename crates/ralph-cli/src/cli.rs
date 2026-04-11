@@ -859,8 +859,10 @@ mod tests {
             let rendered = error.to_string();
 
             assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+            assert!(rendered.contains("finalize"));
             assert!(rendered.contains("plan"));
-            assert!(rendered.contains("ipr"));
+            assert!(rendered.contains("review"));
+            assert!(rendered.contains("task"));
             assert!(!rendered.contains("test-workflow"));
 
             let cli = Cli::try_parse_from(["ralph", "run", "test-workflow"]).unwrap();

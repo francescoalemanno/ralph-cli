@@ -175,7 +175,10 @@ If you provide more than one, Ralph exits with a usage error.
 | `bare` | Minimal wrapper when your request already contains the loop discipline you want. | None |
 | `default` | Repairs a durable `PLAN.md`, executes one plan item per loop, and verifies the whole project when the plan is complete. | `--planfile` (default: `PLAN.md`) |
 | `dbv` | Uses a durable `PLAN.md` as the control surface, decomposes when needed, builds one item per loop, and performs whole-project verification when the plan is complete. | `--planfile` (default: `PLAN.md`) |
+| `finalize` | Runs the best-effort finalization pass: fetch, rebase onto the base ref, tidy commits, and rerun relevant checks. | `--planfile`, `--baseref` (default: `main`) |
 | `plan` | Runs a host-mediated planner loop that explores the repo, asks one clarifying question at a time, drafts a plan, and writes the accepted markdown file under `docs/plans/`. | `--plansdir` (default: `docs/plans`) |
+| `review` | Runs the standalone multi-agent review passes and fixes confirmed findings until the branch is clean. | `--planfile`, `--baseref` (default: `main`) |
+| `task` | Executes markdown task sections one at a time until the plan's implementation stage is complete, then stops before review. | `--planfile` |
 
 List them at any time with:
 

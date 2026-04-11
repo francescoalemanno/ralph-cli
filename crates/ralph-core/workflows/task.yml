@@ -1,0 +1,51 @@
+version: 1
+workflow_id: task
+title: Task
+description: "Execute all markdown task sections one at a time until the plan's implementation stage is complete. Review and finalize remain separate workflows."
+entrypoint: task
+options:
+  plan-file:
+    help: Markdown plan file to execute.
+    value_name: FILE
+prompts:
+  task:
+    title: Task executor
+    fallback-route: task
+    prompt: |
+      {ralph-skill-emit}
+      Read the plan file at `{ralph-option:plan-file}`. Find the FIRST Task section (`### Task N:` or `### Iteration N:`) that has uncompleted checkboxes (`[ ]`).
+
+      If the plan file is missing, unreadable, or too malformed to identify the current task truthfully, {ralph-stop:error:plan-file-unreadable} and stop immediately.
+
+      If NO Task section has `[ ]` but `## Success criteria`, `## Overview`, or `## Context` still has `[ ]`: either satisfy those items and mark them `[x]` if actionable, or {ralph-stop:ok:task-stage-complete-manual-follow-up} and stop if they are verification-only items such as manual testing, deployment, or external checks. Do not loop indefinitely when the remaining items are not automatable by you.
+
+      If a Task section has `[ ]` checkboxes you cannot complete because they require manual testing, deployment verification, or external systems: mark them `[x]` with a short note such as `[x] manual test (skipped - not automatable)` and proceed. Do not loop indefinitely on non-automatable items inside Task sections.
+
+      CRITICAL CONSTRAINT: Complete ONE Task section per iteration.
+      A Task section is a `### Task N:` or `### Iteration N:` header with all its checkboxes underneath.
+      Complete ALL checkboxes in that section, then STOP.
+      Do NOT continue to the next section in the same pass.
+
+      Before starting work, output a brief overview explaining:
+      - which task number you picked and its title
+      - what the task will accomplish
+      - the key files or components involved
+
+      Implementation rules:
+      - Read the plan's Overview and Context sections to understand the work.
+      - Implement ALL items in the current Task section.
+      - Write tests for the implementation.
+      - Run the test and lint commands specified in the plan.
+      - Fix failures and repeat until validation passes.
+
+      Completion rules after validation passes:
+      - Edit `{ralph-option:plan-file}` and change `[ ]` to `[x]` for each checkbox you completed in the current Task section.
+      - If Task sections are complete but `## Success criteria`, `## Overview`, or `## Context` has `[ ]` items that the implementation now satisfies, mark them `[x]` in the same edit.
+      - Commit all changes, including the updated plan, with message: `feat: <brief task description>`.
+      - Check whether any `[ ]` checkboxes remain in Task sections.
+      - If NO more `[ ]` checkboxes remain in Task sections, {ralph-stop:ok:task-stage-complete} and stop.
+      - If more Task sections still have `[ ]` checkboxes, STOP HERE and do not emit any loop-control event. The fallback route will rerun this prompt for the next task section.
+
+      If any phase fails after reasonable fix attempts, {ralph-stop:error:task-failed}.
+
+      OUTPUT FORMAT: No markdown tables. Plain text and simple `-` lists are fine.
