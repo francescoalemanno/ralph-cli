@@ -1,6 +1,9 @@
 #![cfg(not(windows))]
 
-use std::{fs, process::{Command, Stdio}};
+use std::{
+    fs,
+    process::{Command, Stdio},
+};
 
 use camino::Utf8PathBuf;
 

@@ -889,6 +889,45 @@ prompts:
         ));
     }
 
+    #[test]
+    fn plan_workflow_requires_wal_reads_and_disallows_probimg_ralph_bin() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("plan.yml")).unwrap();
+        let workflow =
+            load_workflow_from_path_for_test(&path, include_str!("../workflows/plan.yml")).unwrap();
+
+        let planner = workflow.prompt("plan").expect("plan prompt");
+        let prompt = planner.prompt.as_deref().expect("plan prompt text");
+        assert!(prompt.contains(
+            "execute these exact commands in order to read the planning state from the WAL"
+        ));
+        assert!(
+            prompt.contains("do not inspect, print, `cat`, or otherwise probe `$RALPH_BIN` itself")
+        );
+        assert!(prompt.contains(
+            "if any of those commands return content, you MUST use that content before deciding what to do next"
+        ));
+    }
+
+    #[test]
+    fn plan_workflow_allows_question_on_revise_when_feedback_requests_missing_choices() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("plan.yml")).unwrap();
+        let workflow =
+            load_workflow_from_path_for_test(&path, include_str!("../workflows/plan.yml")).unwrap();
+
+        let planner = workflow.prompt("plan").expect("plan prompt");
+        let prompt = planner.prompt.as_deref().expect("plan prompt text");
+        assert!(
+            prompt
+                .contains("if the feedback asks for missing user choices you cannot infer safely")
+        );
+        assert!(prompt.contains("emit exactly one `planning-question` instead of a new draft"));
+        assert!(prompt.contains(
+            "do not emit a fresh draft that ignores the existing review feedback or the latest WAL draft state"
+        ));
+    }
+
     fn load_workflow_from_path_for_test(
         path: &Utf8PathBuf,
         raw: &str,

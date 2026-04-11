@@ -104,13 +104,15 @@ pub fn format_iteration_banner(
     iteration: usize,
     max_iterations: usize,
 ) -> String {
-    let title = format!(
-        " {} ITERATION {}/{} ",
-        prompt_name, iteration, max_iterations
-    );
-    let width = title.len().max(44);
-    let rule = "=".repeat(width);
-    format!("\n{rule}\n{title:=^width$}\n{rule}", width = width)
+    const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
+    const ANSI_RESET: &str = "\x1b[0m";
+
+    let title = format!(" {prompt_name} | iteration {iteration}/{max_iterations} ");
+    let width = title.len().max(72);
+    format!(
+        "{ANSI_BOLD_CYAN}{title:=^width$}{ANSI_RESET}",
+        width = width
+    )
 }
 
 #[async_trait]

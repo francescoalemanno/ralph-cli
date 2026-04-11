@@ -1,7 +1,11 @@
-use std::io::{self, BufRead, Write};
+use std::{
+    io::{self, BufRead, IsTerminal, Write},
+    sync::OnceLock,
+};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use termimad::MadSkin;
 
 use crate::{
     PlanningAnswerSource, PlanningDraftDecision, PlanningDraftDecisionKind, PlanningDraftReview,
@@ -20,6 +24,7 @@ impl RunDelegate for ConsoleDelegate {
                 iteration,
                 max_iterations,
             } => {
+                println!();
                 println!(
                     "{}",
                     format_iteration_banner(&prompt_name, iteration, max_iterations)
@@ -29,23 +34,32 @@ impl RunDelegate for ConsoleDelegate {
                 print!("{chunk}");
             }
             RunEvent::ParallelWorkerLaunched { channel_id, label } => {
-                println!("[parallel:{channel_id}] launched {label}");
+                println!(
+                    "{}",
+                    format_parallel_event("queued", &channel_id, &label, None)
+                );
             }
             RunEvent::ParallelWorkerStarted { channel_id, label } => {
-                println!("[parallel:{channel_id}] started {label}");
+                println!(
+                    "{}",
+                    format_parallel_event("running", &channel_id, &label, None)
+                );
             }
             RunEvent::ParallelWorkerFinished {
                 channel_id,
                 label,
                 exit_code,
             } => {
-                println!("[parallel:{channel_id}] finished {label} (exit={exit_code})");
+                println!(
+                    "{}",
+                    format_parallel_event("done", &channel_id, &label, Some(exit_code))
+                );
             }
             RunEvent::Note(note) => {
-                eprintln!("{note}");
+                eprintln!("{}", format_note(&note));
             }
             RunEvent::Finished { status, summary } => {
-                println!("\n{} ({})", summary, status.label());
+                println!("\n{}", format_finish_line(status.label(), &summary));
             }
         }
         Ok(())
@@ -123,10 +137,7 @@ impl RunDelegate for ConsoleDelegate {
         writeln!(stdout, "Plan draft")?;
         writeln!(stdout, "Target: {}", draft.target_path)?;
         writeln!(stdout, "--------------------")?;
-        writeln!(stdout, "{}", draft.draft)?;
-        if !draft.draft.ends_with('\n') {
-            writeln!(stdout)?;
-        }
+        render_markdown_draft(&mut stdout, &draft.draft)?;
         writeln!(stdout, "--------------------")?;
         writeln!(stdout)?;
         writeln!(stdout, "  1) Accept")?;
@@ -181,4 +192,74 @@ fn prompt_line(prompt: &str) -> Result<String> {
     let mut input = String::new();
     stdin.lock().read_line(&mut input)?;
     Ok(input.trim().to_owned())
+}
+
+fn render_markdown_draft(stdout: &mut impl Write, markdown: &str) -> Result<()> {
+    if io::stdout().is_terminal() {
+        write!(stdout, "{}", planning_draft_skin().term_text(markdown))?;
+        if !markdown.ends_with('\n') {
+            writeln!(stdout)?;
+        }
+        return Ok(());
+    }
+
+    writeln!(stdout, "{markdown}")?;
+    if !markdown.ends_with('\n') {
+        writeln!(stdout)?;
+    }
+    Ok(())
+}
+
+fn planning_draft_skin() -> &'static MadSkin {
+    static SKIN: OnceLock<MadSkin> = OnceLock::new();
+    SKIN.get_or_init(MadSkin::default)
+}
+
+fn format_parallel_event(
+    kind: &str,
+    channel_id: &str,
+    label: &str,
+    exit_code: Option<i32>,
+) -> String {
+    const ANSI_CYAN: &str = "\x1b[36m";
+    const ANSI_GREEN: &str = "\x1b[32m";
+    const ANSI_RED: &str = "\x1b[31m";
+    const ANSI_DIM: &str = "\x1b[2m";
+    const ANSI_RESET: &str = "\x1b[0m";
+
+    let color = match (kind, exit_code) {
+        ("done", Some(0)) => ANSI_GREEN,
+        ("done", Some(_)) => ANSI_RED,
+        ("running", _) => ANSI_CYAN,
+        _ => ANSI_DIM,
+    };
+
+    match exit_code {
+        Some(exit_code) => {
+            format!("{color}[parallel:{channel_id}] {kind} {label} (exit={exit_code}){ANSI_RESET}")
+        }
+        None => format!("{color}[parallel:{channel_id}] {kind} {label}{ANSI_RESET}"),
+    }
+}
+
+fn format_note(note: &str) -> String {
+    const ANSI_YELLOW: &str = "\x1b[33m";
+    const ANSI_RESET: &str = "\x1b[0m";
+
+    format!("{ANSI_YELLOW}! {note}{ANSI_RESET}")
+}
+
+fn format_finish_line(status: &str, summary: &str) -> String {
+    const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
+    const ANSI_BOLD_RED: &str = "\x1b[1;31m";
+    const ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
+    const ANSI_RESET: &str = "\x1b[0m";
+
+    let color = match status {
+        "completed" => ANSI_BOLD_GREEN,
+        "failed" => ANSI_BOLD_RED,
+        _ => ANSI_BOLD_YELLOW,
+    };
+
+    format!("{color}{summary} ({status}){ANSI_RESET}")
 }

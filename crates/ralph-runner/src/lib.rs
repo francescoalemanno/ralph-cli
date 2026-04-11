@@ -470,7 +470,7 @@ pub fn format_event_notice(
     channel_id: Option<&str>,
     event: &ralph_core::ParsedAgentEvent,
 ) -> String {
-    const ANSI_BOLD_RED: &str = "\x1b[1;31m";
+    const ANSI_BOLD_MAGENTA: &str = "\x1b[1;35m";
     const ANSI_RESET: &str = "\x1b[0m";
 
     let mut message = "◆ event emitted".to_owned();
@@ -483,27 +483,63 @@ pub fn format_event_notice(
     message.push_str(": ");
     message.push_str(&event.event);
     if !event.body.is_empty() {
-        if event.body.contains('\n') {
+        let preview = preview_event_body(&event.body, 3);
+        if preview.inline {
+            message.push_str(" | ");
+            message.push_str(
+                preview
+                    .lines
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            );
+        } else {
             message.push('\n');
             message.push_str(
-                &event
-                    .body
-                    .lines()
+                &preview
+                    .lines
+                    .iter()
                     .map(|line| format!("  {line}"))
                     .collect::<Vec<_>>()
                     .join("\n"),
             );
-        } else {
-            message.push_str(" | ");
-            message.push_str(&event.body);
+            if preview.omitted_line_count > 0 {
+                message.push('\n');
+                message.push_str(&format!(
+                    "  ... (+{} more line{})",
+                    preview.omitted_line_count,
+                    if preview.omitted_line_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ));
+            }
         }
     }
 
-    format!("{ANSI_BOLD_RED}{message}{ANSI_RESET}\n")
+    format!("{ANSI_BOLD_MAGENTA}{message}{ANSI_RESET}\n")
 }
 
 fn render_event_notice(event: &ralph_core::ParsedAgentEvent) -> String {
     format_event_notice(None, event)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EventBodyPreview {
+    lines: Vec<String>,
+    omitted_line_count: usize,
+    inline: bool,
+}
+
+fn preview_event_body(body: &str, max_lines: usize) -> EventBodyPreview {
+    let lines = body.lines().map(str::to_owned).collect::<Vec<_>>();
+    let preview_lines = lines.iter().take(max_lines).cloned().collect::<Vec<_>>();
+    EventBodyPreview {
+        omitted_line_count: lines.len().saturating_sub(preview_lines.len()),
+        inline: lines.len() <= 1,
+        lines: preview_lines,
+    }
 }
 
 async fn read_stream<R>(mut reader: R, tx: UnboundedSender<RunnerStreamEvent>) -> Result<()>
@@ -713,7 +749,7 @@ mod tests {
 
         let rendered = super::decorate_visible_output(&mut state, "hello\n".to_owned(), false);
 
-        assert!(rendered.starts_with("\x1b[1;31m◆ event emitted: loop-route | beta\x1b[0m\n"));
+        assert!(rendered.starts_with("\x1b[1;35m◆ event emitted: loop-route | beta\x1b[0m\n"));
         assert!(rendered.ends_with("hello\n"));
         assert!(state.pending.is_empty());
     }
@@ -732,7 +768,7 @@ mod tests {
             super::decorate_visible_output(&mut state, "before\nafter".to_owned(), false);
 
         assert!(
-            rendered.starts_with("before\n\x1b[1;31m◆ event emitted: loop-stop:ok | done\x1b[0m\n")
+            rendered.starts_with("before\n\x1b[1;35m◆ event emitted: loop-stop:ok | done\x1b[0m\n")
         );
         assert!(rendered.ends_with("after"));
         assert!(state.pending.is_empty());
@@ -752,9 +788,26 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "tail\n\x1b[1;31m◆ event emitted: handoff\n  alpha\n  beta\x1b[0m\n"
+            "tail\n\x1b[1;35m◆ event emitted: handoff\n  alpha\n  beta\x1b[0m\n"
         );
         assert!(state.pending.is_empty());
+    }
+
+    #[test]
+    fn truncates_multiline_event_notice_after_three_lines() {
+        let rendered = super::format_event_notice(
+            Some("host"),
+            &ralph_core::ParsedAgentEvent {
+                event: "planning-draft".to_owned(),
+                body: "one\ntwo\nthree\nfour\nfive".to_owned(),
+            },
+        );
+
+        assert!(rendered.contains("◆ event emitted [host]: planning-draft"));
+        assert!(rendered.contains("\n  one\n  two\n  three\n"));
+        assert!(rendered.contains("  ... (+2 more lines)"));
+        assert!(!rendered.contains("\n  four\n"));
+        assert!(!rendered.contains("\n  five\n"));
     }
 
     #[test]

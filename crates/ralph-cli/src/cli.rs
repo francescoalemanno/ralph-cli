@@ -29,8 +29,7 @@ const REQUEST_HELP: &str = "Provide the request as argv text";
 const RUN_CLI_HELP: &str = "Run in CLI mode instead of opening the TUI";
 const RUN_AGENT_HELP: &str = "Override the configured coding agent for this run";
 const RUN_MAX_ITERATIONS_HELP: &str = "Override the configured workflow iteration limit";
-const RUN_SESSION_TIMEOUT_HELP: &str =
-    "Kill the agent after a fixed duration like 30m, 5m, or 45s";
+const RUN_SESSION_TIMEOUT_HELP: &str = "Kill the agent after a fixed duration like 30m, 5m, or 45s";
 const RUN_IDLE_TIMEOUT_HELP: &str =
     "Kill the agent after this much time with no output like 5m, 30s, or 1h";
 const GET_EVENT_HELP: &str = "Event name whose latest payload should be printed";
@@ -685,12 +684,9 @@ fn parse_timeout_duration(value: &str) -> Result<u64> {
         ));
     }
     let (number, unit) = value.split_at(value.len() - 1);
-    let amount = number.parse::<u64>().map_err(|_| {
-        anyhow!(
-            "invalid duration '{}'; expected [integer][h|m|s]",
-            value
-        )
-    })?;
+    let amount = number
+        .parse::<u64>()
+        .map_err(|_| anyhow!("invalid duration '{}'; expected [integer][h|m|s]", value))?;
     if amount == 0 {
         return Err(anyhow!("invalid duration '{}'; value must be > 0", value));
     }
@@ -901,7 +897,10 @@ mod tests {
     #[test]
     fn rejects_invalid_timeout_durations() {
         for value in ["0s", "30", "1d", "ms", "1h30m"] {
-            assert!(parse_timeout_duration(value).is_err(), "{value} should fail");
+            assert!(
+                parse_timeout_duration(value).is_err(),
+                "{value} should fail"
+            );
         }
     }
 

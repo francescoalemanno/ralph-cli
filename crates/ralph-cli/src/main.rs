@@ -4,7 +4,7 @@ mod output;
 use std::{
     env, fs,
     io::{self, IsTerminal, Read},
-    process::ExitCode,
+    process::{Command, ExitCode},
 };
 
 use crate::{
@@ -13,8 +13,8 @@ use crate::{
         RequestArgs, render_run_workflow_help,
     },
     output::{
-        AgentCurrentRow, agent_list_rows, print_agent_current, print_agent_list,
-        print_workflow_definition, print_workflow_list, print_workflow_run,
+        AgentCurrentRow, CliRunHeader, agent_list_rows, print_agent_current, print_agent_list,
+        print_run_header, print_workflow_definition, print_workflow_list, print_workflow_run,
     },
 };
 use anyhow::{Context, Result, anyhow};
@@ -139,14 +139,43 @@ async fn run_run_command(project_dir: Utf8PathBuf, args: cli::RunArgs) -> Result
 
 async fn run_cli_workflow(project_dir: Utf8PathBuf, args: &cli::RunArgs) -> Result<()> {
     let mut app = RalphApp::load(project_dir)?;
+    let input = resolve_workflow_run_input(args)?;
     args.runtime.apply_to(&mut app)?;
-    let mut delegate = ConsoleDelegate;
+    let workflow = app.load_workflow(&args.workflow)?;
+    let request_preview = resolve_request_preview(app.project_dir(), &workflow, &input.request)?;
+    let agent = app
+        .config()
+        .agent_definition(app.agent_id())
+        .ok_or_else(|| anyhow!("agent '{}' is not defined", app.agent_id()))?;
+    print_run_header(&CliRunHeader {
+        version: env!("CARGO_PKG_VERSION"),
+        workflow_id: workflow.workflow_id.clone(),
+        workflow_title: workflow.title.clone(),
+        entrypoint: workflow.entrypoint.clone(),
+        agent: format!("{} ({})", app.agent_name(), app.agent_id()),
+        runner: agent.runner.command_preview(),
+        project_dir: app.project_dir().to_string(),
+        branch: git_branch(app.project_dir()),
+        request_source: describe_request_source(&workflow, &input.request),
+        request_preview,
+        max_iterations: app.config().max_iterations,
+        session_timeout_secs: agent.runner.session_timeout_secs,
+        idle_timeout_secs: agent.runner.idle_timeout_secs,
+        workflow_options: input
+            .options
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        artifact_root: app
+            .project_dir()
+            .join(".ralph")
+            .join("runs")
+            .join(&args.workflow)
+            .to_string(),
+    });
+    let mut delegate = ConsoleDelegate::default();
     let summary = app
-        .run_workflow(
-            &args.workflow,
-            resolve_workflow_run_input(args)?,
-            &mut delegate,
-        )
+        .run_workflow(&args.workflow, input, &mut delegate)
         .await?;
     print_workflow_run(&summary);
     Ok(())
@@ -311,6 +340,83 @@ fn resolve_project_relative_path(project_dir: &Utf8Path, path: &Utf8Path) -> Utf
         path.to_path_buf()
     } else {
         project_dir.join(path)
+    }
+}
+
+fn describe_request_source(
+    workflow: &ralph_core::WorkflowDefinition,
+    request: &WorkflowRequestInput,
+) -> String {
+    if request.argv.is_some() {
+        return "argv".to_owned();
+    }
+    if request.stdin.is_some() {
+        return "stdin".to_owned();
+    }
+    if let Some(path) = &request.request_file {
+        return format!("file {}", path);
+    }
+    match workflow.request.as_ref() {
+        Some(definition) if definition.inline.is_some() => "workflow inline".to_owned(),
+        Some(definition) => definition
+            .file
+            .as_ref()
+            .map(|file| format!("workflow file {}", file.path))
+            .unwrap_or_else(|| "none".to_owned()),
+        None => "none".to_owned(),
+    }
+}
+
+fn resolve_request_preview(
+    project_dir: &Utf8Path,
+    workflow: &ralph_core::WorkflowDefinition,
+    request: &WorkflowRequestInput,
+) -> Result<Option<String>> {
+    if let Some(argv) = &request.argv {
+        return Ok(Some(argv.clone()));
+    }
+    if let Some(stdin) = &request.stdin {
+        return Ok(Some(stdin.clone()));
+    }
+    if let Some(path) = &request.request_file {
+        let resolved = resolve_project_relative_path(project_dir, path);
+        let contents = fs::read_to_string(resolved.as_std_path())
+            .with_context(|| format!("failed to read request file {}", resolved))?;
+        return Ok(Some(contents));
+    }
+
+    let Some(definition) = workflow.request.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(inline) = &definition.inline {
+        return Ok(Some(inline.clone()));
+    }
+    if let Some(file) = &definition.file {
+        let resolved = resolve_project_relative_path(project_dir, &file.path);
+        let contents = fs::read_to_string(resolved.as_std_path())
+            .with_context(|| format!("failed to read workflow request file {}", resolved))?;
+        return Ok(Some(contents));
+    }
+    Ok(None)
+}
+
+fn git_branch(project_dir: &Utf8Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(project_dir.as_str())
+        .arg("rev-parse")
+        .arg("--abbrev-ref")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch)
     }
 }
 

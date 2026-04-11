@@ -89,7 +89,6 @@ impl CodingAgent {
                         "run".to_owned(),
                         "--format".to_owned(),
                         "default".to_owned(),
-                        "--thinking".to_owned(),
                     ],
                     command: None,
                     prompt_input: PromptInput::Stdin,
@@ -463,10 +462,7 @@ mod tests {
     fn opencode_builtin_commands_match_expected_shapes() {
         let opencode = CodingAgent::Opencode.definition();
         assert_eq!(opencode.runner.prompt_input, PromptInput::Stdin);
-        assert_eq!(
-            opencode.runner.args,
-            vec!["run", "--format", "default", "--thinking"]
-        );
+        assert_eq!(opencode.runner.args, vec!["run", "--format", "default"]);
     }
 
     #[test]

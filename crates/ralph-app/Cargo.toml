@@ -9,6 +9,7 @@ async-trait.workspace = true
 camino.workspace = true
 ralph-core = { version = "0.4.4", path = "../ralph-core" }
 ralph-runner = { version = "0.4.4", path = "../ralph-runner" }
+termimad.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
