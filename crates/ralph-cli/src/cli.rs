@@ -5,23 +5,26 @@ use camino::Utf8PathBuf;
 use clap::{
     Arg, ArgAction, ArgMatches, Command,
     error::{Error, ErrorKind},
+    parser::ValueSource,
 };
 use ralph_app::RalphApp;
 use ralph_core::{ConfigFileScope, list_all_workflows, load_workflow, workflow_option_flag};
 
-const ROOT_ABOUT: &str = "Workflow runner for Ralph";
+const ROOT_ABOUT: &str = "Guided planner and workflow runner for Ralph";
 const ROOT_LONG_ABOUT: &str = "\
-Ralph runs request-driven workflows from the workflow registry.
+Ralph starts in guided mode by default.
 \
 \n\
-\n`ralph run <workflow-id> <request>` opens the workflow runner TUI.
-\nThe TUI requires both a workflow id and a request provided as argv text or `--file`.
-\n`ralph run --cli <workflow-id> <request>` runs a workflow in CLI mode.
-\nCLI mode also accepts the request from stdin when input is piped.
+\n`ralph` asks for a plan description, runs the `plan` workflow interactively,\
+\nthen can continue into `task` and `review`.
+\n`ralph --plan[=DESCRIPTION]` creates a plan interactively and stops after the plan file is written.
+\n`ralph -t <PLAN_FILE>` runs only the `task` workflow.
+\n`ralph -r [PLAN_FILE]` runs only the `review` workflow.
+\n`ralph -f [PLAN_FILE]` runs only the `finalize` workflow.
 \
 \n\
-\nUse the CLI when you want workflow execution, workflow inspection, setup tools, or\
-\nscriptable configuration management.";
+\nUse `ralph run <workflow-id> ...` when you want the lower-level workflow runner,\
+\nworkflow inspection, setup tools, or scriptable configuration management.";
 const PROJECT_DIR_HELP: &str = "Run the command against this project directory";
 const WORKFLOW_HELP: &str = "Workflow ID from the registry";
 const REQUEST_FILE_HELP: &str = "Read the request from a file";
@@ -41,6 +44,13 @@ const INIT_EDITOR_HELP: &str = "Persist this editor command as the project defau
 const INIT_MAX_ITERATIONS_HELP: &str =
     "Persist this workflow iteration limit as the project default";
 const FORCE_HELP: &str = "Overwrite an existing project config file";
+const GUIDED_PLAN_HELP: &str =
+    "Create a plan interactively and stop after the plan file is written.";
+const GUIDED_TASKS_ONLY_HELP: &str =
+    "Execute the plan tasks only, then stop without running review or finalize.";
+const GUIDED_REVIEW_HELP: &str = "Run the full review pipeline only, skipping task execution.";
+const GUIDED_FINALIZE_HELP: &str =
+    "Run the finalize workflow only, skipping task execution and review.";
 const RUN_AFTER_HELP: &str = "\
 Examples:
   ralph run default \"fix the failing tests\"
@@ -67,6 +77,10 @@ const WORKFLOW_ID_ARG: &str = "workflow_id";
 const SCOPE_ARG: &str = "scope";
 const EDITOR_ARG: &str = "editor";
 const FORCE_ARG: &str = "force";
+const PLAN_ARG: &str = "plan";
+const TASKS_ONLY_ARG: &str = "tasks_only";
+const REVIEW_ARG: &str = "review";
+const FINALIZE_ARG: &str = "finalize";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WritableConfigScopeArg {
@@ -159,7 +173,17 @@ impl Cli {
 
     fn from_matches(matches: &ArgMatches) -> Result<Self> {
         let project_dir = matches.get_one::<Utf8PathBuf>(PROJECT_DIR_ARG).cloned();
+        let has_plan = arg_present(matches, PLAN_ARG);
+        let has_tasks_only = arg_present(matches, TASKS_ONLY_ARG);
+        let has_review = arg_present(matches, REVIEW_ARG);
+        let has_finalize = arg_present(matches, FINALIZE_ARG);
+        let has_top_level_shortcut = has_plan || has_tasks_only || has_review || has_finalize;
         let command = match matches.subcommand() {
+            Some(_) if has_top_level_shortcut => {
+                return Err(anyhow!(
+                    "top-level guided flags cannot be combined with subcommands"
+                ));
+            }
             Some(("run", submatches)) => Commands::Run(parse_run_args(submatches)?),
             Some(("get", submatches)) => Commands::Get(parse_get_args(submatches)?),
             Some(("ls", _)) => Commands::Ls,
@@ -170,7 +194,23 @@ impl Cli {
             Some(("init", submatches)) => Commands::Init(parse_init_args(submatches)),
             Some(("doctor", _)) => Commands::Doctor,
             Some((name, _)) => return Err(anyhow!("unsupported subcommand '{}'", name)),
-            None => return Err(anyhow!("a subcommand is required")),
+            None if has_plan => Commands::Guided(GuidedArgs {
+                description: normalize_optional_value(matches.get_one::<String>(PLAN_ARG)),
+                build_after_plan: false,
+            }),
+            None if has_tasks_only => Commands::TasksOnly(PlanShortcutArgs {
+                plan_file: required_string_result(matches, TASKS_ONLY_ARG)?,
+            }),
+            None if has_review => Commands::ReviewOnly(OptionalPlanShortcutArgs {
+                plan_file: normalize_optional_value(matches.get_one::<String>(REVIEW_ARG)),
+            }),
+            None if has_finalize => Commands::FinalizeOnly(OptionalPlanShortcutArgs {
+                plan_file: normalize_optional_value(matches.get_one::<String>(FINALIZE_ARG)),
+            }),
+            None => Commands::Guided(GuidedArgs {
+                description: None,
+                build_after_plan: true,
+            }),
         };
 
         Ok(Self {
@@ -203,6 +243,10 @@ pub(crate) fn render_run_workflow_help(workflow_id: &str) -> Result<String> {
 
 #[derive(Debug, Clone)]
 pub(crate) enum Commands {
+    Guided(GuidedArgs),
+    TasksOnly(PlanShortcutArgs),
+    ReviewOnly(OptionalPlanShortcutArgs),
+    FinalizeOnly(OptionalPlanShortcutArgs),
     Run(RunArgs),
     Get(GetArgs),
     Ls,
@@ -212,6 +256,22 @@ pub(crate) enum Commands {
     Config(ConfigCommands),
     Init(InitArgs),
     Doctor,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GuidedArgs {
+    pub(crate) description: Option<String>,
+    pub(crate) build_after_plan: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PlanShortcutArgs {
+    pub(crate) plan_file: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct OptionalPlanShortcutArgs {
+    pub(crate) plan_file: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -316,8 +376,6 @@ fn build_cli_command() -> Result<Command> {
     Ok(Command::new("ralph")
         .about(ROOT_ABOUT)
         .long_about(ROOT_LONG_ABOUT)
-        .arg_required_else_help(true)
-        .subcommand_required(true)
         .arg(
             Arg::new(PROJECT_DIR_ARG)
                 .long("project-dir")
@@ -325,6 +383,45 @@ fn build_cli_command() -> Result<Command> {
                 .value_name("PATH")
                 .value_parser(clap::value_parser!(Utf8PathBuf))
                 .help(PROJECT_DIR_HELP),
+        )
+        .arg(
+            Arg::new(PLAN_ARG)
+                .long("plan")
+                .value_name("DESCRIPTION")
+                .num_args(0..=1)
+                .require_equals(true)
+                .default_missing_value("")
+                .conflicts_with_all([TASKS_ONLY_ARG, REVIEW_ARG, FINALIZE_ARG])
+                .help(GUIDED_PLAN_HELP),
+        )
+        .arg(
+            Arg::new(TASKS_ONLY_ARG)
+                .short('t')
+                .long("tasks-only")
+                .value_name("PLAN_FILE")
+                .action(ArgAction::Set)
+                .conflicts_with_all([PLAN_ARG, REVIEW_ARG, FINALIZE_ARG])
+                .help(GUIDED_TASKS_ONLY_HELP),
+        )
+        .arg(
+            Arg::new(REVIEW_ARG)
+                .short('r')
+                .long("review")
+                .value_name("PLAN_FILE")
+                .num_args(0..=1)
+                .default_missing_value("")
+                .conflicts_with_all([PLAN_ARG, TASKS_ONLY_ARG, FINALIZE_ARG])
+                .help(GUIDED_REVIEW_HELP),
+        )
+        .arg(
+            Arg::new(FINALIZE_ARG)
+                .short('f')
+                .long("finalize")
+                .value_name("PLAN_FILE")
+                .num_args(0..=1)
+                .default_missing_value("")
+                .conflicts_with_all([PLAN_ARG, TASKS_ONLY_ARG, REVIEW_ARG])
+                .help(GUIDED_FINALIZE_HELP),
         )
         .subcommand(build_run_command()?)
         .subcommand(
@@ -676,6 +773,20 @@ fn required_string_result(matches: &ArgMatches, id: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("missing required argument '{}'", id))
 }
 
+fn arg_present(matches: &ArgMatches, id: &str) -> bool {
+    matches
+        .value_source(id)
+        .is_some_and(|source| source != ValueSource::DefaultValue)
+}
+
+fn normalize_optional_value(value: Option<&String>) -> Option<String> {
+    value
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn parse_timeout_duration(value: &str) -> Result<u64> {
     if value.len() < 2 {
         return Err(anyhow!(
@@ -713,12 +824,97 @@ mod tests {
     use crate::test_support::with_test_workflow_home;
 
     #[test]
-    fn root_cli_requires_a_subcommand() {
+    fn root_cli_defaults_to_guided_mode() {
         with_test_workflow_home(|| {
-            let error = Cli::try_parse_from(["ralph"]).unwrap_err();
-            assert_eq!(
-                error.kind(),
-                ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            let cli = Cli::try_parse_from(["ralph"]).unwrap();
+
+            let Commands::Guided(args) = cli.command else {
+                panic!("expected guided command");
+            };
+            assert!(args.description.is_none());
+            assert!(args.build_after_plan);
+        });
+    }
+
+    #[test]
+    fn plan_flag_parses_optional_description() {
+        with_test_workflow_home(|| {
+            let cli = Cli::try_parse_from(["ralph", "--plan=ship auth"]).unwrap();
+
+            let Commands::Guided(args) = cli.command else {
+                panic!("expected guided command");
+            };
+            assert_eq!(args.description.as_deref(), Some("ship auth"));
+            assert!(!args.build_after_plan);
+        });
+    }
+
+    #[test]
+    fn plan_flag_without_description_stops_after_planning() {
+        with_test_workflow_home(|| {
+            let cli = Cli::try_parse_from(["ralph", "--plan"]).unwrap();
+
+            let Commands::Guided(args) = cli.command else {
+                panic!("expected guided command");
+            };
+            assert!(args.description.is_none());
+            assert!(!args.build_after_plan);
+        });
+    }
+
+    #[test]
+    fn tasks_only_flag_requires_plan_file() {
+        with_test_workflow_home(|| {
+            let cli = Cli::try_parse_from(["ralph", "-t", "PLAN.md"]).unwrap();
+
+            let Commands::TasksOnly(args) = cli.command else {
+                panic!("expected tasks-only command");
+            };
+            assert_eq!(args.plan_file, "PLAN.md");
+
+            let error = Cli::try_parse_from(["ralph", "-t"]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        });
+    }
+
+    #[test]
+    fn review_and_finalize_flags_accept_optional_plan_file() {
+        with_test_workflow_home(|| {
+            let review = Cli::try_parse_from(["ralph", "-r"]).unwrap();
+            let Commands::ReviewOnly(args) = review.command else {
+                panic!("expected review-only command");
+            };
+            assert!(args.plan_file.is_none());
+
+            let review = Cli::try_parse_from(["ralph", "-r", "PLAN.md"]).unwrap();
+            let Commands::ReviewOnly(args) = review.command else {
+                panic!("expected review-only command");
+            };
+            assert_eq!(args.plan_file.as_deref(), Some("PLAN.md"));
+
+            let finalize = Cli::try_parse_from(["ralph", "-f"]).unwrap();
+            let Commands::FinalizeOnly(args) = finalize.command else {
+                panic!("expected finalize-only command");
+            };
+            assert!(args.plan_file.is_none());
+
+            let finalize = Cli::try_parse_from(["ralph", "-f", "PLAN.md"]).unwrap();
+            let Commands::FinalizeOnly(args) = finalize.command else {
+                panic!("expected finalize-only command");
+            };
+            assert_eq!(args.plan_file.as_deref(), Some("PLAN.md"));
+        });
+    }
+
+    #[test]
+    fn top_level_guided_flags_cannot_be_combined_with_subcommands() {
+        with_test_workflow_home(|| {
+            let error = Cli::try_parse_from(["ralph", "--plan", "ls"]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidValue);
+            assert!(
+                error
+                    .to_string()
+                    .contains("top-level guided flags cannot be combined with subcommands")
             );
         });
     }

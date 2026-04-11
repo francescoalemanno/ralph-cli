@@ -222,6 +222,12 @@ impl<R> RalphApp<R> {
     }
 
     pub fn resolve_workflow_edit_path(&self, workflow_id: &str) -> Result<Utf8PathBuf> {
+        if ralph_core::is_protected_builtin_workflow(workflow_id) {
+            return Err(anyhow!(
+                "workflow '{}' is protected and cannot be edited",
+                workflow_id
+            ));
+        }
         self.load_workflow(workflow_id)?
             .source_path()
             .map(Utf8Path::to_path_buf)
@@ -230,5 +236,26 @@ impl<R> RalphApp<R> {
 
     pub fn read_utf8_file(&self, path: &Utf8Path) -> Result<String> {
         std::fs::read_to_string(path).map_err(|error| anyhow!("failed to read {}: {error}", path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use camino::Utf8PathBuf;
+    use ralph_core::AppConfig;
+
+    use super::RalphApp;
+
+    #[test]
+    fn protected_workflows_cannot_be_edited() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let app = RalphApp::new(project_dir, AppConfig::default(), ());
+
+        let error = app
+            .resolve_workflow_edit_path("plan")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("workflow 'plan' is protected and cannot be edited"));
     }
 }
