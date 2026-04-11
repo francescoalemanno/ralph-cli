@@ -339,12 +339,37 @@ fn config_path_for_scope(
 }
 
 pub fn global_config_dir() -> Result<Utf8PathBuf> {
+    if let Some(path) = global_config_dir_override_value() {
+        return Ok(path);
+    }
+
     if let Some(path) = std::env::var_os(RALPH_CONFIG_HOME_ENV) {
         return Utf8PathBuf::from_path_buf(path.into())
             .map_err(|_| anyhow!("{RALPH_CONFIG_HOME_ENV} is not valid UTF-8"));
     }
 
     canonical_global_config_dir()
+}
+
+fn global_config_dir_override_value() -> Option<Utf8PathBuf> {
+    global_config_dir_override()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn global_config_dir_override() -> &'static std::sync::RwLock<Option<Utf8PathBuf>> {
+    use std::sync::{OnceLock, RwLock};
+
+    static GLOBAL_CONFIG_DIR_OVERRIDE: OnceLock<RwLock<Option<Utf8PathBuf>>> = OnceLock::new();
+    GLOBAL_CONFIG_DIR_OVERRIDE.get_or_init(|| RwLock::new(None))
+}
+
+fn global_config_dir_override_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+
+    static GLOBAL_CONFIG_DIR_OVERRIDE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    GLOBAL_CONFIG_DIR_OVERRIDE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn canonical_global_config_dir() -> Result<Utf8PathBuf> {
@@ -357,8 +382,38 @@ fn canonical_global_config_dir() -> Result<Utf8PathBuf> {
         .map_err(|_| anyhow!("Ralph global config directory is not valid UTF-8"))
 }
 
+#[doc(hidden)]
+pub struct ScopedGlobalConfigDirOverride {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedGlobalConfigDirOverride {
+    pub fn new(path: Utf8PathBuf) -> Self {
+        let guard = global_config_dir_override_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *global_config_dir_override()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for ScopedGlobalConfigDirOverride {
+    fn drop(&mut self) {
+        *global_config_dir_override()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+#[doc(hidden)]
+pub fn scoped_global_config_dir_override(path: Utf8PathBuf) -> ScopedGlobalConfigDirOverride {
+    ScopedGlobalConfigDirOverride::new(path)
+}
+
 #[cfg(test)]
-pub(crate) fn configure_test_global_config_home() -> Utf8PathBuf {
+pub(crate) fn configure_test_global_config_home() -> (Utf8PathBuf, ScopedGlobalConfigDirOverride) {
     use std::sync::OnceLock;
 
     static TEST_CONFIG_HOME: OnceLock<Utf8PathBuf> = OnceLock::new();
@@ -370,21 +425,10 @@ pub(crate) fn configure_test_global_config_home() -> Utf8PathBuf {
         fs::create_dir_all(&path).unwrap();
         path
     });
-    unsafe {
-        std::env::set_var(RALPH_CONFIG_HOME_ENV, path.as_str());
-    }
-    path.clone()
-}
-
-#[cfg(test)]
-pub(crate) fn global_config_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-
-    static TEST_CONFIG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_CONFIG_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap()
+    (
+        path.clone(),
+        scoped_global_config_dir_override(path.clone()),
+    )
 }
 
 fn merge_config(mut base: AppConfig, partial: PartialAppConfig) -> AppConfig {
@@ -470,7 +514,7 @@ mod tests {
 
     use super::{
         AppConfig, ConfigFileScope, PartialAppConfig, configure_test_global_config_home,
-        global_config_test_lock, merge_config, write_partial_config,
+        merge_config, write_partial_config,
     };
     use crate::{AgentConfig, CommandMode, PromptInput, RunnerConfig};
 
@@ -513,8 +557,7 @@ mod tests {
 
     #[test]
     fn persisted_agent_switch_updates_project_agent_only() {
-        let _guard = global_config_test_lock();
-        configure_test_global_config_home();
+        let (_, _guard) = configure_test_global_config_home();
         if let Some(user_path) = AppConfig::user_config_path().unwrap()
             && user_path.exists()
         {
@@ -533,8 +576,7 @@ mod tests {
 
     #[test]
     fn user_config_is_seeded_with_builtin_agents() {
-        let _guard = global_config_test_lock();
-        configure_test_global_config_home();
+        let (_, _guard) = configure_test_global_config_home();
 
         let user_path = AppConfig::user_config_path().unwrap().unwrap();
         if user_path.exists() {
@@ -555,8 +597,7 @@ mod tests {
 
     #[test]
     fn stale_seeded_user_config_is_refreshed_with_new_builtins() {
-        let _guard = global_config_test_lock();
-        configure_test_global_config_home();
+        let (_, _guard) = configure_test_global_config_home();
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
 
@@ -584,8 +625,7 @@ mod tests {
 
     #[test]
     fn custom_user_agent_registry_is_not_rewritten_with_builtins() {
-        let _guard = global_config_test_lock();
-        configure_test_global_config_home();
+        let (_, _guard) = configure_test_global_config_home();
         let temp = tempfile::tempdir().unwrap();
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
 
@@ -599,8 +639,7 @@ mod tests {
                     name: "Custom".to_owned(),
                     builtin: false,
                     hidden: false,
-                    non_interactive: crate::CodingAgent::Codex.definition().non_interactive,
-                    interactive: crate::CodingAgent::Codex.definition().interactive,
+                    runner: crate::CodingAgent::Codex.definition().runner,
                 }]),
                 ..Default::default()
             },
@@ -685,8 +724,7 @@ mod tests {
                     name: "Custom".to_owned(),
                     builtin: false,
                     hidden: false,
-                    non_interactive: crate::CodingAgent::Codex.definition().non_interactive,
-                    interactive: crate::CodingAgent::Codex.definition().interactive,
+                    runner: crate::CodingAgent::Codex.definition().runner,
                 }]),
                 default_agent: Some("custom".to_owned()),
                 ..Default::default()
@@ -711,14 +749,15 @@ mod tests {
             prompt_input: PromptInput::Argv,
             prompt_env_var: "PROMPT".to_owned(),
             env: Default::default(),
+            session_timeout_secs: None,
+            idle_timeout_secs: None,
         };
         AgentConfig {
             id: id.to_owned(),
             name: name.to_owned(),
             builtin: false,
             hidden: false,
-            non_interactive: runner.clone(),
-            interactive: runner,
+            runner,
         }
     }
 
@@ -731,14 +770,15 @@ mod tests {
             prompt_input: PromptInput::Argv,
             prompt_env_var: "PROMPT".to_owned(),
             env: Default::default(),
+            session_timeout_secs: None,
+            idle_timeout_secs: None,
         };
         AgentConfig {
             id: id.to_owned(),
             name: name.to_owned(),
             builtin: false,
             hidden: false,
-            non_interactive: runner.clone(),
-            interactive: runner,
+            runner,
         }
     }
 }

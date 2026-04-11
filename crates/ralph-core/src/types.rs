@@ -32,6 +32,7 @@ impl LastRunStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunnerInvocation {
     pub run_id: String,
+    pub channel_id: String,
     pub prompt_text: String,
     pub project_dir: Utf8PathBuf,
     pub run_dir: Utf8PathBuf,

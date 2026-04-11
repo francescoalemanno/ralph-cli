@@ -29,8 +29,12 @@ const REQUEST_HELP: &str = "Provide the request as argv text";
 const RUN_CLI_HELP: &str = "Run in CLI mode instead of opening the TUI";
 const RUN_AGENT_HELP: &str = "Override the configured coding agent for this run";
 const RUN_MAX_ITERATIONS_HELP: &str = "Override the configured workflow iteration limit";
-const EMIT_EVENT_HELP: &str = "Event name to append to the current run WAL";
-const EMIT_BODY_HELP: &str = "Optional event body text";
+const RUN_SESSION_TIMEOUT_HELP: &str =
+    "Kill the agent after a fixed duration like 30m, 5m, or 45s";
+const RUN_IDLE_TIMEOUT_HELP: &str =
+    "Kill the agent after this much time with no output like 5m, 30s, or 1h";
+const GET_EVENT_HELP: &str = "Event name whose latest payload should be printed";
+const GET_CHANNEL_HELP: &str = "Optional channel ID to filter the event lookup";
 const CONFIG_SCOPE_WRITE_HELP: &str = "Config scope to update";
 const CONFIG_SCOPE_VIEW_HELP: &str = "Config view to render";
 const INIT_AGENT_HELP: &str = "Persist this agent as the project default";
@@ -40,11 +44,13 @@ const INIT_MAX_ITERATIONS_HELP: &str =
 const FORCE_HELP: &str = "Overwrite an existing project config file";
 const RUN_AFTER_HELP: &str = "\
 Examples:
-  ralph run task-based \"fix the failing tests\"
-  ralph run task-based --file REQ.md
-  cat REQ.md | ralph run --cli task-based";
-const EMIT_LONG_ABOUT: &str = "\
-Emit an agent event into the current Ralph run WAL.
+  ralph run default \"fix the failing tests\"
+  ralph run default --file REQ.md
+  cat REQ.md | ralph run --cli bare";
+const GET_LONG_ABOUT: &str = "\
+Print the most recent payload stored for an event in the current Ralph run WAL.
+
+Without `--channel`, the lookup scans all channels in the current run.
 
 This command only works inside a Ralph agent run.";
 
@@ -52,10 +58,12 @@ const PROJECT_DIR_ARG: &str = "project_dir";
 const CLI_ARG: &str = "cli";
 const AGENT_ARG: &str = "agent";
 const MAX_ITERATIONS_ARG: &str = "max_iterations";
+const SESSION_TIMEOUT_ARG: &str = "session_timeout";
+const IDLE_TIMEOUT_ARG: &str = "idle_timeout";
 const REQUEST_FILE_ARG: &str = "request_file";
 const REQUEST_ARG: &str = "request";
 const EVENT_ARG: &str = "event";
-const BODY_ARG: &str = "body";
+const CHANNEL_ARG: &str = "channel";
 const WORKFLOW_ID_ARG: &str = "workflow_id";
 const SCOPE_ARG: &str = "scope";
 const EDITOR_ARG: &str = "editor";
@@ -93,6 +101,8 @@ impl From<WritableConfigScopeArg> for ConfigFileScope {
 pub(crate) struct RuntimeArgs {
     pub(crate) agent: Option<String>,
     pub(crate) max_iterations: Option<usize>,
+    pub(crate) session_timeout_secs: Option<u64>,
+    pub(crate) idle_timeout_secs: Option<u64>,
 }
 
 impl RuntimeArgs {
@@ -102,6 +112,21 @@ impl RuntimeArgs {
         }
         if let Some(max_iterations) = self.max_iterations {
             app.config_mut().max_iterations = max_iterations;
+        }
+        if self.session_timeout_secs.is_some() || self.idle_timeout_secs.is_some() {
+            let agent_id = app.agent_id().to_owned();
+            let agent = app
+                .config_mut()
+                .agents
+                .iter_mut()
+                .find(|agent| agent.id == agent_id)
+                .ok_or_else(|| anyhow!("agent '{}' is not defined", agent_id))?;
+            if let Some(session_timeout_secs) = self.session_timeout_secs {
+                agent.runner.session_timeout_secs = Some(session_timeout_secs);
+            }
+            if let Some(idle_timeout_secs) = self.idle_timeout_secs {
+                agent.runner.idle_timeout_secs = Some(idle_timeout_secs);
+            }
         }
         Ok(())
     }
@@ -137,7 +162,7 @@ impl Cli {
         let project_dir = matches.get_one::<Utf8PathBuf>(PROJECT_DIR_ARG).cloned();
         let command = match matches.subcommand() {
             Some(("run", submatches)) => Commands::Run(parse_run_args(submatches)?),
-            Some(("emit", submatches)) => Commands::Emit(parse_emit_args(submatches)?),
+            Some(("get", submatches)) => Commands::Get(parse_get_args(submatches)?),
             Some(("ls", _)) => Commands::Ls,
             Some(("show", submatches)) => Commands::Show(parse_show_args(submatches)?),
             Some(("edit", submatches)) => Commands::Edit(parse_edit_args(submatches)?),
@@ -180,7 +205,7 @@ pub(crate) fn render_run_workflow_help(workflow_id: &str) -> Result<String> {
 #[derive(Debug, Clone)]
 pub(crate) enum Commands {
     Run(RunArgs),
-    Emit(EmitArgs),
+    Get(GetArgs),
     Ls,
     Show(ShowArgs),
     Edit(EditArgs),
@@ -220,9 +245,9 @@ impl RequestArgs {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct EmitArgs {
+pub(crate) struct GetArgs {
     pub(crate) event: String,
-    pub(crate) body: Vec<String>,
+    pub(crate) channel: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -304,23 +329,21 @@ fn build_cli_command() -> Result<Command> {
         )
         .subcommand(build_run_command()?)
         .subcommand(
-            Command::new("emit")
-                .about("Emit an agent event into the current Ralph run WAL")
-                .long_about(EMIT_LONG_ABOUT)
+            Command::new("get")
+                .about("Print the latest payload for an event in the current Ralph run WAL")
+                .long_about(GET_LONG_ABOUT)
                 .arg_required_else_help(true)
+                .arg(
+                    Arg::new(CHANNEL_ARG)
+                        .long("channel")
+                        .value_name("CHANNEL")
+                        .help(GET_CHANNEL_HELP),
+                )
                 .arg(
                     Arg::new(EVENT_ARG)
                         .value_name("EVENT")
                         .required(true)
-                        .help(EMIT_EVENT_HELP),
-                )
-                .arg(
-                    Arg::new(BODY_ARG)
-                        .value_name("BODY")
-                        .trailing_var_arg(true)
-                        .allow_hyphen_values(true)
-                        .num_args(1..)
-                        .help(EMIT_BODY_HELP),
+                        .help(GET_EVENT_HELP),
                 ),
         )
         .subcommand(
@@ -459,6 +482,24 @@ fn build_run_command() -> Result<Command> {
                 .value_name("N")
                 .value_parser(clap::value_parser!(usize))
                 .help(RUN_MAX_ITERATIONS_HELP),
+        )
+        .arg(
+            Arg::new(SESSION_TIMEOUT_ARG)
+                .long("session-timeout")
+                .global(true)
+                .value_name("DURATION")
+                .default_value("1h")
+                .value_parser(clap::builder::ValueParser::new(parse_timeout_duration))
+                .help(RUN_SESSION_TIMEOUT_HELP),
+        )
+        .arg(
+            Arg::new(IDLE_TIMEOUT_ARG)
+                .long("idle-timeout")
+                .global(true)
+                .value_name("DURATION")
+                .default_value("10m")
+                .value_parser(clap::builder::ValueParser::new(parse_timeout_duration))
+                .help(RUN_IDLE_TIMEOUT_HELP),
         );
 
     for workflow in list_all_workflows()? {
@@ -548,6 +589,10 @@ fn parse_run_args(matches: &ArgMatches) -> Result<RunArgs> {
             max_iterations: workflow_matches
                 .get_one::<usize>(MAX_ITERATIONS_ARG)
                 .copied(),
+            session_timeout_secs: workflow_matches
+                .get_one::<u64>(SESSION_TIMEOUT_ARG)
+                .copied(),
+            idle_timeout_secs: workflow_matches.get_one::<u64>(IDLE_TIMEOUT_ARG).copied(),
         },
         workflow: workflow.to_owned(),
         workflow_options,
@@ -563,13 +608,10 @@ fn parse_run_args(matches: &ArgMatches) -> Result<RunArgs> {
     })
 }
 
-fn parse_emit_args(matches: &ArgMatches) -> Result<EmitArgs> {
-    Ok(EmitArgs {
+fn parse_get_args(matches: &ArgMatches) -> Result<GetArgs> {
+    Ok(GetArgs {
         event: required_string_result(matches, EVENT_ARG)?,
-        body: matches
-            .get_many::<String>(BODY_ARG)
-            .map(|values| values.cloned().collect())
-            .unwrap_or_default(),
+        channel: matches.get_one::<String>(CHANNEL_ARG).cloned(),
     })
 }
 
@@ -635,6 +677,34 @@ fn required_string_result(matches: &ArgMatches, id: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("missing required argument '{}'", id))
 }
 
+fn parse_timeout_duration(value: &str) -> Result<u64> {
+    if value.len() < 2 {
+        return Err(anyhow!(
+            "invalid duration '{}'; expected [integer][h|m|s]",
+            value
+        ));
+    }
+    let (number, unit) = value.split_at(value.len() - 1);
+    let amount = number.parse::<u64>().map_err(|_| {
+        anyhow!(
+            "invalid duration '{}'; expected [integer][h|m|s]",
+            value
+        )
+    })?;
+    if amount == 0 {
+        return Err(anyhow!("invalid duration '{}'; value must be > 0", value));
+    }
+    match unit {
+        "h" => Ok(amount.saturating_mul(60 * 60)),
+        "m" => Ok(amount.saturating_mul(60)),
+        "s" => Ok(amount),
+        _ => Err(anyhow!(
+            "invalid duration '{}'; expected [integer][h|m|s]",
+            value
+        )),
+    }
+}
+
 fn leak(value: String) -> &'static str {
     Box::leak(value.into_boxed_str())
 }
@@ -643,7 +713,7 @@ fn leak(value: String) -> &'static str {
 mod tests {
     use clap::error::ErrorKind;
 
-    use super::{Cli, Commands, build_cli_command};
+    use super::{Cli, Commands, build_cli_command, parse_timeout_duration};
     use crate::test_support::with_test_workflow_home;
 
     #[test]
@@ -667,6 +737,8 @@ mod tests {
                 panic!("expected run subcommand");
             };
             assert_eq!(args.workflow, "fixture-flow");
+            assert_eq!(args.runtime.session_timeout_secs, Some(60 * 60));
+            assert_eq!(args.runtime.idle_timeout_secs, Some(10 * 60));
             assert_eq!(
                 args.request_args.request,
                 vec!["fix".to_owned(), "tests".to_owned()]
@@ -682,6 +754,10 @@ mod tests {
                 "run",
                 "--agent",
                 "claude",
+                "--session-timeout",
+                "30m",
+                "--idle-timeout",
+                "5m",
                 "fixture-flow",
                 "ship",
                 "it",
@@ -693,6 +769,8 @@ mod tests {
             };
             assert_eq!(args.workflow, "fixture-flow");
             assert_eq!(args.runtime.agent.as_deref(), Some("claude"));
+            assert_eq!(args.runtime.session_timeout_secs, Some(30 * 60));
+            assert_eq!(args.runtime.idle_timeout_secs, Some(5 * 60));
             assert_eq!(
                 args.request_args.request,
                 vec!["ship".to_owned(), "it".to_owned()]
@@ -729,6 +807,8 @@ mod tests {
             };
             assert!(args.cli);
             assert_eq!(args.workflow, "fixture-flow");
+            assert_eq!(args.runtime.session_timeout_secs, Some(60 * 60));
+            assert_eq!(args.runtime.idle_timeout_secs, Some(10 * 60));
         });
     }
 
@@ -766,6 +846,10 @@ mod tests {
             assert_eq!(error.kind(), ErrorKind::DisplayHelp);
             assert!(rendered.contains("--statefile"));
             assert!(rendered.contains("state.txt"));
+            assert!(rendered.contains("--session-timeout <DURATION>"));
+            assert!(rendered.contains("[default: 1h]"));
+            assert!(rendered.contains("--idle-timeout <DURATION>"));
+            assert!(rendered.contains("[default: 10m]"));
         });
     }
 
@@ -779,6 +863,8 @@ mod tests {
             let rendered = error.to_string();
 
             assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+            assert!(rendered.contains("plan"));
+            assert!(rendered.contains("ipr"));
             assert!(!rendered.contains("test-workflow"));
 
             let cli = Cli::try_parse_from(["ralph", "run", "test-workflow"]).unwrap();
@@ -798,22 +884,69 @@ mod tests {
                 Cli::try_parse_from(["ralph", "show", "--max-iterations", "3", "fixture-flow"])
                     .is_err()
             );
+            assert!(
+                Cli::try_parse_from(["ralph", "show", "--session-timeout", "3m", "fixture-flow"])
+                    .is_err()
+            );
         });
     }
 
     #[test]
-    fn emit_without_event_surfaces_help_instead_of_panicking() {
+    fn parses_timeout_durations_in_seconds_minutes_and_hours() {
+        assert_eq!(parse_timeout_duration("45s").unwrap(), 45);
+        assert_eq!(parse_timeout_duration("5m").unwrap(), 300);
+        assert_eq!(parse_timeout_duration("2h").unwrap(), 7200);
+    }
+
+    #[test]
+    fn rejects_invalid_timeout_durations() {
+        for value in ["0s", "30", "1d", "ms", "1h30m"] {
+            assert!(parse_timeout_duration(value).is_err(), "{value} should fail");
+        }
+    }
+
+    #[test]
+    fn get_subcommand_parses_event_name() {
         with_test_workflow_home(|| {
-            let error = Cli::try_parse_from(["ralph", "emit"]).unwrap_err();
+            let cli = Cli::try_parse_from(["ralph", "get", "handoff"]).unwrap();
+
+            let Commands::Get(args) = cli.command else {
+                panic!("expected get subcommand");
+            };
+            assert_eq!(args.event, "handoff");
+            assert_eq!(args.channel, None);
+        });
+    }
+
+    #[test]
+    fn get_subcommand_parses_optional_channel_filter() {
+        with_test_workflow_home(|| {
+            let cli = Cli::try_parse_from(["ralph", "get", "--channel", "QT", "handoff"]).unwrap();
+
+            let Commands::Get(args) = cli.command else {
+                panic!("expected get subcommand");
+            };
+            assert_eq!(args.event, "handoff");
+            assert_eq!(args.channel.as_deref(), Some("QT"));
+        });
+    }
+
+    #[test]
+    fn get_without_event_surfaces_help_instead_of_panicking() {
+        with_test_workflow_home(|| {
+            let error = Cli::try_parse_from(["ralph", "get"]).unwrap_err();
             let rendered = error.to_string();
 
             assert_eq!(
                 error.kind(),
                 ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
             );
-            assert!(rendered.contains("Emit an agent event into the current Ralph run WAL"));
+            assert!(
+                rendered
+                    .contains("Print the latest payload for an event in the current Ralph run WAL")
+            );
             assert!(rendered.contains("Usage:"));
-            assert!(rendered.contains("ralph emit"));
+            assert!(rendered.contains("ralph get"));
             assert!(rendered.contains("<EVENT>"));
         });
     }

@@ -42,10 +42,6 @@ pub(crate) fn print_bare_file(path: &Utf8Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn print_emitted_event(event: &str) {
-    println!("event {event} emitted.");
-}
-
 pub(crate) fn print_workflow_run(summary: &WorkflowRunSummary) {
     println!(
         "{} [{}] prompt={} run_dir={}",
@@ -100,7 +96,7 @@ pub(crate) fn agent_list_rows(agents: &[AgentConfig]) -> Vec<AgentListRow> {
         .map(|agent| AgentListRow {
             agent: format!("{} ({})", agent.name, agent.id),
             detected: agent.is_available(),
-            command: agent.non_interactive.command_preview(),
+            command: agent.runner.command_preview(),
         })
         .collect()
 }

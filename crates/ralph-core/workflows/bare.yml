@@ -11,7 +11,6 @@ request:
 prompts:
   main:
     title: Bare
-    is_interactive: false
     fallback-route: main
     prompt: |
       {ralph-request}

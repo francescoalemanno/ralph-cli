@@ -6,12 +6,10 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
-    AgentConfig, AppConfig, LastRunStatus, RunnerConfig, WorkflowDefinition, WorkflowSummary,
-    list_workflows, load_workflow,
+    AgentConfig, AppConfig, LastRunStatus, WorkflowDefinition, WorkflowSummary, list_workflows,
+    load_workflow,
 };
-use ralph_runner::{
-    CommandRunner, InteractiveSessionInvocation, InteractiveSessionOutcome, RunnerAdapter,
-};
+use ralph_runner::CommandRunner;
 
 pub use console::ConsoleDelegate;
 pub use workflow_run::{WorkflowRequestInput, WorkflowRunInput};
@@ -24,11 +22,81 @@ pub enum RunEvent {
         max_iterations: usize,
     },
     Output(String),
+    ParallelWorkerLaunched {
+        channel_id: String,
+        label: String,
+    },
+    ParallelWorkerStarted {
+        channel_id: String,
+        label: String,
+    },
+    ParallelWorkerFinished {
+        channel_id: String,
+        label: String,
+        exit_code: i32,
+    },
     Note(String),
     Finished {
         status: LastRunStatus,
         summary: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningQuestion {
+    pub question: String,
+    pub options: Vec<String>,
+    pub context: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanningAnswerSource {
+    Option,
+    Custom,
+}
+
+impl PlanningAnswerSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Option => "option",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningQuestionAnswer {
+    pub answer: String,
+    pub source: PlanningAnswerSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningDraftReview {
+    pub target_path: Utf8PathBuf,
+    pub draft: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanningDraftDecisionKind {
+    Accept,
+    Revise,
+    Reject,
+}
+
+impl PlanningDraftDecisionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Accept => "accept",
+            Self::Revise => "revise",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningDraftDecision {
+    pub kind: PlanningDraftDecisionKind,
+    pub feedback: Option<String>,
 }
 
 pub fn format_iteration_banner(
@@ -49,12 +117,22 @@ pub fn format_iteration_banner(
 pub trait RunDelegate: Send {
     async fn on_event(&mut self, event: RunEvent) -> Result<()>;
 
-    async fn run_interactive_session(
+    async fn answer_planning_question(
         &mut self,
-        _config: &RunnerConfig,
-        _invocation: &InteractiveSessionInvocation,
-    ) -> Result<Option<InteractiveSessionOutcome>> {
-        Ok(None)
+        _question: &PlanningQuestion,
+    ) -> Result<PlanningQuestionAnswer> {
+        Err(anyhow!(
+            "planning questions are not supported by this run delegate"
+        ))
+    }
+
+    async fn review_planning_draft(
+        &mut self,
+        _draft: &PlanningDraftReview,
+    ) -> Result<PlanningDraftDecision> {
+        Err(anyhow!(
+            "planning draft review is not supported by this run delegate"
+        ))
     }
 }
 
@@ -150,18 +228,5 @@ impl<R> RalphApp<R> {
 
     pub fn read_utf8_file(&self, path: &Utf8Path) -> Result<String> {
         std::fs::read_to_string(path).map_err(|error| anyhow!("failed to read {}: {error}", path))
-    }
-}
-
-impl<R> RalphApp<R>
-where
-    R: RunnerAdapter,
-{
-    pub fn run_interactive_session_with_config(
-        &self,
-        config: &RunnerConfig,
-        invocation: &InteractiveSessionInvocation,
-    ) -> Result<InteractiveSessionOutcome> {
-        self.runner.run_interactive_session(config, invocation)
     }
 }

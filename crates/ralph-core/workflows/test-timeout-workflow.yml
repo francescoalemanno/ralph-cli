@@ -1,0 +1,15 @@
+version: 1
+workflow_id: test-timeout-workflow
+title: Test Timeout Workflow
+description: Internal workflow for exercising runner timeout behavior.
+hidden: true
+entrypoint: main
+options:
+  script:
+    value_name: SHELL
+prompts:
+  main:
+    title: Main
+    fallback-route: no-route-error
+    prompt: |
+      {ralph-option:script}

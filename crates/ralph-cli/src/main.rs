@@ -9,20 +9,20 @@ use std::{
 
 use crate::{
     cli::{
-        AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, EmitArgs, InitArgs,
+        AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, GetArgs, InitArgs,
         RequestArgs, render_run_workflow_help,
     },
     output::{
         AgentCurrentRow, agent_list_rows, print_agent_current, print_agent_list,
-        print_emitted_event, print_workflow_definition, print_workflow_list, print_workflow_run,
+        print_workflow_definition, print_workflow_list, print_workflow_run,
     },
 };
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_app::{ConsoleDelegate, RalphApp, WorkflowRequestInput, WorkflowRunInput};
 use ralph_core::{
-    AgentEventRecord, AppConfig, ConfigFileScope, append_agent_event, atomic_write,
-    load_workflow_from_path, seed_builtin_workflows_if_missing,
+    AppConfig, ConfigFileScope, atomic_write, latest_agent_event_body_from_wal_in_channel,
+    load_workflow, seed_builtin_workflows_if_missing,
 };
 use ralph_tui::{
     TuiLaunchOptions, TuiPreloadedRequest, TuiRequestSource, edit_file, run_tui_with_options,
@@ -51,11 +51,18 @@ fn build_tui_launch_options(
     project_dir: &Utf8Path,
     args: &cli::RunArgs,
 ) -> Result<TuiLaunchOptions> {
+    let workflow = load_workflow(&args.workflow)
+        .with_context(|| format!("failed to load workflow '{}'", args.workflow))?;
     let argv = args.request_args.argv_text();
     let provided = args.request_args.provided_count();
-    if provided != 1 {
+    if workflow.uses_request_token() && provided == 0 {
         return Err(anyhow!(
             "opening the runner TUI requires both a workflow and a request; use `ralph run <workflow-id> \"your request\"` or `ralph run <workflow-id> --file REQ.md`"
+        ));
+    }
+    if provided > 1 {
+        return Err(anyhow!(
+            "opening the runner TUI accepts at most one preloaded request source; use argv text or `--file`, not both"
         ));
     }
 
@@ -78,7 +85,7 @@ fn build_tui_launch_options(
         (None, None) => None,
         _ => {
             return Err(anyhow!(
-                "opening the runner TUI requires both a workflow and a request; use `ralph run <workflow-id> \"your request\"` or `ralph run <workflow-id> --file REQ.md`"
+                "opening the runner TUI accepts at most one preloaded request source; use argv text or `--file`, not both"
             ));
         }
     };
@@ -93,7 +100,7 @@ fn build_tui_launch_options(
 async fn run_command(project_dir: Utf8PathBuf, command: Commands) -> Result<()> {
     match command {
         Commands::Run(args) => run_run_command(project_dir, args).await,
-        Commands::Emit(args) => run_emit(args),
+        Commands::Get(args) => run_get(args),
         Commands::Ls => {
             let app = RalphApp::load(project_dir)?;
             print_workflow_list(app.list_workflows()?);
@@ -172,9 +179,9 @@ fn is_run_usage_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     [
         "opening the runner TUI requires both a workflow and a request",
+        "opening the runner TUI accepts at most one preloaded request source",
         "stdin preloading is not supported in TUI mode",
         "provide the workflow request in exactly one runtime form",
-        "cannot use stdin as the request source because interactive prompts need the terminal",
         "does not accept argv requests",
         "does not accept stdin requests",
         "does not accept --request-file",
@@ -242,104 +249,18 @@ fn run_config_command(project_dir: Utf8PathBuf, command: ConfigCommands) -> Resu
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EmitContext {
-    run_id: String,
-    project_dir: Utf8PathBuf,
-    run_dir: Utf8PathBuf,
-    prompt_path: Option<Utf8PathBuf>,
-    prompt_name: String,
-}
-
-fn run_emit(args: EmitArgs) -> Result<()> {
+fn run_get(args: GetArgs) -> Result<()> {
     let event = args.event.trim().to_owned();
     if event.is_empty() {
         return Err(anyhow!("event name cannot be empty"));
     }
 
-    let body = args.body.join(" ");
-    let context = emit_context_from_env()?;
-    validate_emit_args(&event, &body, &context)?;
-    let wal_run_dir = context.run_dir.clone();
-
-    append_agent_event(
-        &wal_run_dir,
-        &AgentEventRecord {
-            v: 1,
-            ts_unix_ms: current_unix_timestamp_ms(),
-            run_id: context.run_id,
-            event: event.clone(),
-            body,
-            project_dir: context.project_dir,
-            run_dir: context.run_dir,
-            prompt_path: context.prompt_path.unwrap_or_default(),
-            prompt_name: context.prompt_name,
-            pid: std::process::id(),
-        },
-    )?;
-
-    print_emitted_event(&event);
+    let wal_path = env_utf8_path("RALPH_WAL_PATH")?;
+    let body =
+        latest_agent_event_body_from_wal_in_channel(&wal_path, &event, args.channel.as_deref())?
+            .ok_or_else(|| anyhow!("no event with name {event}"))?;
+    println!("{body}");
     Ok(())
-}
-
-fn emit_context_from_env() -> Result<EmitContext> {
-    build_emit_context(
-        env_utf8_path("RALPH_RUN_DIR")?,
-        optional_env("RALPH_RUN_ID")?,
-        optional_env_utf8_path("RALPH_PROJECT_DIR")?,
-        optional_env_utf8_path("RALPH_PROMPT_PATH")?,
-        optional_env("RALPH_PROMPT_NAME")?,
-    )
-}
-
-fn validate_emit_args(event: &str, body: &str, context: &EmitContext) -> Result<()> {
-    if !event.starts_with("loop-") {
-        return Ok(());
-    }
-
-    match event {
-        "loop-continue" | "loop-stop:ok" | "loop-stop:error" => Ok(()),
-        "loop-route" => validate_loop_route_body(body, context),
-        _ => Err(anyhow!(unsupported_loop_event_message(event))),
-    }
-}
-
-fn validate_loop_route_body(body: &str, context: &EmitContext) -> Result<()> {
-    let trimmed = body.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!(invalid_route_message(
-            trimmed,
-            &available_routes(context)?
-        )));
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') {
-        return Err(anyhow!(invalid_route_message(
-            trimmed,
-            &available_routes(context)?
-        )));
-    }
-    let routes = available_routes(context)?;
-    if routes.iter().any(|route| route == trimmed) {
-        return Ok(());
-    }
-    Err(anyhow!(invalid_route_message(trimmed, &routes)))
-}
-
-fn invalid_route_message(route: &str, routes: &[String]) -> String {
-    if routes.is_empty() {
-        format!("\"{route}\" is not a valid event body for `loop-route`.\nNo routes are available.")
-    } else {
-        format!(
-            "\"{route}\" is not a valid event body for `loop-route`.\nChoose among the available routes:\n{}",
-            routes.join("\n")
-        )
-    }
-}
-
-fn unsupported_loop_event_message(event: &str) -> String {
-    format!(
-        "`{event}` is not a supported loop event.\nChoose among:\nloop-continue\nloop-stop:ok\nloop-stop:error\nloop-route"
-    )
 }
 
 fn required_env(key: &str) -> Result<String> {
@@ -347,99 +268,13 @@ fn required_env(key: &str) -> Result<String> {
         .map_err(|_| anyhow!("missing {key}; this command only works inside a Ralph agent run"))
 }
 
-fn optional_env(key: &str) -> Result<Option<String>> {
-    match env::var(key) {
-        Ok(value) => Ok(Some(value)),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(env::VarError::NotUnicode(_)) => Err(anyhow!(
-            "{key} is not valid UTF-8; this command only works inside a Ralph agent run"
-        )),
-    }
-}
-
 fn env_utf8_path(key: &str) -> Result<Utf8PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = test_support::env_path_override(key) {
+        return Ok(path);
+    }
+
     Ok(Utf8PathBuf::from(required_env(key)?))
-}
-
-fn optional_env_utf8_path(key: &str) -> Result<Option<Utf8PathBuf>> {
-    optional_env(key).map(|value| value.map(Utf8PathBuf::from))
-}
-
-fn build_emit_context(
-    run_dir: Utf8PathBuf,
-    run_id_env: Option<String>,
-    project_dir_env: Option<Utf8PathBuf>,
-    prompt_path: Option<Utf8PathBuf>,
-    prompt_name: Option<String>,
-) -> Result<EmitContext> {
-    if !run_dir.is_absolute() {
-        return Err(anyhow!(
-            "RALPH_RUN_DIR must be an absolute path; got {}",
-            run_dir
-        ));
-    }
-
-    let derived_run_id = run_dir
-        .file_name()
-        .ok_or_else(|| {
-            anyhow!(
-                "RALPH_RUN_DIR must end with a run id directory: {}",
-                run_dir
-            )
-        })?
-        .to_owned();
-    let run_id = match run_id_env {
-        Some(run_id) if run_id != derived_run_id => {
-            return Err(anyhow!(
-                "RALPH_RUN_ID '{}' does not match RALPH_RUN_DIR '{}'",
-                run_id,
-                run_dir
-            ));
-        }
-        Some(run_id) => run_id,
-        None => derived_run_id,
-    };
-
-    let derived_project_dir = project_dir_from_run_dir(&run_dir);
-    let project_dir = match (project_dir_env, derived_project_dir) {
-        (Some(project_dir), Some(derived)) if project_dir != derived => {
-            return Err(anyhow!(
-                "RALPH_PROJECT_DIR '{}' does not match RALPH_RUN_DIR '{}'",
-                project_dir,
-                run_dir
-            ));
-        }
-        (Some(project_dir), _) => project_dir,
-        (None, Some(derived)) => derived,
-        (None, None) => resolve_project_dir(None)?,
-    };
-
-    Ok(EmitContext {
-        run_id,
-        project_dir,
-        run_dir,
-        prompt_path,
-        prompt_name: prompt_name.unwrap_or_default(),
-    })
-}
-
-fn project_dir_from_run_dir(run_dir: &Utf8Path) -> Option<Utf8PathBuf> {
-    let workflow_dir = run_dir.parent()?;
-    let runs_dir = workflow_dir.parent()?;
-    let ralph_dir = runs_dir.parent()?;
-    if runs_dir.file_name()? != "runs" || ralph_dir.file_name()? != ".ralph" {
-        return None;
-    }
-    Some(ralph_dir.parent()?.to_path_buf())
-}
-
-fn current_unix_timestamp_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn resolve_workflow_run_input(args: &cli::RunArgs) -> Result<WorkflowRunInput> {
@@ -477,18 +312,6 @@ fn resolve_project_relative_path(project_dir: &Utf8Path, path: &Utf8Path) -> Utf
     } else {
         project_dir.join(path)
     }
-}
-
-fn available_routes(context: &EmitContext) -> Result<Vec<String>> {
-    let prompt_path = context.prompt_path.as_ref().ok_or_else(|| {
-        anyhow!("missing RALPH_PROMPT_PATH; `loop-route` requires workflow source context")
-    })?;
-    let workflow = load_workflow_from_path(prompt_path)?;
-    Ok(workflow
-        .prompt_ids()
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>())
 }
 
 fn run_init(project_dir: Utf8PathBuf, args: InitArgs) -> Result<()> {
@@ -574,24 +397,61 @@ fn init_tracing() {
 pub(crate) mod test_support {
     use std::{
         fs,
-        sync::{Mutex, OnceLock},
+        sync::{Mutex, OnceLock, RwLock},
     };
 
     use camino::Utf8PathBuf;
+    use ralph_core::ScopedGlobalConfigDirOverride;
 
-    const RALPH_CONFIG_HOME_ENV: &str = "RALPH_CONFIG_HOME";
+    fn wal_path_override() -> &'static RwLock<Option<Utf8PathBuf>> {
+        static WAL_PATH_OVERRIDE: OnceLock<RwLock<Option<Utf8PathBuf>>> = OnceLock::new();
+        WAL_PATH_OVERRIDE.get_or_init(|| RwLock::new(None))
+    }
 
-    fn env_lock() -> &'static Mutex<()> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    fn wal_path_override_lock() -> &'static Mutex<()> {
+        static WAL_PATH_OVERRIDE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        WAL_PATH_OVERRIDE_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    pub(crate) fn env_path_override(key: &str) -> Option<Utf8PathBuf> {
+        match key {
+            "RALPH_WAL_PATH" => wal_path_override()
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            _ => None,
+        }
+    }
+
+    pub(crate) struct ScopedWalPathOverride {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedWalPathOverride {
+        pub(crate) fn new(path: Utf8PathBuf) -> Self {
+            let guard = wal_path_override_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *wal_path_override()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
+            Self { _guard: guard }
+        }
+    }
+
+    impl Drop for ScopedWalPathOverride {
+        fn drop(&mut self) {
+            *wal_path_override()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
     }
 
     pub(crate) fn with_test_workflow_home(test: impl FnOnce()) {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::tempdir().unwrap();
         let config_home = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let _config_home: ScopedGlobalConfigDirOverride =
+            ralph_core::scoped_global_config_dir_override(config_home.clone());
         fs::create_dir_all(config_home.join("workflows").as_std_path()).unwrap();
         fs::write(
             config_home.join("workflows/fixture-flow.yml").as_std_path(),
@@ -610,7 +470,6 @@ request:
 prompts:
   main:
     title: Main
-    is_interactive: false
     fallback-route: no-route-error
     prompt: |
       state={ralph-option:state-file}
@@ -618,13 +477,7 @@ prompts:
 "#,
         )
         .unwrap();
-        unsafe {
-            std::env::set_var(RALPH_CONFIG_HOME_ENV, config_home.as_str());
-        }
         test();
-        unsafe {
-            std::env::remove_var(RALPH_CONFIG_HOME_ENV);
-        }
     }
 }
 
@@ -632,280 +485,130 @@ prompts:
 mod tests {
     use super::*;
     use crate::cli::{RunArgs, RuntimeArgs};
-    use crate::test_support::with_test_workflow_home;
+    use crate::test_support::{ScopedWalPathOverride, with_test_workflow_home};
     use std::fs;
 
     #[test]
-    fn loop_route_validation_lists_available_routes() {
-        let temp = tempfile::tempdir().unwrap();
-        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("route-test.yml")).unwrap();
-        fs::write(
-            workflow_path.as_std_path(),
-            r#"
-version: 1
-workflow_id: route-test
-title: Route Test
-entrypoint: alpha
-prompts:
-  alpha:
-    title: Alpha
-    is_interactive: false
-    fallback-route: no-route-error
-    prompt: hello
-  beta:
-    title: Beta
-    is_interactive: false
-    fallback-route: no-route-error
-    prompt: world
-"#,
-        )
-        .unwrap();
-
-        let context = EmitContext {
-            run_id: "run-1".to_owned(),
-            project_dir: Utf8PathBuf::from("/tmp/project"),
-            run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
-            prompt_path: Some(workflow_path),
-            prompt_name: "alpha".to_owned(),
-        };
-        let error = validate_loop_route_body("broken", &context)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("\"broken\" is not a valid event body for `loop-route`."));
-        assert!(error.contains("alpha"));
-        assert!(error.contains("beta"));
-    }
-
-    #[test]
-    fn loop_route_validation_accepts_yaml_prompt_ids() {
+    fn get_returns_latest_event_body_from_wal_path() {
         let temp = tempfile::tempdir().unwrap();
         let run_dir = Utf8PathBuf::from_path_buf(temp.path().join("run")).unwrap();
         fs::create_dir_all(run_dir.as_std_path()).unwrap();
-        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("route-test.yml")).unwrap();
-        fs::write(
-            workflow_path.as_std_path(),
-            r#"
-version: 1
-workflow_id: route-test
-title: Route Test
-entrypoint: alpha
-prompts:
-  alpha:
-    title: Alpha
-    is_interactive: false
-    fallback-route: no-route-error
-    prompt: hello
-  beta:
-    title: Beta
-    is_interactive: false
-    fallback-route: no-route-error
-    prompt: world
-"#,
-        )
-        .unwrap();
-
-        let context = EmitContext {
-            run_id: "run-1".to_owned(),
-            project_dir: Utf8PathBuf::from("/tmp/project"),
-            run_dir,
-            prompt_path: Some(workflow_path),
-            prompt_name: "alpha".to_owned(),
-        };
-
-        validate_loop_route_body("beta", &context).unwrap();
-    }
-
-    #[test]
-    fn unsupported_loop_events_are_rejected() {
-        let temp = tempfile::tempdir().unwrap();
-        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("route-test.yml")).unwrap();
-        fs::write(
-            workflow_path.as_std_path(),
-            r#"
-version: 1
-workflow_id: route-test
-title: Route Test
-entrypoint: alpha
-prompts:
-  alpha:
-    title: Alpha
-    is_interactive: false
-    fallback-route: no-route-error
-    prompt: hello
-"#,
-        )
-        .unwrap();
-
-        let error = validate_emit_args(
-            "loop-pause",
-            "later",
-            &EmitContext {
+        ralph_core::append_agent_event(
+            &run_dir,
+            &ralph_core::AgentEventRecord {
+                v: 1,
+                ts_unix_ms: 1,
                 run_id: "run-1".to_owned(),
+                channel_id: ralph_core::MAIN_CHANNEL_ID.to_owned(),
+                event: "handoff".to_owned(),
+                body: "first".to_owned(),
                 project_dir: Utf8PathBuf::from("/tmp/project"),
-                run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
-                prompt_path: Some(workflow_path),
+                run_dir: run_dir.clone(),
+                prompt_path: Utf8PathBuf::from("/tmp/workflow.yml"),
                 prompt_name: "alpha".to_owned(),
+                pid: 1,
             },
         )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("`loop-pause` is not a supported loop event."));
-        assert!(error.contains("loop-continue"));
-        assert!(error.contains("loop-route"));
-    }
-
-    #[test]
-    fn non_loop_events_are_allowed_without_validation() {
-        let temp = tempfile::tempdir().unwrap();
-        let workflow_path = Utf8PathBuf::from_path_buf(temp.path().join("route-test.yml")).unwrap();
-        fs::write(
-            workflow_path.as_std_path(),
-            r#"
-version: 1
-workflow_id: route-test
-title: Route Test
-entrypoint: alpha
-prompts:
-  alpha:
-    title: Alpha
-    is_interactive: false
-    fallback-route: no-route-error
-    prompt: hello
-"#,
-        )
         .unwrap();
-
-        validate_emit_args(
-            "note",
-            "free form",
-            &EmitContext {
+        ralph_core::append_agent_event(
+            &run_dir,
+            &ralph_core::AgentEventRecord {
+                v: 1,
+                ts_unix_ms: 2,
                 run_id: "run-1".to_owned(),
+                channel_id: ralph_core::MAIN_CHANNEL_ID.to_owned(),
+                event: "handoff".to_owned(),
+                body: "second".to_owned(),
                 project_dir: Utf8PathBuf::from("/tmp/project"),
-                run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
-                prompt_path: Some(workflow_path),
-                prompt_name: "alpha".to_owned(),
+                run_dir: run_dir.clone(),
+                prompt_path: Utf8PathBuf::from("/tmp/workflow.yml"),
+                prompt_name: "beta".to_owned(),
+                pid: 1,
             },
         )
         .unwrap();
-    }
 
-    #[test]
-    fn emit_context_derives_run_id_and_project_dir_from_run_dir() {
-        let context = build_emit_context(
-            Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
-            None,
-            None,
-            None,
+        let _wal_path = ScopedWalPathOverride::new(ralph_core::agent_events_wal_path(&run_dir));
+        let result = latest_agent_event_body_from_wal_in_channel(
+            &ralph_core::agent_events_wal_path(&run_dir),
+            "handoff",
             None,
         )
         .unwrap();
 
-        assert_eq!(context.run_id, "run-1");
-        assert_eq!(context.project_dir, Utf8PathBuf::from("/tmp/project"));
-        assert_eq!(
-            context.run_dir,
-            Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1")
-        );
-        assert!(context.prompt_path.is_none());
-        assert!(context.prompt_name.is_empty());
+        assert_eq!(result.as_deref(), Some("second"));
     }
 
     #[test]
-    fn emit_context_rejects_mismatched_run_id_and_run_dir() {
-        let error = build_emit_context(
-            Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
-            Some("run-2".to_owned()),
-            None,
-            None,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
+    fn tui_launch_options_require_request_for_workflows_using_request_token() {
+        with_test_workflow_home(|| {
+            let project_dir = Utf8Path::new("/tmp/project");
+            let error = build_tui_launch_options(
+                project_dir,
+                &RunArgs {
+                    cli: false,
+                    runtime: RuntimeArgs::default(),
+                    workflow: "fixture-flow".to_owned(),
+                    workflow_options: Default::default(),
+                    request_args: RequestArgs::default(),
+                },
+            )
+            .unwrap_err()
+            .to_string();
 
-        assert!(error.contains("RALPH_RUN_ID 'run-2' does not match RALPH_RUN_DIR"));
+            assert!(
+                error.contains("opening the runner TUI requires both a workflow and a request")
+            );
+            assert!(error.contains("ralph run <workflow-id>"));
+        });
     }
 
     #[test]
-    fn emit_context_rejects_mismatched_project_dir_and_run_dir() {
-        let error = build_emit_context(
-            Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
-            None,
-            Some(Utf8PathBuf::from("/tmp/other-project")),
-            None,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
+    fn tui_launch_options_allow_missing_request_for_workflows_without_request_token() {
+        with_test_workflow_home(|| {
+            let project_dir = Utf8Path::new("/tmp/project");
+            let launch = build_tui_launch_options(
+                project_dir,
+                &RunArgs {
+                    cli: false,
+                    runtime: RuntimeArgs::default(),
+                    workflow: "test-workflow".to_owned(),
+                    workflow_options: Default::default(),
+                    request_args: RequestArgs::default(),
+                },
+            )
+            .unwrap();
 
-        assert!(
-            error.contains("RALPH_PROJECT_DIR '/tmp/other-project' does not match RALPH_RUN_DIR")
-        );
-    }
-
-    #[test]
-    fn loop_route_requires_prompt_path_context() {
-        let error = validate_emit_args(
-            "loop-route",
-            "beta",
-            &EmitContext {
-                run_id: "run-1".to_owned(),
-                project_dir: Utf8PathBuf::from("/tmp/project"),
-                run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/route-test/run-1"),
-                prompt_path: None,
-                prompt_name: "alpha".to_owned(),
-            },
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("missing RALPH_PROMPT_PATH"));
-    }
-
-    #[test]
-    fn tui_launch_options_require_exactly_one_request_form() {
-        let project_dir = Utf8Path::new("/tmp/project");
-        let error = build_tui_launch_options(
-            project_dir,
-            &RunArgs {
-                cli: false,
-                runtime: RuntimeArgs::default(),
-                workflow: "fixture-flow".to_owned(),
-                workflow_options: Default::default(),
-                request_args: RequestArgs::default(),
-            },
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("opening the runner TUI requires both a workflow and a request"));
-        assert!(error.contains("ralph run <workflow-id>"));
+            assert_eq!(launch.preset_workflow.as_deref(), Some("test-workflow"));
+            assert!(launch.preloaded_request.is_none());
+        });
     }
 
     #[test]
     fn tui_launch_options_preserve_positional_workflow_and_argv_request() {
-        let project_dir = Utf8Path::new("/tmp/project");
-        let launch = build_tui_launch_options(
-            project_dir,
-            &RunArgs {
-                cli: false,
-                runtime: RuntimeArgs::default(),
-                workflow: "fixture-flow".to_owned(),
-                workflow_options: Default::default(),
-                request_args: RequestArgs {
-                    request_file: None,
-                    request: vec!["fix".to_owned(), "tests".to_owned()],
+        with_test_workflow_home(|| {
+            let project_dir = Utf8Path::new("/tmp/project");
+            let launch = build_tui_launch_options(
+                project_dir,
+                &RunArgs {
+                    cli: false,
+                    runtime: RuntimeArgs::default(),
+                    workflow: "fixture-flow".to_owned(),
+                    workflow_options: Default::default(),
+                    request_args: RequestArgs {
+                        request_file: None,
+                        request: vec!["fix".to_owned(), "tests".to_owned()],
+                    },
                 },
-            },
-        )
-        .unwrap();
+            )
+            .unwrap();
 
-        assert_eq!(launch.preset_workflow.as_deref(), Some("fixture-flow"));
-        let preload = launch.preloaded_request.expect("preloaded request");
-        assert_eq!(preload.source, TuiRequestSource::Argv);
-        assert_eq!(preload.text, "fix tests");
-        assert!(preload.file_path.is_none());
+            assert_eq!(launch.preset_workflow.as_deref(), Some("fixture-flow"));
+            let preload = launch.preloaded_request.expect("preloaded request");
+            assert_eq!(preload.source, TuiRequestSource::Argv);
+            assert_eq!(preload.text, "fix tests");
+            assert!(preload.file_path.is_none());
+        });
     }
 
     #[test]

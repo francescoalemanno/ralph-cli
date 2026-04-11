@@ -9,6 +9,5 @@ async-trait.workspace = true
 camino.workspace = true
 libc.workspace = true
 ralph-core = { version = "0.4.4", path = "../ralph-core" }
-tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true

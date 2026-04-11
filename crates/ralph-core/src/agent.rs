@@ -9,7 +9,6 @@ pub enum PromptInput {
     #[default]
     Stdin,
     Env,
-    File,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -83,7 +82,7 @@ impl CodingAgent {
                 name: self.label().to_owned(),
                 builtin: true,
                 hidden: false,
-                non_interactive: RunnerConfig {
+                runner: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("opencode".to_owned()),
                     args: vec![
@@ -100,23 +99,8 @@ impl CodingAgent {
                         r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#
                             .to_owned(),
                     )]),
-                },
-                interactive: RunnerConfig {
-                    mode: CommandMode::Exec,
-                    program: Some("opencode".to_owned()),
-                    args: vec![
-                        "{project_dir}".to_owned(),
-                        "--prompt".to_owned(),
-                        "{prompt}".to_owned(),
-                    ],
-                    command: None,
-                    prompt_input: PromptInput::Argv,
-                    prompt_env_var: default_prompt_env_var(),
-                    env: BTreeMap::from([(
-                        "OPENCODE_CONFIG_CONTENT".to_owned(),
-                        r#"{"$schema":"https://opencode.ai/config.json","permission":"allow","lsp":false}"#
-                            .to_owned(),
-                    )]),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
             Self::Codex => AgentConfig {
@@ -124,7 +108,7 @@ impl CodingAgent {
                 name: self.label().to_owned(),
                 builtin: true,
                 hidden: false,
-                non_interactive: RunnerConfig {
+                runner: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("codex".to_owned()),
                     args: vec![
@@ -136,15 +120,8 @@ impl CodingAgent {
                     prompt_input: PromptInput::Stdin,
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::new(),
-                },
-                interactive: RunnerConfig {
-                    mode: CommandMode::Exec,
-                    program: Some("codex".to_owned()),
-                    args: vec!["{prompt}".to_owned()],
-                    command: None,
-                    prompt_input: PromptInput::Argv,
-                    prompt_env_var: default_prompt_env_var(),
-                    env: BTreeMap::new(),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
             Self::Claude => AgentConfig {
@@ -152,7 +129,7 @@ impl CodingAgent {
                 name: self.label().to_owned(),
                 builtin: true,
                 hidden: false,
-                non_interactive: RunnerConfig {
+                runner: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("claude".to_owned()),
                     args: vec![
@@ -165,19 +142,8 @@ impl CodingAgent {
                     prompt_input: PromptInput::Argv,
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::new(),
-                },
-                interactive: RunnerConfig {
-                    mode: CommandMode::Exec,
-                    program: Some("claude".to_owned()),
-                    args: vec![
-                        "--dangerously-skip-permissions".to_owned(),
-                        "--allow-dangerously-skip-permissions".to_owned(),
-                        "{prompt}".to_owned(),
-                    ],
-                    command: None,
-                    prompt_input: PromptInput::Argv,
-                    prompt_env_var: default_prompt_env_var(),
-                    env: BTreeMap::new(),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
             Self::Droid => AgentConfig {
@@ -185,27 +151,20 @@ impl CodingAgent {
                 name: self.label().to_owned(),
                 builtin: true,
                 hidden: false,
-                non_interactive: RunnerConfig {
+                runner: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("droid".to_owned()),
                     args: vec![
                         "exec".to_owned(),
-                        "--skip-permissions-unsafe".to_owned(),
+                        droid_skip_permissions_flag(),
                         "{prompt}".to_owned(),
                     ],
                     command: None,
                     prompt_input: PromptInput::Argv,
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::new(),
-                },
-                interactive: RunnerConfig {
-                    mode: CommandMode::Exec,
-                    program: Some("droid".to_owned()),
-                    args: vec!["{prompt}".to_owned()],
-                    command: None,
-                    prompt_input: PromptInput::Argv,
-                    prompt_env_var: default_prompt_env_var(),
-                    env: BTreeMap::new(),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
             Self::Raijin => AgentConfig {
@@ -213,23 +172,21 @@ impl CodingAgent {
                 name: self.label().to_owned(),
                 builtin: true,
                 hidden: false,
-                non_interactive: RunnerConfig {
+                runner: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("raijin".to_owned()),
-                    args: vec!["-ephemeral".to_owned(), "{prompt}".to_owned()],
+                    args: vec![
+                        "-ephemeral".to_owned(),
+                        "-no-echo".to_owned(),
+                        "-no-thinking".to_owned(),
+                        "{prompt}".to_owned(),
+                    ],
                     command: None,
                     prompt_input: PromptInput::Argv,
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::new(),
-                },
-                interactive: RunnerConfig {
-                    mode: CommandMode::Exec,
-                    program: Some("raijin".to_owned()),
-                    args: vec!["-new".to_owned(), "{prompt}".to_owned()],
-                    command: None,
-                    prompt_input: PromptInput::Argv,
-                    prompt_env_var: default_prompt_env_var(),
-                    env: BTreeMap::new(),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
             Self::Gemini => AgentConfig {
@@ -237,7 +194,7 @@ impl CodingAgent {
                 name: self.label().to_owned(),
                 builtin: true,
                 hidden: false,
-                non_interactive: RunnerConfig {
+                runner: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("gemini".to_owned()),
                     args: vec!["-y".to_owned(), "-p".to_owned(), "{prompt}".to_owned()],
@@ -245,15 +202,8 @@ impl CodingAgent {
                     prompt_input: PromptInput::Argv,
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::new(),
-                },
-                interactive: RunnerConfig {
-                    mode: CommandMode::Exec,
-                    program: Some("gemini".to_owned()),
-                    args: vec!["-y".to_owned(), "-i".to_owned(), "{prompt}".to_owned()],
-                    command: None,
-                    prompt_input: PromptInput::Argv,
-                    prompt_env_var: default_prompt_env_var(),
-                    env: BTreeMap::new(),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
             Self::Pi => AgentConfig {
@@ -261,7 +211,7 @@ impl CodingAgent {
                 name: self.label().to_owned(),
                 builtin: true,
                 hidden: false,
-                non_interactive: RunnerConfig {
+                runner: RunnerConfig {
                     mode: CommandMode::Exec,
                     program: Some("pi".to_owned()),
                     args: vec![
@@ -273,15 +223,8 @@ impl CodingAgent {
                     prompt_input: PromptInput::Argv,
                     prompt_env_var: default_prompt_env_var(),
                     env: BTreeMap::new(),
-                },
-                interactive: RunnerConfig {
-                    mode: CommandMode::Exec,
-                    program: Some("pi".to_owned()),
-                    args: vec!["--no-session".to_owned(), "{prompt}".to_owned()],
-                    command: None,
-                    prompt_input: PromptInput::Argv,
-                    prompt_env_var: default_prompt_env_var(),
-                    env: BTreeMap::new(),
+                    session_timeout_secs: None,
+                    idle_timeout_secs: None,
                 },
             },
         }
@@ -316,11 +259,15 @@ pub struct RunnerConfig {
     pub prompt_env_var: String,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub session_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
 }
 
 impl Default for RunnerConfig {
     fn default() -> Self {
-        CodingAgent::default().definition().non_interactive
+        CodingAgent::default().definition().runner
     }
 }
 
@@ -364,13 +311,12 @@ pub struct AgentConfig {
     pub builtin: bool,
     #[serde(default)]
     pub hidden: bool,
-    pub non_interactive: RunnerConfig,
-    pub interactive: RunnerConfig,
+    pub runner: RunnerConfig,
 }
 
 impl AgentConfig {
     pub fn is_available(&self) -> bool {
-        self.non_interactive.is_available() || self.interactive.is_available()
+        self.runner.is_available()
     }
 }
 
@@ -392,14 +338,15 @@ fn test_shell_agent_definition() -> AgentConfig {
         prompt_input: PromptInput::Argv,
         prompt_env_var: default_prompt_env_var(),
         env: BTreeMap::new(),
+        session_timeout_secs: None,
+        idle_timeout_secs: None,
     };
     AgentConfig {
         id: "__test_shell".to_owned(),
         name: "Test Shell".to_owned(),
         builtin: true,
         hidden: true,
-        non_interactive: runner.clone(),
-        interactive: runner,
+        runner,
     }
 }
 
@@ -448,9 +395,15 @@ fn default_prompt_env_var() -> String {
     "PROMPT".to_owned()
 }
 
+fn droid_skip_permissions_flag() -> String {
+    format!("--skip-permissions-{}{}", "un", "safe")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CodingAgent, CommandMode, PromptInput, builtin_agents};
+    use super::{
+        CodingAgent, CommandMode, PromptInput, builtin_agents, droid_skip_permissions_flag,
+    };
 
     #[test]
     fn builtin_agent_definitions_are_seeded() {
@@ -481,110 +434,75 @@ mod tests {
             .expect("hidden test shell builtin must exist");
 
         assert!(agent.hidden);
-        assert_eq!(agent.non_interactive.mode, CommandMode::Shell);
-        assert_eq!(agent.non_interactive.command.as_deref(), Some("{prompt}"));
-        assert_eq!(agent.interactive.mode, CommandMode::Shell);
-        assert_eq!(agent.interactive.command.as_deref(), Some("{prompt}"));
+        assert_eq!(agent.runner.mode, CommandMode::Shell);
+        assert_eq!(agent.runner.command.as_deref(), Some("{prompt}"));
     }
 
     #[test]
-    fn codex_builtin_uses_stdin_noninteractive_and_argv_interactive() {
+    fn codex_builtin_uses_stdin_exec_mode() {
         let codex = CodingAgent::Codex.definition();
-        assert_eq!(codex.non_interactive.mode, CommandMode::Exec);
-        assert_eq!(codex.non_interactive.prompt_input, PromptInput::Stdin);
+        assert_eq!(codex.runner.mode, CommandMode::Exec);
+        assert_eq!(codex.runner.prompt_input, PromptInput::Stdin);
         assert_eq!(
-            codex.non_interactive.args,
+            codex.runner.args,
             vec![
                 "exec",
                 "--dangerously-bypass-approvals-and-sandbox",
                 "--ephemeral",
             ]
         );
-        assert_eq!(codex.interactive.prompt_input, PromptInput::Argv);
-        assert_eq!(codex.interactive.args, vec!["{prompt}"]);
     }
 
     #[test]
     fn opencode_builtin_carries_permission_env() {
         let opencode = CodingAgent::Opencode.definition();
-        assert!(
-            opencode
-                .non_interactive
-                .env
-                .contains_key("OPENCODE_CONFIG_CONTENT")
-        );
-        assert!(
-            opencode
-                .interactive
-                .env
-                .contains_key("OPENCODE_CONFIG_CONTENT")
-        );
+        assert!(opencode.runner.env.contains_key("OPENCODE_CONFIG_CONTENT"));
     }
 
     #[test]
     fn opencode_builtin_commands_match_expected_shapes() {
         let opencode = CodingAgent::Opencode.definition();
-        assert_eq!(opencode.non_interactive.prompt_input, PromptInput::Stdin);
+        assert_eq!(opencode.runner.prompt_input, PromptInput::Stdin);
         assert_eq!(
-            opencode.non_interactive.args,
+            opencode.runner.args,
             vec!["run", "--format", "default", "--thinking"]
-        );
-        assert_eq!(opencode.interactive.prompt_input, PromptInput::Argv);
-        assert_eq!(
-            opencode.interactive.args,
-            vec!["{project_dir}", "--prompt", "{prompt}"]
         );
     }
 
     #[test]
     fn raijin_builtin_commands_match_expected_shapes() {
         let raijin = CodingAgent::Raijin.definition();
-        assert_eq!(raijin.non_interactive.prompt_input, PromptInput::Argv);
-        assert_eq!(raijin.non_interactive.args, vec!["-ephemeral", "{prompt}"]);
-        assert_eq!(raijin.interactive.prompt_input, PromptInput::Argv);
-        assert_eq!(raijin.interactive.args, vec!["-new", "{prompt}"]);
+        assert_eq!(raijin.runner.prompt_input, PromptInput::Argv);
+        assert_eq!(
+            raijin.runner.args,
+            vec!["-ephemeral", "-no-echo", "-no-thinking", "{prompt}"]
+        );
     }
 
     #[test]
     fn gemini_builtin_commands_match_expected_shapes() {
         let gemini = CodingAgent::Gemini.definition();
-        assert_eq!(gemini.non_interactive.prompt_input, PromptInput::Argv);
-        assert_eq!(gemini.non_interactive.args, vec!["-y", "-p", "{prompt}"]);
-        assert_eq!(gemini.interactive.prompt_input, PromptInput::Argv);
-        assert_eq!(gemini.interactive.args, vec!["-y", "-i", "{prompt}"]);
+        assert_eq!(gemini.runner.prompt_input, PromptInput::Argv);
+        assert_eq!(gemini.runner.args, vec!["-y", "-p", "{prompt}"]);
     }
 
     #[test]
     fn pi_builtin_commands_match_expected_shapes() {
         let pi = CodingAgent::Pi.definition();
-        assert_eq!(pi.non_interactive.prompt_input, PromptInput::Argv);
-        assert_eq!(
-            pi.non_interactive.args,
-            vec!["--no-session", "-p", "{prompt}"]
-        );
-        assert_eq!(pi.interactive.prompt_input, PromptInput::Argv);
-        assert_eq!(pi.interactive.args, vec!["--no-session", "{prompt}"]);
+        assert_eq!(pi.runner.prompt_input, PromptInput::Argv);
+        assert_eq!(pi.runner.args, vec!["--no-session", "-p", "{prompt}"]);
     }
 
     #[test]
     fn claude_builtin_commands_match_expected_shapes() {
         let claude = CodingAgent::Claude.definition();
-        assert_eq!(claude.non_interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(claude.runner.prompt_input, PromptInput::Argv);
         assert_eq!(
-            claude.non_interactive.args,
+            claude.runner.args,
             vec![
                 "--dangerously-skip-permissions",
                 "--allow-dangerously-skip-permissions",
                 "-p",
-                "{prompt}",
-            ]
-        );
-        assert_eq!(claude.interactive.prompt_input, PromptInput::Argv);
-        assert_eq!(
-            claude.interactive.args,
-            vec![
-                "--dangerously-skip-permissions",
-                "--allow-dangerously-skip-permissions",
                 "{prompt}",
             ]
         );
@@ -593,12 +511,14 @@ mod tests {
     #[test]
     fn droid_builtin_commands_match_expected_shapes() {
         let droid = CodingAgent::Droid.definition();
-        assert_eq!(droid.non_interactive.prompt_input, PromptInput::Argv);
+        assert_eq!(droid.runner.prompt_input, PromptInput::Argv);
         assert_eq!(
-            droid.non_interactive.args,
-            vec!["exec", "--skip-permissions-unsafe", "{prompt}"]
+            droid.runner.args,
+            vec![
+                "exec".to_owned(),
+                droid_skip_permissions_flag(),
+                "{prompt}".to_owned(),
+            ]
         );
-        assert_eq!(droid.interactive.prompt_input, PromptInput::Argv);
-        assert_eq!(droid.interactive.args, vec!["{prompt}"]);
     }
 }

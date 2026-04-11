@@ -9,9 +9,9 @@ const RALPH_ENV_PROJECT_DIR_TOKEN: &str = "env:PROJECT_DIR";
 const RALPH_REQUEST_TOKEN: &str = "request";
 const RALPH_OPTION_PREFIX_TOKEN: &str = "option:";
 const RALPH_SKILL_EMIT_TOKEN: &str = "skill-emit";
+const RALPH_GET_PREFIX_TOKEN: &str = "get:";
 const RALPH_ROUTE_PREFIX_TOKEN: &str = "route:";
 const RALPH_STOP_PREFIX_TOKEN: &str = "stop:";
-const RALPH_EMIT_COMMAND_PREFIX: &str = "$RALPH_BIN emit";
 const RALPH_SKILL_EMIT_NAME: &str = "Ralph event emission";
 
 pub(crate) fn interpolate_workflow_prompt(
@@ -85,6 +85,10 @@ fn render_ralph_token(token: &str, context: &PromptInterpolationContext<'_>) -> 
                     )
                 })
         }
+        _ if token.starts_with(RALPH_GET_PREFIX_TOKEN) => {
+            let spec = &token[RALPH_GET_PREFIX_TOKEN.len()..];
+            render_get_macro(spec)
+        }
         _ if token.starts_with(RALPH_ROUTE_PREFIX_TOKEN) => {
             let route = &token[RALPH_ROUTE_PREFIX_TOKEN.len()..];
             render_route_macro(route)
@@ -104,7 +108,7 @@ fn render_route_macro(route: &str) -> Result<String> {
             "workflow token '{{ralph-route:...}}' requires a route"
         ));
     }
-    Ok(render_emit_command("loop-route", Some(route)))
+    Ok(render_payload_instruction("loop-route", route))
 }
 
 fn render_stop_macro(spec: &str) -> Result<String> {
@@ -119,26 +123,93 @@ fn render_stop_macro(spec: &str) -> Result<String> {
         ));
     }
 
-    Ok(render_emit_command(
-        &format!("loop-stop:{status}"),
-        Some(body),
-    ))
+    let event = format!("loop-stop:{status}");
+    Ok(if body.is_empty() {
+        render_signal_instruction(&event)
+    } else {
+        render_payload_instruction(&event, body)
+    })
 }
 
-fn render_emit_command(event: &str, body: Option<&str>) -> String {
-    match body.map(str::trim).filter(|body| !body.is_empty()) {
-        Some(body) => format!("`{RALPH_EMIT_COMMAND_PREFIX} {event} {body}`"),
-        None => format!("`{RALPH_EMIT_COMMAND_PREFIX} {event}`"),
+fn render_get_macro(spec: &str) -> Result<String> {
+    let spec = spec.trim();
+    let Some((left, event_name)) = spec.rsplit_once(':') else {
+        let event_name = spec.trim();
+        if event_name.is_empty() {
+            return Err(anyhow!(
+                "workflow token '{{ralph-get:...}}' requires an event name"
+            ));
+        }
+        return Ok(render_get_instruction(event_name));
+    };
+
+    let event_name = event_name.trim();
+    if event_name.is_empty() {
+        return Err(anyhow!(
+            "workflow token '{{ralph-get:...}}' requires an event name"
+        ));
     }
+
+    let channel_id = left.trim();
+    if channel_id.is_empty() {
+        return Ok(render_get_instruction(event_name));
+    }
+
+    Ok(render_get_in_channel_instruction(channel_id, event_name))
+}
+
+fn render_signal_instruction(event: &str) -> String {
+    format!(
+        "emit event `{event}` with no body by writing `{}`",
+        render_signal_marker(event)
+    )
+}
+
+fn render_get_instruction(event: &str) -> String {
+    format!(
+        "read the latest payload for event `{event}` across all channels by running `\"$RALPH_BIN\" get {event}`"
+    )
+}
+
+fn render_get_in_channel_instruction(channel_id: &str, event: &str) -> String {
+    format!(
+        "read the latest payload for event `{event}` from channel `{channel_id}` by running `\"$RALPH_BIN\" get --channel {channel_id} {event}`"
+    )
+}
+
+fn render_payload_instruction(event: &str, body: &str) -> String {
+    format!(
+        "emit event `{event}` with body `{body}` by writing `{}`",
+        render_payload_marker(event, body)
+    )
+}
+
+fn render_signal_marker(event: &str) -> String {
+    format!("<<<SIGNAL:{event}>>>")
+}
+
+fn render_payload_marker(event: &str, body: &str) -> String {
+    format!("<<<PAYLOAD:{event}>>>{body}<<<END-PAYLOAD>>>")
 }
 
 fn render_skill_emit_content() -> String {
     format!(
         r#"<skill name="{RALPH_SKILL_EMIT_NAME}">
-- RALPH_BIN is an environment variable which point to the ralph binary path.
-- running the command {} will emit the event.
+definitions:
+event-name = the logical name of the event or payload to emit
+channel-id = the logical output channel identifier
+event-body = the body of the event and payload to emit
+- To emit an event without a body, write `{}`
+- To emit an event with a body, write `{}`
+- Event bodies may span multiple lines.
+- Do not explain the event in prose; output the marker itself.
+- `RALPH_BIN` points to the Ralph binary for this run.
+- Ralph automatically records each emitted event on the correct channel for the current prompt or worker.
+- `"$RALPH_BIN" get <event-name>` reads the latest payload for `<event-name>` across all channels in the current run.
+- `"$RALPH_BIN" get --channel <channel-id> <event-name>` reads the latest payload for `<event-name>` from one specific channel.
 </skill>"#,
-        render_emit_command("<event-name>", Some("<event-body>"))
+        render_signal_marker("event-name"),
+        render_payload_marker("event-name", "event-body"),
     )
 }
 
@@ -172,7 +243,12 @@ mod tests {
         .unwrap();
 
         assert!(rendered.contains("<skill name=\"Ralph event emission\">"));
-        assert!(rendered.contains("$RALPH_BIN emit <event-name> <event-body>"));
+        assert!(rendered.contains("<<<SIGNAL:event-name>>>"));
+        assert!(rendered.contains("<<<PAYLOAD:event-name>>>"));
+        assert!(rendered.contains("event-body"));
+        assert!(rendered.contains("<<<END-PAYLOAD>>>"));
+        assert!(rendered.contains("\"$RALPH_BIN\" get <event-name>"));
+        assert!(rendered.contains("\"$RALPH_BIN\" get --channel <channel-id> <event-name>"));
         assert!(rendered.contains("project=/tmp/project"));
         assert!(rendered.contains("request=ship it"));
         assert!(rendered.contains("progress=progress.txt"));
@@ -188,9 +264,33 @@ mod tests {
         )
         .unwrap();
 
-        assert!(rendered.contains("`$RALPH_BIN emit loop-route build`"));
-        assert!(rendered.contains("`$RALPH_BIN emit loop-stop:ok verification-passed`"));
-        assert!(rendered.contains("`$RALPH_BIN emit loop-stop:error`"));
+        assert!(rendered.contains(
+            "emit event `loop-route` with body `build` by writing `<<<PAYLOAD:loop-route>>>build<<<END-PAYLOAD>>>`"
+        ));
+        assert!(rendered.contains(
+            "emit event `loop-stop:ok` with body `verification-passed` by writing `<<<PAYLOAD:loop-stop:ok>>>verification-passed<<<END-PAYLOAD>>>`"
+        ));
+        assert!(rendered.contains(
+            "emit event `loop-stop:error` with no body by writing `<<<SIGNAL:loop-stop:error>>>`"
+        ));
+    }
+
+    #[test]
+    fn workflow_prompt_interpolates_get_macros() {
+        let rendered = interpolate_workflow_prompt(
+            "{ralph-get:handoff}\n{ralph-get:QT:review}",
+            Utf8Path::new("/tmp/project"),
+            None,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert!(rendered.contains(
+            "read the latest payload for event `handoff` across all channels by running `\"$RALPH_BIN\" get handoff`"
+        ));
+        assert!(rendered.contains(
+            "read the latest payload for event `review` from channel `QT` by running `\"$RALPH_BIN\" get --channel QT review`"
+        ));
     }
 
     #[test]
@@ -250,5 +350,20 @@ mod tests {
 
         assert!(error.contains("{ralph-option:progress-file}"));
         assert!(error.contains("requires workflow option 'progress-file'"));
+    }
+
+    #[test]
+    fn workflow_prompt_rejects_missing_get_event_name() {
+        let error = interpolate_workflow_prompt(
+            "review={ralph-get:}",
+            Utf8Path::new("/tmp/project"),
+            None,
+            &BTreeMap::new(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("{ralph-get:...}"));
+        assert!(error.contains("requires an event name"));
     }
 }

@@ -16,7 +16,6 @@ request:
 prompts:
   dispatch:
     title: Dispatcher
-    is_interactive: false
     fallback-route: dispatch
     prompt: |
       {ralph-skill-emit}
@@ -27,9 +26,9 @@ prompts:
          - Use the request and plan as your primary control surface.
          - If the decision is still unclear after reading the request and plan, you MAY inspect the codebase just enough to disambiguate.
       4. Route exactly once:
-         - If `{ralph-option:plan-file}` is missing, stale, ambiguous, contradictory, not right-sized, or not aligned with the request, run {ralph-route:decompose}, then goto 5. Stop.
-         - Else if `{ralph-option:plan-file}` still has one or more actionable unchecked checklist items, run {ralph-route:build}, then goto 5. Stop.
-         - Else if `{ralph-option:plan-file}` is aligned with the request and all actionable checklist items appear completed, run {ralph-route:verify}, then goto 5. Stop.
+         - If `{ralph-option:plan-file}` is missing, stale, ambiguous, contradictory, not right-sized, or not aligned with the request, {ralph-route:decompose}, then goto 5. Stop.
+         - Else if `{ralph-option:plan-file}` still has one or more actionable unchecked checklist items, {ralph-route:build}, then goto 5. Stop.
+         - Else if `{ralph-option:plan-file}` is aligned with the request and all actionable checklist items appear completed, {ralph-route:verify}, then goto 5. Stop.
       5. Stop.
 
       # Constraints
@@ -44,7 +43,6 @@ prompts:
       END USER REQUEST >>> 
   build:
     title: Builder
-    is_interactive: false
     fallback-route: dispatch
     prompt: |
       # Execution policy
@@ -72,7 +70,6 @@ prompts:
 
   decompose:
     title: Decomposer
-    is_interactive: false
     fallback-route: dispatch
     prompt: |
       # Execution policy
@@ -100,7 +97,6 @@ prompts:
 
   verify:
     title: Verifier
-    is_interactive: false
     fallback-route: verify
     prompt: |
       {ralph-skill-emit}
@@ -111,13 +107,13 @@ prompts:
       4. Run the checks and tests needed to verify that the whole project works as expected for the request, not just one item.
          - If there is no single obvious command, use your judgment and run the best available whole-project validation set.
       5. Decide exactly once:
-         - If the project works as expected, run {ralph-stop:ok:verification-passed}, then goto 6. Stop.
-         - Else run {ralph-stop:error:verification-failed}, then goto 6. Stop.
+         - If the project works as expected, {ralph-stop:ok:verification-passed}, then goto 6. Stop.
+         - Else {ralph-stop:error:verification-failed}, then goto 6. Stop.
       6. Stop.
 
       # Constraints
       - Verification only. Do not implement. Do not replan. Do not update `{ralph-option:plan-file}`.
-      - You MUST emit either `loop-stop:ok` or `loop-stop:error`.
+      - You MUST emit exactly one loop-stop event in this step.
       - Prefer whole-project validation over narrow item-local checks.
 
       <<< USER REQUEST
