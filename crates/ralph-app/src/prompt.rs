@@ -20,6 +20,15 @@ pub(crate) fn interpolate_workflow_prompt(
     request: Option<&str>,
     workflow_options: &BTreeMap<String, String>,
 ) -> Result<String> {
+    interpolate_workflow_value(prompt_text, project_dir, request, workflow_options)
+}
+
+pub(crate) fn interpolate_workflow_value(
+    prompt_text: &str,
+    project_dir: &Utf8Path,
+    request: Option<&str>,
+    workflow_options: &BTreeMap<String, String>,
+) -> Result<String> {
     let project_dir = absolute_unix_path(project_dir)?;
     let context = PromptInterpolationContext {
         project_dir: &project_dir,

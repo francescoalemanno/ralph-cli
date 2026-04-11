@@ -12,6 +12,13 @@ prompts:
   task:
     title: Task executor
     fallback-route: task
+    transition-guards:
+      stop-ok:
+        - type: file_not_contains
+          path: "{ralph-option:plan-file}"
+          literal: "- [ ]"
+          on-fail: continue
+          note: "task completion ignored: plan still contains unchecked items"
     prompt: |
       {ralph-skill-emit}
       Read the plan file at `{ralph-option:plan-file}`. Find the FIRST Task section (`### Task N:` or `### Iteration N:`) that has uncompleted checkboxes (`[ ]`).
@@ -44,8 +51,8 @@ prompts:
       - If Task sections are complete but `## Success criteria`, `## Overview`, or `## Context` has `[ ]` items that the implementation now satisfies, mark them `[x]` in the same edit.
       - Commit all changes, including the updated plan, with message: `feat: <brief task description>`.
       - Check whether any `[ ]` checkboxes remain in Task sections.
-      - If NO more `[ ]` checkboxes remain in Task sections, {ralph-stop:ok:task-stage-complete} and stop.
       - If more Task sections still have `[ ]` checkboxes, STOP HERE and do not emit any loop-control event. The fallback route will rerun this prompt for the next task section.
+      - Else-If NO more `[ ]` checkboxes remain in Task sections, {ralph-stop:ok:task-stage-complete} and stop.
 
       If any phase fails after reasonable fix attempts, {ralph-stop:error:task-failed}.
 

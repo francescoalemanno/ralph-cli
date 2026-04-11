@@ -15,6 +15,7 @@ const REQUEST_TOKEN: &str = "{ralph-request}";
 const PROJECT_DIR_TOKEN: &str = "{ralph-env:PROJECT_DIR}";
 const REMOVED_RUN_DIR_TOKEN: &str = "{ralph-env:RUN_DIR}";
 const OPTION_TOKEN_PREFIX: &str = "{ralph-option:";
+const RALPH_TOKEN_START: &str = "{ralph-";
 
 pub const NO_ROUTE_OK: &str = "no-route-ok";
 pub const NO_ROUTE_ERROR: &str = "no-route-error";
@@ -151,6 +152,7 @@ impl WorkflowDefinition {
                     ));
                 }
             }
+            self.validate_transition_guards(prompt_id, prompt)?;
         }
 
         let request_sources = self
@@ -264,6 +266,285 @@ impl WorkflowDefinition {
         }
         Ok(())
     }
+
+    fn validate_transition_guards(
+        &self,
+        prompt_id: &str,
+        prompt: &WorkflowPromptDefinition,
+    ) -> Result<()> {
+        for (transition_id, guards) in &prompt.transition_guards {
+            self.validate_transition_guard_transition_id(prompt_id, transition_id)?;
+            if guards.is_empty() {
+                return Err(anyhow!(
+                    "workflow '{}' prompt '{}' transition guard list '{}' cannot be empty",
+                    self.workflow_id,
+                    prompt_id,
+                    transition_id
+                ));
+            }
+
+            for guard in guards {
+                self.validate_transition_guard(prompt_id, transition_id, guard)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_transition_guard_transition_id(
+        &self,
+        prompt_id: &str,
+        transition_id: &str,
+    ) -> Result<()> {
+        match transition_id {
+            "continue" | "stop-ok" | "stop-error" => Ok(()),
+            _ if transition_id.starts_with("route:") => {
+                let route = transition_id["route:".len()..].trim();
+                if route.is_empty() {
+                    return Err(anyhow!(
+                        "workflow '{}' prompt '{}' transition guard route target cannot be empty",
+                        self.workflow_id,
+                        prompt_id
+                    ));
+                }
+                if matches!(route, NO_ROUTE_OK | NO_ROUTE_ERROR)
+                    || !self.prompts.contains_key(route)
+                {
+                    return Err(anyhow!(
+                        "workflow '{}' prompt '{}' transition guard route target '{}' is not a known prompt id",
+                        self.workflow_id,
+                        prompt_id,
+                        route
+                    ));
+                }
+                Ok(())
+            }
+            _ => Err(anyhow!(
+                "workflow '{}' prompt '{}' uses unsupported transition guard target '{}'; expected continue, stop-ok, stop-error, or route:<prompt-id>",
+                self.workflow_id,
+                prompt_id,
+                transition_id
+            )),
+        }
+    }
+
+    fn validate_transition_guard(
+        &self,
+        prompt_id: &str,
+        transition_id: &str,
+        guard: &WorkflowTransitionGuard,
+    ) -> Result<()> {
+        match guard {
+            WorkflowTransitionGuard::FileExists { path, failure } => {
+                self.validate_transition_guard_path(prompt_id, path)?;
+                self.validate_transition_guard_failure(prompt_id, transition_id, failure)?;
+            }
+            WorkflowTransitionGuard::FileContains {
+                path,
+                literal,
+                failure,
+            }
+            | WorkflowTransitionGuard::FileNotContains {
+                path,
+                literal,
+                failure,
+            } => {
+                self.validate_transition_guard_path(prompt_id, path)?;
+                if literal.trim().is_empty() {
+                    return Err(anyhow!(
+                        "workflow '{}' prompt '{}' transition guard '{}' literal cannot be empty",
+                        self.workflow_id,
+                        prompt_id,
+                        transition_id
+                    ));
+                }
+                self.validate_transition_guard_failure(prompt_id, transition_id, failure)?;
+            }
+            WorkflowTransitionGuard::EventExists {
+                event,
+                channel,
+                failure,
+            } => {
+                self.validate_transition_guard_event(prompt_id, transition_id, event, channel)?;
+                self.validate_transition_guard_failure(prompt_id, transition_id, failure)?;
+            }
+            WorkflowTransitionGuard::EventContains {
+                event,
+                channel,
+                literal,
+                failure,
+            } => {
+                self.validate_transition_guard_event(prompt_id, transition_id, event, channel)?;
+                if literal.trim().is_empty() {
+                    return Err(anyhow!(
+                        "workflow '{}' prompt '{}' transition guard '{}' literal cannot be empty",
+                        self.workflow_id,
+                        prompt_id,
+                        transition_id
+                    ));
+                }
+                self.validate_transition_guard_failure(prompt_id, transition_id, failure)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_transition_guard_path(&self, prompt_id: &str, path: &str) -> Result<()> {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!(
+                "workflow '{}' prompt '{}' transition guard path cannot be empty",
+                self.workflow_id,
+                prompt_id
+            ));
+        }
+        if trimmed.contains(REMOVED_RUN_DIR_TOKEN) {
+            return Err(anyhow!(
+                "workflow '{}' prompt '{}' transition guard path uses unsupported interpolation '{}'; use '{}' or plain project-relative paths instead",
+                self.workflow_id,
+                prompt_id,
+                REMOVED_RUN_DIR_TOKEN,
+                PROJECT_DIR_TOKEN
+            ));
+        }
+
+        for option_id in referenced_option_ids(trimmed) {
+            if !self.options.contains_key(option_id) {
+                return Err(anyhow!(
+                    "workflow '{}' prompt '{}' transition guard path references undefined option '{}'",
+                    self.workflow_id,
+                    prompt_id,
+                    option_id
+                ));
+            }
+        }
+
+        let mut remaining = trimmed;
+        while let Some(start) = remaining.find(RALPH_TOKEN_START) {
+            let suffix = &remaining[start + 1..];
+            let Some(end) = suffix.find('}') else {
+                return Err(anyhow!(
+                    "workflow '{}' prompt '{}' transition guard path contains an unterminated Ralph token",
+                    self.workflow_id,
+                    prompt_id
+                ));
+            };
+            let token = &suffix[..end];
+            if token != "ralph-env:PROJECT_DIR" && !token.starts_with("ralph-option:") {
+                return Err(anyhow!(
+                    "workflow '{}' prompt '{}' transition guard paths only support '{}', '{{ralph-option:...}}', or plain paths",
+                    self.workflow_id,
+                    prompt_id,
+                    PROJECT_DIR_TOKEN
+                ));
+            }
+            remaining = &suffix[end + 1..];
+        }
+
+        Ok(())
+    }
+
+    fn validate_transition_guard_event(
+        &self,
+        prompt_id: &str,
+        transition_id: &str,
+        event: &str,
+        channel: &Option<String>,
+    ) -> Result<()> {
+        if event.trim().is_empty() {
+            return Err(anyhow!(
+                "workflow '{}' prompt '{}' transition guard '{}' event cannot be empty",
+                self.workflow_id,
+                prompt_id,
+                transition_id
+            ));
+        }
+        if let Some(channel) = channel
+            && channel.trim().is_empty()
+        {
+            return Err(anyhow!(
+                "workflow '{}' prompt '{}' transition guard '{}' channel cannot be empty",
+                self.workflow_id,
+                prompt_id,
+                transition_id
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_transition_guard_failure(
+        &self,
+        prompt_id: &str,
+        transition_id: &str,
+        failure: &WorkflowTransitionGuardFailure,
+    ) -> Result<()> {
+        match failure.on_fail {
+            WorkflowTransitionGuardFailureAction::Continue
+            | WorkflowTransitionGuardFailureAction::Error => {
+                if let Some(route) = &failure.route {
+                    return Err(anyhow!(
+                        "workflow '{}' prompt '{}' transition guard '{}' must not define route '{}' when on-fail is '{}'",
+                        self.workflow_id,
+                        prompt_id,
+                        transition_id,
+                        route,
+                        failure.on_fail.label()
+                    ));
+                }
+            }
+            WorkflowTransitionGuardFailureAction::Route => {
+                let route = failure.route.as_deref().map(str::trim).ok_or_else(|| {
+                    anyhow!(
+                        "workflow '{}' prompt '{}' transition guard '{}' requires a route when on-fail is 'route'",
+                        self.workflow_id,
+                        prompt_id,
+                        transition_id
+                    )
+                })?;
+                if route.is_empty() || matches!(route, NO_ROUTE_OK | NO_ROUTE_ERROR) {
+                    return Err(anyhow!(
+                        "workflow '{}' prompt '{}' transition guard '{}' route target cannot be empty or a sentinel",
+                        self.workflow_id,
+                        prompt_id,
+                        transition_id
+                    ));
+                }
+                if !self.prompts.contains_key(route) {
+                    return Err(anyhow!(
+                        "workflow '{}' prompt '{}' transition guard '{}' route target '{}' is not a known prompt id",
+                        self.workflow_id,
+                        prompt_id,
+                        transition_id,
+                        route
+                    ));
+                }
+            }
+        }
+
+        if let Some(note) = &failure.note
+            && note.trim().is_empty()
+        {
+            return Err(anyhow!(
+                "workflow '{}' prompt '{}' transition guard '{}' note cannot be empty",
+                self.workflow_id,
+                prompt_id,
+                transition_id
+            ));
+        }
+        if let Some(summary) = &failure.summary
+            && summary.trim().is_empty()
+        {
+            return Err(anyhow!(
+                "workflow '{}' prompt '{}' transition guard '{}' summary cannot be empty",
+                self.workflow_id,
+                prompt_id,
+                transition_id
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 fn validate_worker_id(worker_id: &str) -> Result<()> {
@@ -295,6 +576,75 @@ pub struct WorkflowPromptDefinition {
     pub prompt: Option<String>,
     #[serde(default)]
     pub parallel: Option<WorkflowParallelDefinition>,
+    #[serde(default, rename = "transition-guards")]
+    pub transition_guards: BTreeMap<String, Vec<WorkflowTransitionGuard>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowTransitionGuardFailureAction {
+    Continue,
+    Error,
+    Route,
+}
+
+impl WorkflowTransitionGuardFailureAction {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Error => "error",
+            Self::Route => "route",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowTransitionGuardFailure {
+    #[serde(rename = "on-fail")]
+    pub on_fail: WorkflowTransitionGuardFailureAction,
+    #[serde(default)]
+    pub route: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkflowTransitionGuard {
+    FileExists {
+        path: String,
+        #[serde(flatten)]
+        failure: WorkflowTransitionGuardFailure,
+    },
+    FileContains {
+        path: String,
+        literal: String,
+        #[serde(flatten)]
+        failure: WorkflowTransitionGuardFailure,
+    },
+    FileNotContains {
+        path: String,
+        literal: String,
+        #[serde(flatten)]
+        failure: WorkflowTransitionGuardFailure,
+    },
+    EventExists {
+        event: String,
+        #[serde(default)]
+        channel: Option<String>,
+        #[serde(flatten)]
+        failure: WorkflowTransitionGuardFailure,
+    },
+    EventContains {
+        event: String,
+        literal: String,
+        #[serde(default)]
+        channel: Option<String>,
+        #[serde(flatten)]
+        failure: WorkflowTransitionGuardFailure,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -922,6 +1272,7 @@ prompts:
                     fallback_route: NO_ROUTE_ERROR.to_owned(),
                     prompt: Some("hello".to_owned()),
                     parallel: None,
+                    transition_guards: BTreeMap::new(),
                 },
             )]),
             source_path: None,
@@ -949,6 +1300,7 @@ prompts:
                     fallback_route: NO_ROUTE_ERROR.to_owned(),
                     prompt: Some("{ralph-env:RUN_DIR}/progress.txt".to_owned()),
                     parallel: None,
+                    transition_guards: BTreeMap::new(),
                 },
             )]),
             source_path: None,
@@ -977,6 +1329,7 @@ prompts:
                     fallback_route: NO_ROUTE_ERROR.to_owned(),
                     prompt: Some("{ralph-option:progress-file}".to_owned()),
                     parallel: None,
+                    transition_guards: BTreeMap::new(),
                 },
             )]),
             source_path: None,
@@ -1021,6 +1374,7 @@ prompts:
                     fallback_route: NO_ROUTE_ERROR.to_owned(),
                     prompt: Some("hello".to_owned()),
                     parallel: None,
+                    transition_guards: BTreeMap::new(),
                 },
             )]),
             source_path: None,
@@ -1100,6 +1454,47 @@ prompts:
         assert!(prompt.contains(
             "do not emit a fresh draft that ignores the existing review feedback or the latest WAL draft state"
         ));
+    }
+
+    #[test]
+    fn task_workflow_defines_stop_ok_transition_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("task.yml")).unwrap();
+        let workflow =
+            load_workflow_from_path_for_test(&path, include_str!("../workflows/task.yml")).unwrap();
+
+        let task = workflow.prompt("task").expect("task prompt");
+        assert!(task.transition_guards.contains_key("stop-ok"));
+    }
+
+    #[test]
+    fn transition_guard_routes_must_target_known_prompt_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("guarded.yml")).unwrap();
+        let error = load_workflow_from_path_for_test(
+            &path,
+            r#"
+version: 1
+workflow_id: guarded
+title: Guarded
+entrypoint: main
+prompts:
+  main:
+    title: Main
+    fallback-route: no-route-error
+    transition-guards:
+      stop-ok:
+        - type: file_exists
+          path: PLAN.md
+          on-fail: route
+          route: missing
+    prompt: hello
+"#,
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("route target 'missing' is not a known prompt id"));
     }
 
     fn load_workflow_from_path_for_test(
