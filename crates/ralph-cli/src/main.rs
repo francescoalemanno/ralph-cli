@@ -266,7 +266,7 @@ async fn run_cli_workflow(
                 .to_string(),
         },
     );
-    let mut delegate = ConsoleDelegate::default();
+    let mut delegate = ConsoleDelegate;
     let summary = app
         .run_workflow(&args.workflow, input, &mut delegate)
         .await?;

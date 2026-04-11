@@ -243,7 +243,7 @@ struct PlanningDraftDialog {
 
 enum PlanningDraftMode {
     Review,
-    Revising { textarea: TextArea<'static> },
+    Revising { textarea: Box<TextArea<'static>> },
 }
 
 impl PlanningDraftDialog {
@@ -254,7 +254,7 @@ impl PlanningDraftDialog {
 
 enum ActiveDialog {
     PlanningQuestion(PlanningQuestionDialog),
-    PlanningDraft(PlanningDraftDialog),
+    PlanningDraft(Box<PlanningDraftDialog>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -584,7 +584,9 @@ impl TuiApp {
                             }
                             1 => {
                                 dialog.mode = PlanningDraftMode::Revising {
-                                    textarea: self.new_planning_revision_textarea(&dialog.feedback),
+                                    textarea: Box::new(
+                                        self.new_planning_revision_textarea(&dialog.feedback),
+                                    ),
                                 };
                                 self.message = "editing revision feedback".to_owned();
                             }
@@ -813,14 +815,15 @@ impl TuiApp {
                     ));
                 }
                 self.message = "review the plan draft".to_owned();
-                self.active_dialog = Some(ActiveDialog::PlanningDraft(PlanningDraftDialog {
-                    draft,
-                    selected: 0,
-                    scroll: 0,
-                    mode: PlanningDraftMode::Review,
-                    feedback: String::new(),
-                    reply,
-                }));
+                self.active_dialog =
+                    Some(ActiveDialog::PlanningDraft(Box::new(PlanningDraftDialog {
+                        draft,
+                        selected: 0,
+                        scroll: 0,
+                        mode: PlanningDraftMode::Review,
+                        feedback: String::new(),
+                        reply,
+                    })));
             }
         }
 
@@ -1811,7 +1814,7 @@ impl TuiApp {
                 if let Some(feedback_area) = layout.feedback
                     && let PlanningDraftMode::Revising { textarea } = &dialog.mode
                 {
-                    frame.render_widget(textarea, feedback_area);
+                    frame.render_widget(textarea.as_ref(), feedback_area);
                 }
 
                 let actions = if dialog.is_revising() {
@@ -2210,7 +2213,7 @@ fn wrap_planning_draft(markdown: &str, width: u16) -> Vec<DraftWrappedLine> {
 
         if is_horizontal_rule(trimmed) {
             lines.push(DraftWrappedLine {
-                text: "─".repeat(width.min(64).max(3)),
+                text: "─".repeat(width.clamp(3, 64)),
                 kind: DraftLineKind::Rule,
             });
             continue;
@@ -2506,17 +2509,17 @@ mod tests {
 
     fn planning_draft_dialog(tui: &TuiApp) -> &PlanningDraftDialog {
         match tui.active_dialog.as_ref() {
-            Some(ActiveDialog::PlanningDraft(dialog)) => dialog,
+            Some(ActiveDialog::PlanningDraft(dialog)) => dialog.as_ref(),
             _ => panic!("expected planning draft dialog"),
         }
     }
 
     fn planning_draft_textarea_text(tui: &TuiApp) -> Option<String> {
         match tui.active_dialog.as_ref() {
-            Some(ActiveDialog::PlanningDraft(PlanningDraftDialog {
-                mode: PlanningDraftMode::Revising { textarea },
-                ..
-            })) => Some(textarea.lines().join("\n")),
+            Some(ActiveDialog::PlanningDraft(dialog)) => match &dialog.mode {
+                PlanningDraftMode::Revising { textarea } => Some(textarea.lines().join("\n")),
+                PlanningDraftMode::Review => None,
+            },
             _ => None,
         }
     }
@@ -2787,7 +2790,7 @@ prompt_env_var = "PROMPT"
             .collect::<Vec<_>>()
             .join("\n");
         let (dialog, _reply_rx) = new_planning_draft_dialog(&draft);
-        tui.active_dialog = Some(ActiveDialog::PlanningDraft(dialog));
+        tui.active_dialog = Some(ActiveDialog::PlanningDraft(Box::new(dialog)));
         let screen = Rect::new(0, 0, 100, 30);
 
         tui.handle_dialog_key(KeyEvent::from(KeyCode::Down), screen)
@@ -2822,7 +2825,7 @@ prompt_env_var = "PROMPT"
             .collect::<Vec<_>>()
             .join("\n");
         let (dialog, _reply_rx) = new_planning_draft_dialog(&draft);
-        tui.active_dialog = Some(ActiveDialog::PlanningDraft(dialog));
+        tui.active_dialog = Some(ActiveDialog::PlanningDraft(Box::new(dialog)));
         let screen = Rect::new(0, 0, 100, 30);
         let layout = planning_draft_layout(screen, false);
 
@@ -2853,7 +2856,7 @@ prompt_env_var = "PROMPT"
     fn revise_feedback_is_edited_in_textarea_after_confirming_revise() {
         let (mut tui, _temp) = new_test_tui();
         let (dialog, reply_rx) = new_planning_draft_dialog("# Title");
-        tui.active_dialog = Some(ActiveDialog::PlanningDraft(dialog));
+        tui.active_dialog = Some(ActiveDialog::PlanningDraft(Box::new(dialog)));
         let screen = Rect::new(0, 0, 100, 30);
 
         tui.handle_dialog_key(KeyEvent::from(KeyCode::Char('2')), screen)
