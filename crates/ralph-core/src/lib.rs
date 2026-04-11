@@ -2,6 +2,7 @@ mod agent;
 mod agent_events;
 mod atomic;
 mod config;
+mod theme;
 mod types;
 mod workflow;
 
@@ -19,6 +20,7 @@ pub use config::{
     ARTIFACT_DIR_NAME, AppConfig, ConfigFileScope, ScopedGlobalConfigDirOverride, ThemeConfig,
     global_config_dir, scoped_global_config_dir_override,
 };
+pub use theme::{ResolvedTheme, ThemeColor, ThemeMode, ThemeVariant};
 pub use types::{LastRunStatus, RunControl, RunnerInvocation, RunnerResult, WorkflowRunSummary};
 pub use workflow::{
     NO_ROUTE_ERROR, NO_ROUTE_OK, WorkflowDefinition, WorkflowFileRequest, WorkflowOptionDefinition,

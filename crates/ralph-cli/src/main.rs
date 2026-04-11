@@ -114,7 +114,7 @@ async fn run_command(project_dir: Utf8PathBuf, command: Commands) -> Result<()> 
         Commands::Edit(args) => {
             let app = RalphApp::load(project_dir)?;
             let path = app.resolve_workflow_edit_path(&args.workflow_id)?;
-            edit_file(&path, app.config().editor_override.as_deref())
+            edit_file(&path, app.config().editor_override.as_deref(), &app.config().theme)
         }
         Commands::Agent(command) => run_agent_command(project_dir, command),
         Commands::Config(command) => run_config_command(project_dir, command),
@@ -147,7 +147,7 @@ async fn run_cli_workflow(project_dir: Utf8PathBuf, args: &cli::RunArgs) -> Resu
         .config()
         .agent_definition(app.agent_id())
         .ok_or_else(|| anyhow!("agent '{}' is not defined", app.agent_id()))?;
-    print_run_header(&CliRunHeader {
+    print_run_header(&app.config().theme, &CliRunHeader {
         version: env!("CARGO_PKG_VERSION"),
         workflow_id: workflow.workflow_id.clone(),
         workflow_title: workflow.title.clone(),
@@ -177,7 +177,7 @@ async fn run_cli_workflow(project_dir: Utf8PathBuf, args: &cli::RunArgs) -> Resu
     let summary = app
         .run_workflow(&args.workflow, input, &mut delegate)
         .await?;
-    print_workflow_run(&summary);
+    print_workflow_run(&app.config().theme, &summary);
     Ok(())
 }
 

@@ -5,7 +5,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentConfig, atomic_write, builtin_agents};
+use crate::{AgentConfig, ThemeMode, atomic_write, builtin_agents};
 
 pub const ARTIFACT_DIR_NAME: &str = ".ralph";
 const PROJECT_CONFIG_FILE_NAME: &str = "config.toml";
@@ -19,20 +19,26 @@ pub enum ConfigFileScope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeConfig {
+    #[serde(default)]
+    pub mode: ThemeMode,
     #[serde(default = "default_accent_color")]
     pub accent_color: String,
     #[serde(default = "default_success_color")]
     pub success_color: String,
     #[serde(default = "default_warning_color")]
     pub warning_color: String,
+    #[serde(default = "default_error_color")]
+    pub error_color: String,
 }
 
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
+            mode: ThemeMode::Auto,
             accent_color: default_accent_color(),
             success_color: default_success_color(),
             warning_color: default_warning_color(),
+            error_color: default_error_color(),
         }
     }
 }
@@ -231,11 +237,15 @@ impl AppConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct PartialThemeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<ThemeMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     accent_color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     success_color: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     warning_color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_color: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -448,6 +458,9 @@ fn merge_config(mut base: AppConfig, partial: PartialAppConfig) -> AppConfig {
         base.editor_override = normalize_optional_string(editor_override);
     }
     if let Some(theme) = partial.theme {
+        if let Some(value) = theme.mode {
+            base.theme.mode = value;
+        }
         if let Some(value) = theme.accent_color {
             base.theme.accent_color = value;
         }
@@ -456,6 +469,9 @@ fn merge_config(mut base: AppConfig, partial: PartialAppConfig) -> AppConfig {
         }
         if let Some(value) = theme.warning_color {
             base.theme.warning_color = value;
+        }
+        if let Some(value) = theme.error_color {
+            base.theme.error_color = value;
         }
     }
     base
@@ -504,6 +520,10 @@ fn default_success_color() -> String {
 
 fn default_warning_color() -> String {
     "yellow".to_owned()
+}
+
+fn default_error_color() -> String {
+    "red".to_owned()
 }
 
 #[cfg(test)]

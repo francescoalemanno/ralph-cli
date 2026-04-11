@@ -7,24 +7,28 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ralph_core::atomic_write;
+use ralph_core::{ResolvedTheme, ThemeConfig, atomic_write};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     widgets::{Block, BorderType, Borders, Paragraph},
 };
 use tui_textarea::{Input, Key, TextArea};
 
-use crate::ui::styled_title;
+use crate::ui::{ratatui_color, styled_title};
 
-pub fn edit_file(path: &Utf8Path, editor_override: Option<&str>) -> Result<()> {
+pub fn edit_file(
+    path: &Utf8Path,
+    editor_override: Option<&str>,
+    theme: &ThemeConfig,
+) -> Result<()> {
     if let Some(editor) = preferred_external_editor(editor_override) {
         return edit_file_with_external_editor(path, &editor);
     }
 
-    PromptEditor::new(path.as_std_path().to_path_buf())?.run()?;
+    PromptEditor::new(path.as_std_path().to_path_buf(), theme.resolve())?.run()?;
     Ok(())
 }
 
@@ -77,12 +81,13 @@ struct PromptEditor<'a> {
     path: PathBuf,
     textarea: TextArea<'a>,
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    theme: ResolvedTheme,
     modified: bool,
     message: Option<Cow<'static, str>>,
 }
 
 impl<'a> PromptEditor<'a> {
-    fn new(path: PathBuf) -> Result<Self> {
+    fn new(path: PathBuf, theme: ResolvedTheme) -> Result<Self> {
         let mut textarea = load_text_area(&path)?;
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = Terminal::new(backend).context("failed to create editor terminal")?;
@@ -108,19 +113,20 @@ impl<'a> PromptEditor<'a> {
                 .title(styled_title(
                     "Prompt Editor",
                     "Ctrl-S saves  ◆  Ctrl-Q closes",
-                    Color::White,
-                    Color::DarkGray,
-                    Color::Gray,
+                    ratatui_color(theme.text),
+                    ratatui_color(theme.subtle),
+                    ratatui_color(theme.muted),
                 ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded),
         );
-        textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+        textarea.set_line_number_style(Style::default().fg(ratatui_color(theme.subtle)));
 
         Ok(Self {
             path,
             textarea,
             terminal,
+            theme,
             modified: false,
             message: None,
         })
@@ -161,7 +167,8 @@ impl<'a> PromptEditor<'a> {
                 frame.render_widget(Paragraph::new(path).style(status_style), status_chunks[0]);
                 frame.render_widget(Paragraph::new(cursor).style(status_style), status_chunks[1]);
                 frame.render_widget(
-                    Paragraph::new(footer_text.as_ref()).style(Style::default().fg(Color::Gray)),
+                    Paragraph::new(footer_text.as_ref())
+                        .style(Style::default().fg(ratatui_color(self.theme.muted))),
                     layout[2],
                 );
             })?;

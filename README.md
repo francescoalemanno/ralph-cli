@@ -130,6 +130,25 @@ cat REQ.md | ralph run --cli bare
 
 CLI mode also accepts piped stdin.
 
+## Theme
+
+Ralph resolves one shared terminal theme for both the CLI and the TUI.
+
+- `theme.mode = "auto"` uses `COLORFGBG` when available and falls back to a dark palette.
+- `theme.mode = "dark"` or `theme.mode = "light"` forces a specific palette.
+- `RALPH_THEME_MODE=dark|light` overrides auto detection for the current process.
+
+Example:
+
+```toml
+[theme]
+mode = "auto"
+accent_color = "cyan"
+success_color = "green"
+warning_color = "yellow"
+error_color = "red"
+```
+
 ### Request Input Rules
 
 Ralph accepts the workflow request in exactly one runtime form:

@@ -35,8 +35,7 @@ use ratatui::{
 };
 use tokio::{runtime::Handle, sync::oneshot};
 use ui::{
-    normalize_terminal_text, resolved_accent_color, resolved_success_color, resolved_warning_color,
-    resume_terminal, styled_title, suspend_terminal,
+    normalize_terminal_text, ratatui_color, resume_terminal, styled_title, suspend_terminal,
 };
 
 const RUNNING_SCROLLBACK_LIMIT: usize = 100_000;
@@ -912,7 +911,11 @@ impl TuiApp {
         let target = self.resolve_request_edit_target()?;
         self.prepare_request_edit_target(&target)?;
         suspend_terminal(terminal)?;
-        let edit_result = edit_file(&target.path, self.app.config().editor_override.as_deref());
+        let edit_result = edit_file(
+            &target.path,
+            self.app.config().editor_override.as_deref(),
+            &self.app.config().theme,
+        );
         resume_terminal(terminal)?;
         edit_result?;
         self.refresh_request_from_target(&target)?;
@@ -1381,10 +1384,11 @@ impl TuiApp {
             RequestMode::File => ("[ File ]", self.request_mode == RequestMode::File),
         };
         if active {
+            let theme = self.theme();
             Span::styled(
                 label,
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(ratatui_color(theme.accent.contrast()))
                     .bg(self.accent_color())
                     .add_modifier(Modifier::BOLD),
             )
@@ -1671,8 +1675,9 @@ impl TuiApp {
 
     fn dialog_option_line(&self, selected: bool, prefix: &str, text: &str) -> Line<'static> {
         let style = if selected {
+            let theme = self.theme();
             Style::default()
-                .fg(Color::Black)
+                .fg(ratatui_color(theme.accent.contrast()))
                 .bg(self.accent_color())
                 .add_modifier(Modifier::BOLD)
         } else {
@@ -1733,58 +1738,84 @@ impl TuiApp {
     }
 
     fn title_line(&self, title: &str, subtitle: &str) -> Line<'static> {
+        let theme = self.theme();
         styled_title(
             title,
             subtitle,
-            self.text_color(),
-            self.subtle_color(),
-            self.muted_color(),
+            ratatui_color(theme.text),
+            ratatui_color(theme.subtle),
+            ratatui_color(theme.muted),
         )
     }
 
-    fn accent_color(&self) -> Color {
-        resolved_accent_color(&self.app.config().theme.accent_color)
+    fn theme(&self) -> ralph_core::ResolvedTheme {
+        self.app.config().theme.resolve()
     }
 
-    fn success_color(&self) -> Color {
-        resolved_success_color(&self.app.config().theme.success_color)
+    fn accent_color(&self) -> Color {
+        ratatui_color(self.theme().accent)
     }
 
     fn warning_color(&self) -> Color {
-        resolved_warning_color(&self.app.config().theme.warning_color)
+        ratatui_color(self.theme().warning)
     }
 
     fn background_color(&self) -> Color {
-        Color::Black
+        ratatui_color(self.theme().background)
     }
 
     fn text_color(&self) -> Color {
-        Color::White
+        ratatui_color(self.theme().text)
     }
 
     fn muted_color(&self) -> Color {
-        Color::Gray
+        ratatui_color(self.theme().muted)
     }
 
     fn subtle_color(&self) -> Color {
-        Color::DarkGray
+        ratatui_color(self.theme().subtle)
     }
 
     fn notice_palette(&self) -> (&'static str, Color, Color) {
+        let theme = self.theme();
         if let Some(running) = self.running.as_ref() {
             match running.status() {
-                Some(LastRunStatus::Completed) => (" DONE ", Color::Black, self.success_color()),
-                Some(LastRunStatus::Failed) => (" FAIL ", Color::White, Color::Red),
-                Some(LastRunStatus::Canceled) => (" CANCELED ", Color::Black, self.accent_color()),
+                Some(LastRunStatus::Completed) => (
+                    " DONE ",
+                    ratatui_color(theme.success.contrast()),
+                    ratatui_color(theme.success),
+                ),
+                Some(LastRunStatus::Failed) => (
+                    " FAIL ",
+                    ratatui_color(theme.error.contrast()),
+                    ratatui_color(theme.error),
+                ),
+                Some(LastRunStatus::Canceled) => (
+                    " CANCELED ",
+                    ratatui_color(theme.accent.contrast()),
+                    ratatui_color(theme.accent),
+                ),
                 Some(LastRunStatus::MaxIterations) => {
-                    (" LIMIT ", Color::Black, self.warning_color())
+                    (
+                        " LIMIT ",
+                        ratatui_color(theme.warning.contrast()),
+                        ratatui_color(theme.warning),
+                    )
                 }
                 Some(LastRunStatus::NeverRun) | None => {
-                    (" INFO ", Color::Black, self.accent_color())
+                    (
+                        " INFO ",
+                        ratatui_color(theme.accent.contrast()),
+                        ratatui_color(theme.accent),
+                    )
                 }
             }
         } else {
-            (" INFO ", Color::Black, self.accent_color())
+            (
+                " INFO ",
+                ratatui_color(theme.accent.contrast()),
+                ratatui_color(theme.accent),
+            )
         }
     }
 }

@@ -1,8 +1,14 @@
-use std::fs;
+use std::{
+    env, fs,
+    io::{self, IsTerminal},
+};
 
 use anyhow::{Context, Result};
 use camino::Utf8Path;
-use ralph_core::{AgentConfig, WorkflowDefinition, WorkflowRunSummary, WorkflowSummary};
+use ralph_core::{
+    AgentConfig, LastRunStatus, ThemeColor, ThemeConfig, WorkflowDefinition, WorkflowRunSummary,
+    WorkflowSummary,
+};
 
 pub(crate) struct AgentListRow {
     pub(crate) agent: String,
@@ -60,24 +66,28 @@ pub(crate) fn print_bare_file(path: &Utf8Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn print_workflow_run(summary: &WorkflowRunSummary) {
-    const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
-    const ANSI_DIM: &str = "\x1b[2m";
-    const ANSI_RESET: &str = "\x1b[0m";
+pub(crate) fn print_workflow_run(theme_config: &ThemeConfig, summary: &WorkflowRunSummary) {
+    let theme = CliTheme::new(theme_config);
     let title = " Run Result ";
     let width = title.len().max(72);
     println!(
-        "{ANSI_BOLD_GREEN}{title:=^width$}{ANSI_RESET}\n{ANSI_DIM}workflow{ANSI_RESET} {} [{}] prompt={}\n{ANSI_DIM}run_dir  {ANSI_RESET} {}",
+        "{}\n{} {} [{}] prompt={}\n{} {}",
+        theme
+            .style()
+            .fg(theme.status_color(summary.status))
+            .bold()
+            .paint(format!("{title:=^width$}", width = width)),
+        theme.label_style().paint("workflow"),
         summary.workflow_id,
         summary.status.label(),
         summary.final_prompt_id,
+        theme.label_style().paint("run_dir  "),
         summary.run_dir,
-        width = width
     );
 }
 
-pub(crate) fn print_run_header(header: &CliRunHeader) {
-    println!("{}", render_run_header(header));
+pub(crate) fn print_run_header(theme_config: &ThemeConfig, header: &CliRunHeader) {
+    println!("{}", render_run_header(theme_config, header));
 }
 
 pub(crate) fn print_workflow_list(workflows: Vec<WorkflowSummary>) {
@@ -129,50 +139,64 @@ pub(crate) fn agent_list_rows(agents: &[AgentConfig]) -> Vec<AgentListRow> {
         .collect()
 }
 
-fn render_run_header(header: &CliRunHeader) -> String {
-    const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
-    const ANSI_DIM: &str = "\x1b[2m";
-    const ANSI_RESET: &str = "\x1b[0m";
-
+fn render_run_header(theme_config: &ThemeConfig, header: &CliRunHeader) -> String {
+    let theme = CliTheme::new(theme_config);
     let title = format!(" RALPH v{} | CLI RUN ", header.version);
     let width = title.len().max(72);
-    let mut lines = vec![format!(
-        "{ANSI_BOLD_CYAN}{title:=^width$}{ANSI_RESET}",
-        width = width
-    )];
+    let mut lines = vec![
+        theme
+            .style()
+            .fg(theme.palette.accent)
+            .bold()
+            .paint(format!("{title:=^width$}", width = width)),
+    ];
 
     lines.push(format!(
-        "{ANSI_DIM}workflow  {ANSI_RESET} {} ({})",
+        "{} {} ({})",
+        theme.label_style().paint("workflow  "),
         header.workflow_id, header.workflow_title
     ));
     lines.push(format!(
-        "{ANSI_DIM}entry     {ANSI_RESET} {}",
+        "{} {}",
+        theme.label_style().paint("entry     "),
         header.entrypoint
     ));
-    lines.push(format!("{ANSI_DIM}agent     {ANSI_RESET} {}", header.agent));
     lines.push(format!(
-        "{ANSI_DIM}runner    {ANSI_RESET} {}",
+        "{} {}",
+        theme.label_style().paint("agent     "),
+        header.agent
+    ));
+    lines.push(format!(
+        "{} {}",
+        theme.label_style().paint("runner    "),
         header.runner
     ));
     lines.push(format!(
-        "{ANSI_DIM}project   {ANSI_RESET} {}",
+        "{} {}",
+        theme.label_style().paint("project   "),
         header.project_dir
     ));
     if let Some(branch) = &header.branch {
-        lines.push(format!("{ANSI_DIM}branch    {ANSI_RESET} {}", branch));
+        lines.push(format!(
+            "{} {}",
+            theme.label_style().paint("branch    "),
+            branch
+        ));
     }
     lines.push(format!(
-        "{ANSI_DIM}request   {ANSI_RESET} {}",
+        "{} {}",
+        theme.label_style().paint("request   "),
         header.request_source
     ));
     if let Some(preview) = &header.request_preview {
-        lines.push(format!("{ANSI_DIM}preview   {ANSI_RESET}"));
+        lines.push(theme.label_style().paint("preview   "));
         for line in preview_text(preview, 3) {
             lines.push(format!("  {}", line));
         }
     }
     lines.push(format!(
-        "{ANSI_DIM}limits    {ANSI_RESET} {}",
+        "{} {}",
+        theme.label_style().paint("limits    "),
         format_limits_line(
             header.max_iterations,
             header.session_timeout_secs,
@@ -186,14 +210,103 @@ fn render_run_header(header: &CliRunHeader) -> String {
             .map(|(key, value)| format!("{key}={value}"))
             .collect::<Vec<_>>()
             .join(" | ");
-        lines.push(format!("{ANSI_DIM}options   {ANSI_RESET} {}", options));
+        lines.push(format!(
+            "{} {}",
+            theme.label_style().paint("options   "),
+            options
+        ));
     }
     lines.push(format!(
-        "{ANSI_DIM}artifacts {ANSI_RESET} {}",
+        "{} {}",
+        theme.label_style().paint("artifacts "),
         header.artifact_root
     ));
-    lines.push(format!("{ANSI_BOLD_CYAN}{}{ANSI_RESET}", "=".repeat(width)));
+    lines.push(
+        theme
+            .style()
+            .fg(theme.palette.accent)
+            .bold()
+            .paint("=".repeat(width)),
+    );
     lines.join("\n")
+}
+
+struct CliTheme {
+    colors_enabled: bool,
+    palette: ralph_core::ResolvedTheme,
+}
+
+impl CliTheme {
+    fn new(theme_config: &ThemeConfig) -> Self {
+        Self {
+            colors_enabled: io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
+            palette: theme_config.resolve(),
+        }
+    }
+
+    fn style(&self) -> AnsiStyle {
+        AnsiStyle {
+            enabled: self.colors_enabled,
+            ..AnsiStyle::default()
+        }
+    }
+
+    fn label_style(&self) -> AnsiStyle {
+        self.style().fg(self.palette.subtle)
+    }
+
+    fn status_color(&self, status: LastRunStatus) -> ThemeColor {
+        match status {
+            LastRunStatus::NeverRun | LastRunStatus::Canceled => self.palette.accent,
+            LastRunStatus::Completed => self.palette.success,
+            LastRunStatus::MaxIterations => self.palette.warning,
+            LastRunStatus::Failed => self.palette.error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct AnsiStyle {
+    enabled: bool,
+    fg: Option<ThemeColor>,
+    bold: bool,
+}
+
+impl AnsiStyle {
+    fn fg(mut self, color: ThemeColor) -> Self {
+        self.fg = Some(color);
+        self
+    }
+
+    fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+
+    fn paint(self, text: impl Into<String>) -> String {
+        let text = text.into();
+        if !self.enabled {
+            return text;
+        }
+
+        let mut codes = Vec::new();
+        if self.bold {
+            codes.push(1u16);
+        }
+        if let Some(color) = self.fg {
+            codes.push(u16::from(color.ansi_fg_code()));
+        }
+        if codes.is_empty() {
+            return text;
+        }
+
+        let codes = codes
+            .into_iter()
+            .map(|code| code.to_string())
+            .collect::<Vec<_>>()
+            .join(";");
+        format!("\u{1b}[{codes}m{text}\u{1b}[0m")
+    }
 }
 
 fn format_limits_line(
@@ -247,6 +360,7 @@ fn preview_text(text: &str, max_lines: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{CliRunHeader, agent_list_rows, render_run_header};
+    use ralph_core::ThemeConfig;
 
     fn strip_ansi(input: &str) -> String {
         let mut stripped = String::new();
@@ -275,7 +389,7 @@ mod tests {
 
     #[test]
     fn render_run_header_truncates_request_preview_after_three_lines() {
-        let rendered = strip_ansi(&render_run_header(&CliRunHeader {
+        let rendered = strip_ansi(&render_run_header(&ThemeConfig::default(), &CliRunHeader {
             version: "0.4.4",
             workflow_id: "plan".to_owned(),
             workflow_title: "Plan".to_owned(),

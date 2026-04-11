@@ -9,6 +9,7 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode,
     },
 };
+use ralph_core::ThemeColor;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -76,49 +77,23 @@ pub(crate) fn normalize_terminal_text(text: &str) -> Vec<u8> {
     normalized
 }
 
-pub(crate) fn resolved_accent_color(name: &str) -> Color {
-    if name.trim().eq_ignore_ascii_case("cyan") {
-        Color::Cyan
-    } else {
-        color_from_name(name).unwrap_or(Color::Cyan)
+pub(crate) fn ratatui_color(color: ThemeColor) -> Color {
+    match color {
+        ThemeColor::Black => Color::Black,
+        ThemeColor::Red => Color::Red,
+        ThemeColor::Green => Color::Green,
+        ThemeColor::Yellow => Color::Yellow,
+        ThemeColor::Blue => Color::Blue,
+        ThemeColor::Magenta => Color::Magenta,
+        ThemeColor::Cyan => Color::Cyan,
+        ThemeColor::Gray => Color::Gray,
+        ThemeColor::DarkGray => Color::DarkGray,
+        ThemeColor::LightRed => Color::LightRed,
+        ThemeColor::LightGreen => Color::LightGreen,
+        ThemeColor::LightYellow => Color::LightYellow,
+        ThemeColor::LightBlue => Color::LightBlue,
+        ThemeColor::LightMagenta => Color::LightMagenta,
+        ThemeColor::LightCyan => Color::LightCyan,
+        ThemeColor::White => Color::White,
     }
-}
-
-pub(crate) fn resolved_success_color(name: &str) -> Color {
-    if name.trim().eq_ignore_ascii_case("green") {
-        Color::LightGreen
-    } else {
-        color_from_name(name).unwrap_or(Color::LightGreen)
-    }
-}
-
-pub(crate) fn resolved_warning_color(name: &str) -> Color {
-    if name.trim().eq_ignore_ascii_case("yellow") {
-        Color::LightYellow
-    } else {
-        color_from_name(name).unwrap_or(Color::LightYellow)
-    }
-}
-
-fn color_from_name(name: &str) -> Option<Color> {
-    let normalized = name.trim().to_ascii_lowercase();
-    Some(match normalized.as_str() {
-        "black" => Color::Black,
-        "red" => Color::Red,
-        "green" => Color::Green,
-        "yellow" => Color::Yellow,
-        "blue" => Color::Blue,
-        "magenta" => Color::Magenta,
-        "cyan" => Color::Cyan,
-        "gray" | "grey" => Color::Gray,
-        "darkgray" | "dark_gray" | "darkgrey" | "dark_grey" => Color::DarkGray,
-        "lightred" | "light_red" => Color::LightRed,
-        "lightgreen" | "light_green" => Color::LightGreen,
-        "lightyellow" | "light_yellow" => Color::LightYellow,
-        "lightblue" | "light_blue" => Color::LightBlue,
-        "lightmagenta" | "light_magenta" => Color::LightMagenta,
-        "lightcyan" | "light_cyan" => Color::LightCyan,
-        "white" => Color::White,
-        _ => return None,
-    })
 }
