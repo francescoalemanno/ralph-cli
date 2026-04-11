@@ -138,15 +138,13 @@ impl ThemeMode {
         )
     }
 
-    fn resolve_with(
-        self,
-        override_mode: Option<&str>,
-        colorfgbg: Option<&str>,
-    ) -> ThemeVariant {
+    fn resolve_with(self, override_mode: Option<&str>, colorfgbg: Option<&str>) -> ThemeVariant {
         match self {
             Self::Dark => ThemeVariant::Dark,
             Self::Light => ThemeVariant::Light,
-            Self::Auto => detect_theme_variant(override_mode, colorfgbg).unwrap_or(ThemeVariant::Dark),
+            Self::Auto => {
+                detect_theme_variant(override_mode, colorfgbg).unwrap_or(ThemeVariant::Dark)
+            }
         }
     }
 }
@@ -235,8 +233,7 @@ fn theme_variant_from_colorfgbg(value: &str) -> Option<ThemeVariant> {
 
 fn classify_xterm_background(index: u8) -> ThemeVariant {
     let (red, green, blue) = xterm_rgb(index);
-    let brightness =
-        (u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114) / 1000;
+    let brightness = (u32::from(red) * 299 + u32::from(green) * 587 + u32::from(blue) * 114) / 1000;
     if brightness >= 128 {
         ThemeVariant::Light
     } else {
@@ -345,8 +342,14 @@ mod tests {
 
     #[test]
     fn colorfgbg_detects_light_and_dark_backgrounds() {
-        assert_eq!(theme_variant_from_colorfgbg("15;0"), Some(ThemeVariant::Dark));
-        assert_eq!(theme_variant_from_colorfgbg("0;15"), Some(ThemeVariant::Light));
+        assert_eq!(
+            theme_variant_from_colorfgbg("15;0"),
+            Some(ThemeVariant::Dark)
+        );
+        assert_eq!(
+            theme_variant_from_colorfgbg("0;15"),
+            Some(ThemeVariant::Light)
+        );
     }
 
     #[test]

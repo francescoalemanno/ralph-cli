@@ -114,7 +114,11 @@ async fn run_command(project_dir: Utf8PathBuf, command: Commands) -> Result<()> 
         Commands::Edit(args) => {
             let app = RalphApp::load(project_dir)?;
             let path = app.resolve_workflow_edit_path(&args.workflow_id)?;
-            edit_file(&path, app.config().editor_override.as_deref(), &app.config().theme)
+            edit_file(
+                &path,
+                app.config().editor_override.as_deref(),
+                &app.config().theme,
+            )
         }
         Commands::Agent(command) => run_agent_command(project_dir, command),
         Commands::Config(command) => run_config_command(project_dir, command),
@@ -147,32 +151,35 @@ async fn run_cli_workflow(project_dir: Utf8PathBuf, args: &cli::RunArgs) -> Resu
         .config()
         .agent_definition(app.agent_id())
         .ok_or_else(|| anyhow!("agent '{}' is not defined", app.agent_id()))?;
-    print_run_header(&app.config().theme, &CliRunHeader {
-        version: env!("CARGO_PKG_VERSION"),
-        workflow_id: workflow.workflow_id.clone(),
-        workflow_title: workflow.title.clone(),
-        entrypoint: workflow.entrypoint.clone(),
-        agent: format!("{} ({})", app.agent_name(), app.agent_id()),
-        runner: agent.runner.command_preview(),
-        project_dir: app.project_dir().to_string(),
-        branch: git_branch(app.project_dir()),
-        request_source: describe_request_source(&workflow, &input.request),
-        request_preview,
-        max_iterations: app.config().max_iterations,
-        session_timeout_secs: agent.runner.session_timeout_secs,
-        idle_timeout_secs: agent.runner.idle_timeout_secs,
-        workflow_options: input
-            .options
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-        artifact_root: app
-            .project_dir()
-            .join(".ralph")
-            .join("runs")
-            .join(&args.workflow)
-            .to_string(),
-    });
+    print_run_header(
+        &app.config().theme,
+        &CliRunHeader {
+            version: env!("CARGO_PKG_VERSION"),
+            workflow_id: workflow.workflow_id.clone(),
+            workflow_title: workflow.title.clone(),
+            entrypoint: workflow.entrypoint.clone(),
+            agent: format!("{} ({})", app.agent_name(), app.agent_id()),
+            runner: agent.runner.command_preview(),
+            project_dir: app.project_dir().to_string(),
+            branch: git_branch(app.project_dir()),
+            request_source: describe_request_source(&workflow, &input.request),
+            request_preview,
+            max_iterations: app.config().max_iterations,
+            session_timeout_secs: agent.runner.session_timeout_secs,
+            idle_timeout_secs: agent.runner.idle_timeout_secs,
+            workflow_options: input
+                .options
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            artifact_root: app
+                .project_dir()
+                .join(".ralph")
+                .join("runs")
+                .join(&args.workflow)
+                .to_string(),
+        },
+    );
     let mut delegate = ConsoleDelegate::default();
     let summary = app
         .run_workflow(&args.workflow, input, &mut delegate)

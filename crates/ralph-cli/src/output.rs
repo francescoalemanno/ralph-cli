@@ -154,7 +154,8 @@ fn render_run_header(theme_config: &ThemeConfig, header: &CliRunHeader) -> Strin
     lines.push(format!(
         "{} {} ({})",
         theme.label_style().paint("workflow  "),
-        header.workflow_id, header.workflow_title
+        header.workflow_id,
+        header.workflow_title
     ));
     lines.push(format!(
         "{} {}",
@@ -389,23 +390,26 @@ mod tests {
 
     #[test]
     fn render_run_header_truncates_request_preview_after_three_lines() {
-        let rendered = strip_ansi(&render_run_header(&ThemeConfig::default(), &CliRunHeader {
-            version: "0.4.4",
-            workflow_id: "plan".to_owned(),
-            workflow_title: "Plan".to_owned(),
-            entrypoint: "draft".to_owned(),
-            agent: "Codex (codex)".to_owned(),
-            runner: "codex exec".to_owned(),
-            project_dir: "/tmp/project".to_owned(),
-            branch: Some("main".to_owned()),
-            request_source: "argv".to_owned(),
-            request_preview: Some("one\ntwo\nthree\nfour".to_owned()),
-            max_iterations: 40,
-            session_timeout_secs: Some(3600),
-            idle_timeout_secs: Some(600),
-            workflow_options: vec![("plans-dir".to_owned(), "docs/plans".to_owned())],
-            artifact_root: "/tmp/project/.ralph/runs/plan".to_owned(),
-        }));
+        let rendered = strip_ansi(&render_run_header(
+            &ThemeConfig::default(),
+            &CliRunHeader {
+                version: "0.4.4",
+                workflow_id: "plan".to_owned(),
+                workflow_title: "Plan".to_owned(),
+                entrypoint: "draft".to_owned(),
+                agent: "Codex (codex)".to_owned(),
+                runner: "codex exec".to_owned(),
+                project_dir: "/tmp/project".to_owned(),
+                branch: Some("main".to_owned()),
+                request_source: "argv".to_owned(),
+                request_preview: Some("one\ntwo\nthree\nfour".to_owned()),
+                max_iterations: 40,
+                session_timeout_secs: Some(3600),
+                idle_timeout_secs: Some(600),
+                workflow_options: vec![("plans-dir".to_owned(), "docs/plans".to_owned())],
+                artifact_root: "/tmp/project/.ralph/runs/plan".to_owned(),
+            },
+        ));
 
         assert!(rendered.contains("workflow   plan (Plan)"));
         assert!(rendered.contains("branch     main"));

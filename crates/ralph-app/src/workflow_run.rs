@@ -453,18 +453,18 @@ where
         let Some(draft_body) = draft_body else {
             return Ok(None);
         };
-        let Some(target_path_body) = latest_main_event_body(run_events, PLANNING_TARGET_PATH_EVENT)
-        else {
-            return Ok(Some(NextStep::FinishError(
-                "planning draft is missing planning-target-path".to_owned(),
-            )));
-        };
+        let plans_dir = workflow_options.get("plans-dir").map(String::as_str);
+        let (target_path_body, persist_generated_target_path) =
+            planning_target_path_body_for_draft(
+                &self.project_dir,
+                &wal_path,
+                plans_dir,
+                run_events,
+                draft_body,
+            )?;
 
-        let target_path = resolve_planning_target_path(
-            &self.project_dir,
-            workflow_options.get("plans-dir").map(String::as_str),
-            target_path_body,
-        )?;
+        let target_path =
+            resolve_planning_target_path(&self.project_dir, plans_dir, &target_path_body)?;
         let draft = PlanningDraftReview {
             target_path: target_path.clone(),
             draft: draft_body.to_owned(),
@@ -475,23 +475,28 @@ where
         match decision.kind {
             PlanningDraftDecisionKind::Accept => {
                 write_planning_draft(&target_path, &draft.draft)?;
+                let mut payloads = Vec::new();
+                if persist_generated_target_path {
+                    payloads.push((PLANNING_TARGET_PATH_EVENT, target_path_body.clone()));
+                }
+                payloads.extend([
+                    (
+                        PLANNING_REVIEW_EVENT,
+                        format_planning_review_body(&decision),
+                    ),
+                    (PLANNING_PROGRESS_EVENT, progress_after),
+                    (
+                        PLANNING_PLAN_FILE_EVENT,
+                        display_project_path(&self.project_dir, &target_path),
+                    ),
+                ]);
                 append_host_payloads(
                     run_id,
                     &self.project_dir,
                     run_dir,
                     workflow_path,
                     prompt_id,
-                    &[
-                        (
-                            PLANNING_REVIEW_EVENT,
-                            format_planning_review_body(&decision),
-                        ),
-                        (PLANNING_PROGRESS_EVENT, progress_after),
-                        (
-                            PLANNING_PLAN_FILE_EVENT,
-                            display_project_path(&self.project_dir, &target_path),
-                        ),
-                    ],
+                    &payloads,
                     wal_write_lock,
                     delegate,
                 )
@@ -502,19 +507,24 @@ where
                 ))))
             }
             PlanningDraftDecisionKind::Revise => {
+                let mut payloads = Vec::new();
+                if persist_generated_target_path {
+                    payloads.push((PLANNING_TARGET_PATH_EVENT, target_path_body.clone()));
+                }
+                payloads.extend([
+                    (
+                        PLANNING_REVIEW_EVENT,
+                        format_planning_review_body(&decision),
+                    ),
+                    (PLANNING_PROGRESS_EVENT, progress_after),
+                ]);
                 append_host_payloads(
                     run_id,
                     &self.project_dir,
                     run_dir,
                     workflow_path,
                     prompt_id,
-                    &[
-                        (
-                            PLANNING_REVIEW_EVENT,
-                            format_planning_review_body(&decision),
-                        ),
-                        (PLANNING_PROGRESS_EVENT, progress_after),
-                    ],
+                    &payloads,
                     wal_write_lock,
                     delegate,
                 )
@@ -522,19 +532,24 @@ where
                 Ok(Some(NextStep::Continue))
             }
             PlanningDraftDecisionKind::Reject => {
+                let mut payloads = Vec::new();
+                if persist_generated_target_path {
+                    payloads.push((PLANNING_TARGET_PATH_EVENT, target_path_body));
+                }
+                payloads.extend([
+                    (
+                        PLANNING_REVIEW_EVENT,
+                        format_planning_review_body(&decision),
+                    ),
+                    (PLANNING_PROGRESS_EVENT, progress_after),
+                ]);
                 append_host_payloads(
                     run_id,
                     &self.project_dir,
                     run_dir,
                     workflow_path,
                     prompt_id,
-                    &[
-                        (
-                            PLANNING_REVIEW_EVENT,
-                            format_planning_review_body(&decision),
-                        ),
-                        (PLANNING_PROGRESS_EVENT, progress_after),
-                    ],
+                    &payloads,
                     wal_write_lock,
                     delegate,
                 )
@@ -885,6 +900,29 @@ fn latest_main_event_body<'a>(run_events: &'a [AgentEventRecord], event: &str) -
         .map(|record| record.body.as_str())
 }
 
+fn planning_target_path_body_for_draft(
+    project_dir: &Utf8Path,
+    wal_path: &Utf8Path,
+    plans_dir: Option<&str>,
+    run_events: &[AgentEventRecord],
+    draft_body: &str,
+) -> Result<(String, bool)> {
+    if let Some(target_path_body) = latest_main_event_body(run_events, PLANNING_TARGET_PATH_EVENT) {
+        return Ok((target_path_body.trim().to_owned(), false));
+    }
+
+    if let Some(target_path_body) =
+        latest_agent_event_body_from_wal_in_channel(wal_path, PLANNING_TARGET_PATH_EVENT, None)?
+    {
+        return Ok((target_path_body.trim().to_owned(), false));
+    }
+
+    Ok((
+        generate_planning_target_path_body(project_dir, plans_dir, draft_body),
+        true,
+    ))
+}
+
 fn parse_planning_question(body: &str) -> Result<PlanningQuestion> {
     let mut question = None;
     let mut options = Vec::new();
@@ -1028,6 +1066,65 @@ fn format_planning_review_body(decision: &PlanningDraftDecision) -> String {
             feedback.trim()
         ),
         _ => format!("Decision: {}", decision.kind.label()),
+    }
+}
+
+fn generate_planning_target_path_body(
+    project_dir: &Utf8Path,
+    plans_dir: Option<&str>,
+    draft_body: &str,
+) -> String {
+    let slug = slugify_planning_title(draft_body);
+    let plans_dir = plans_dir.map(str::trim).filter(|dir| !dir.is_empty());
+
+    for suffix in 1.. {
+        let file_name = if suffix == 1 {
+            format!("{slug}.md")
+        } else {
+            format!("{slug}-{suffix}.md")
+        };
+        let relative = match plans_dir {
+            Some(dir) => Utf8Path::new(dir).join(&file_name),
+            None => Utf8PathBuf::from(file_name),
+        };
+        if !project_dir.join(&relative).exists() {
+            return relative.to_string();
+        }
+    }
+
+    unreachable!("planning target path generation always returns")
+}
+
+fn slugify_planning_title(draft_body: &str) -> String {
+    let title = draft_body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("# ").map(str::trim))
+        .filter(|title| !title.is_empty())
+        .or_else(|| {
+            draft_body
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+        })
+        .unwrap_or("plan");
+
+    let mut slug = String::new();
+    let mut last_was_dash = false;
+    for ch in title.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            slug.push('-');
+            last_was_dash = true;
+        }
+    }
+
+    let slug = slug.trim_matches('-').to_owned();
+    if slug.is_empty() {
+        "plan".to_owned()
+    } else {
+        slug
     }
 }
 
@@ -1538,6 +1635,7 @@ mod tests {
         outputs: Vec<String>,
         planning_answers: Vec<PlanningQuestionAnswer>,
         planning_decisions: Vec<PlanningDraftDecision>,
+        reviewed_drafts: Vec<PlanningDraftReview>,
     }
 
     #[async_trait]
@@ -1578,8 +1676,9 @@ mod tests {
 
         async fn review_planning_draft(
             &mut self,
-            _draft: &PlanningDraftReview,
+            draft: &PlanningDraftReview,
         ) -> Result<PlanningDraftDecision> {
+            self.reviewed_drafts.push(draft.clone());
             Ok(self.planning_decisions.remove(0))
         }
     }
@@ -1990,6 +2089,176 @@ prompts:
             record.channel_id == HOST_CHANNEL_ID
                 && record.event == PLANNING_PLAN_FILE_EVENT
                 && record.body == "docs/plans/2026-04-10-cache-plan.md"
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revised_planning_draft_reuses_latest_wal_target_path() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let config_home = Utf8PathBuf::from_path_buf(temp.path().join("config-home")).unwrap();
+        fs::create_dir_all(config_home.join("workflows")).unwrap();
+        let _config_home = ScopedConfigHome::new(config_home.clone());
+        fs::write(
+            config_home.join("workflows/plan-fixture.yml"),
+            r#"
+version: 1
+workflow_id: plan-fixture
+title: Plan Fixture
+entrypoint: plan
+options:
+  plans-dir:
+    default: docs/plans
+request:
+  runtime:
+    argv: true
+prompts:
+  plan:
+    title: Plan
+    fallback-route: no-route-error
+    prompt: plan {ralph-request}
+"#,
+        )?;
+
+        let first_draft = "# Cache Plan\n\n## Overview\nInitial draft.\n";
+        let revised_draft = "# Cache Plan\n\n## Overview\nRevised draft.\n";
+        let runner = WorkflowSpyRunner {
+            events: Arc::new(Mutex::new(vec![
+                vec![
+                    (
+                        PLANNING_TARGET_PATH_EVENT.to_owned(),
+                        "docs/plans/cache-plan.md".to_owned(),
+                    ),
+                    (PLANNING_DRAFT_EVENT.to_owned(), first_draft.to_owned()),
+                ],
+                vec![(PLANNING_DRAFT_EVENT.to_owned(), revised_draft.to_owned())],
+            ])),
+            ..Default::default()
+        };
+        let app = RalphApp::new(project_dir.clone(), AppConfig::default(), runner);
+        let mut delegate = TestDelegate {
+            planning_decisions: vec![
+                PlanningDraftDecision {
+                    kind: PlanningDraftDecisionKind::Revise,
+                    feedback: Some("Add validation.".to_owned()),
+                },
+                PlanningDraftDecision {
+                    kind: PlanningDraftDecisionKind::Accept,
+                    feedback: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let summary = app
+            .run_workflow(
+                "plan-fixture",
+                WorkflowRunInput {
+                    request: WorkflowRequestInput {
+                        argv: Some("implement caching".to_owned()),
+                        ..Default::default()
+                    },
+                    options: BTreeMap::from([("plans-dir".to_owned(), "docs/plans".to_owned())]),
+                },
+                &mut delegate,
+            )
+            .await?;
+
+        assert_eq!(summary.status, ralph_core::LastRunStatus::Completed);
+        let expected_path = project_dir.join("docs/plans/cache-plan.md");
+        assert_eq!(delegate.reviewed_drafts.len(), 2);
+        assert_eq!(delegate.reviewed_drafts[0].target_path, expected_path);
+        assert_eq!(delegate.reviewed_drafts[1].target_path, expected_path);
+        assert_eq!(
+            fs::read_to_string(expected_path.as_std_path())?,
+            revised_draft
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planning_draft_without_target_path_gets_slug_target_and_persists_it() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let config_home = Utf8PathBuf::from_path_buf(temp.path().join("config-home")).unwrap();
+        fs::create_dir_all(config_home.join("workflows")).unwrap();
+        let _config_home = ScopedConfigHome::new(config_home.clone());
+        fs::write(
+            config_home.join("workflows/plan-fixture.yml"),
+            r#"
+version: 1
+workflow_id: plan-fixture
+title: Plan Fixture
+entrypoint: plan
+options:
+  plans-dir:
+    default: docs/plans
+request:
+  runtime:
+    argv: true
+prompts:
+  plan:
+    title: Plan
+    fallback-route: no-route-error
+    prompt: plan {ralph-request}
+"#,
+        )?;
+
+        let first_draft = "# Interactive Mode for JSON CLI\n\n## Overview\nInitial draft.\n";
+        let revised_draft = "# Interactive Mode for JSON CLI\n\n## Overview\nAdd ls support.\n";
+        let runner = WorkflowSpyRunner {
+            events: Arc::new(Mutex::new(vec![
+                vec![(PLANNING_DRAFT_EVENT.to_owned(), first_draft.to_owned())],
+                vec![(PLANNING_DRAFT_EVENT.to_owned(), revised_draft.to_owned())],
+            ])),
+            ..Default::default()
+        };
+        let app = RalphApp::new(project_dir.clone(), AppConfig::default(), runner);
+        let mut delegate = TestDelegate {
+            planning_decisions: vec![
+                PlanningDraftDecision {
+                    kind: PlanningDraftDecisionKind::Revise,
+                    feedback: Some("Add ls.".to_owned()),
+                },
+                PlanningDraftDecision {
+                    kind: PlanningDraftDecisionKind::Accept,
+                    feedback: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let summary = app
+            .run_workflow(
+                "plan-fixture",
+                WorkflowRunInput {
+                    request: WorkflowRequestInput {
+                        argv: Some("interactive json mode".to_owned()),
+                        ..Default::default()
+                    },
+                    options: BTreeMap::from([("plans-dir".to_owned(), "docs/plans".to_owned())]),
+                },
+                &mut delegate,
+            )
+            .await?;
+
+        assert_eq!(summary.status, ralph_core::LastRunStatus::Completed);
+        let expected_relative = "docs/plans/interactive-mode-for-json-cli.md";
+        let expected_path = project_dir.join(expected_relative);
+        assert_eq!(delegate.reviewed_drafts.len(), 2);
+        assert_eq!(delegate.reviewed_drafts[0].target_path, expected_path);
+        assert_eq!(delegate.reviewed_drafts[1].target_path, expected_path);
+        assert_eq!(
+            fs::read_to_string(expected_path.as_std_path())?,
+            revised_draft
+        );
+
+        let wal = ralph_core::read_agent_events_since(&summary.run_dir, 0)?;
+        assert!(wal.records.iter().any(|record| {
+            record.channel_id == HOST_CHANNEL_ID
+                && record.event == PLANNING_TARGET_PATH_EVENT
+                && record.body == expected_relative
         }));
         Ok(())
     }

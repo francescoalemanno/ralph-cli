@@ -33,10 +33,10 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use textwrap::Options as TextWrapOptions;
 use tokio::{runtime::Handle, sync::oneshot};
-use ui::{
-    normalize_terminal_text, ratatui_color, resume_terminal, styled_title, suspend_terminal,
-};
+use tui_textarea::{Input as TextAreaInput, Key as TextAreaKey, TextArea};
+use ui::{normalize_terminal_text, ratatui_color, resume_terminal, styled_title, suspend_terminal};
 
 const RUNNING_SCROLLBACK_LIMIT: usize = 100_000;
 
@@ -235,13 +235,53 @@ struct PlanningQuestionDialog {
 struct PlanningDraftDialog {
     draft: PlanningDraftReview,
     selected: usize,
+    scroll: usize,
+    mode: PlanningDraftMode,
     feedback: String,
     reply: oneshot::Sender<Result<PlanningDraftDecision, String>>,
+}
+
+enum PlanningDraftMode {
+    Review,
+    Revising { textarea: TextArea<'static> },
+}
+
+impl PlanningDraftDialog {
+    fn is_revising(&self) -> bool {
+        matches!(self.mode, PlanningDraftMode::Revising { .. })
+    }
 }
 
 enum ActiveDialog {
     PlanningQuestion(PlanningQuestionDialog),
     PlanningDraft(PlanningDraftDialog),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DraftLineKind {
+    Normal,
+    Heading1,
+    Heading2,
+    Heading3,
+    Quote,
+    Code,
+    Rule,
+    Muted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DraftWrappedLine {
+    text: String,
+    kind: DraftLineKind,
+}
+
+struct PlanningDraftLayout {
+    area: Rect,
+    header: Rect,
+    content: Rect,
+    feedback: Option<Rect>,
+    actions: Rect,
+    help: Rect,
 }
 
 struct TuiApp {
@@ -335,7 +375,9 @@ impl TuiApp {
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> Result<bool> {
         if self.active_dialog.is_some() {
-            return self.handle_dialog_key(key);
+            let size = terminal.size().context("failed to read terminal size")?;
+            let screen = Rect::new(0, 0, size.width, size.height);
+            return self.handle_dialog_key(key, screen);
         }
 
         if self.running.is_some() {
@@ -421,9 +463,15 @@ impl TuiApp {
         Ok(true)
     }
 
-    fn handle_dialog_key(&mut self, key: KeyEvent) -> Result<bool> {
-        if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    fn handle_dialog_key(&mut self, key: KeyEvent, screen: Rect) -> Result<bool> {
+        let revise_input_active = matches!(
+            self.active_dialog.as_ref(),
+            Some(ActiveDialog::PlanningDraft(dialog)) if dialog.is_revising()
+        );
+        if key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && !revise_input_active)
         {
             if let Some(running) = &self.running {
                 running.control.cancel();
@@ -486,60 +534,109 @@ impl TuiApp {
                 self.active_dialog = Some(ActiveDialog::PlanningQuestion(dialog));
             }
             ActiveDialog::PlanningDraft(mut dialog) => {
-                match key.code {
-                    KeyCode::Up => {
-                        dialog.selected = dialog.selected.saturating_sub(1);
-                    }
-                    KeyCode::Down => {
-                        if dialog.selected < 2 {
-                            dialog.selected += 1;
+                match &mut dialog.mode {
+                    PlanningDraftMode::Review => match key.code {
+                        KeyCode::Left | KeyCode::BackTab | KeyCode::Char('h') => {
+                            dialog.selected = dialog.selected.saturating_sub(1);
                         }
-                    }
-                    KeyCode::Backspace if dialog.selected == 1 => {
-                        dialog.feedback.pop();
-                    }
-                    KeyCode::Char(ch)
-                        if dialog.selected == 1
-                            && (key.modifiers.is_empty()
-                                || key.modifiers == KeyModifiers::SHIFT) =>
-                    {
-                        dialog.feedback.push(ch);
-                    }
-                    KeyCode::Enter => match dialog.selected {
-                        0 => {
-                            let reply = dialog.reply;
-                            let _ = reply.send(Ok(PlanningDraftDecision {
-                                kind: PlanningDraftDecisionKind::Accept,
-                                feedback: None,
-                            }));
-                            self.message = "accepted plan draft".to_owned();
-                            return Ok(true);
-                        }
-                        1 => {
-                            if dialog.feedback.trim().is_empty() {
-                                self.message = "enter revision feedback".to_owned();
-                            } else {
-                                let reply = dialog.reply;
-                                let _ = reply.send(Ok(PlanningDraftDecision {
-                                    kind: PlanningDraftDecisionKind::Revise,
-                                    feedback: Some(dialog.feedback.trim().to_owned()),
-                                }));
-                                self.message = "revision feedback captured".to_owned();
-                                return Ok(true);
+                        KeyCode::Right | KeyCode::Tab | KeyCode::Char('l') => {
+                            if dialog.selected < 2 {
+                                dialog.selected += 1;
                             }
                         }
-                        2 => {
-                            let reply = dialog.reply;
-                            let _ = reply.send(Ok(PlanningDraftDecision {
-                                kind: PlanningDraftDecisionKind::Reject,
-                                feedback: None,
-                            }));
-                            self.message = "rejected plan draft".to_owned();
-                            return Ok(true);
+                        KeyCode::Char('1') => dialog.selected = 0,
+                        KeyCode::Char('2') => dialog.selected = 1,
+                        KeyCode::Char('3') => dialog.selected = 2,
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            dialog.scroll = dialog.scroll.saturating_sub(1);
                         }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let max_scroll =
+                                self.max_planning_draft_scroll_for_screen(&dialog, screen);
+                            dialog.scroll = (dialog.scroll + 1).min(max_scroll);
+                        }
+                        KeyCode::PageUp => {
+                            let step = self.planning_draft_page_step(screen, dialog.is_revising());
+                            dialog.scroll = dialog.scroll.saturating_sub(step);
+                        }
+                        KeyCode::PageDown => {
+                            let step = self.planning_draft_page_step(screen, dialog.is_revising());
+                            let max_scroll =
+                                self.max_planning_draft_scroll_for_screen(&dialog, screen);
+                            dialog.scroll = (dialog.scroll + step).min(max_scroll);
+                        }
+                        KeyCode::Home => {
+                            dialog.scroll = 0;
+                        }
+                        KeyCode::End => {
+                            dialog.scroll =
+                                self.max_planning_draft_scroll_for_screen(&dialog, screen);
+                        }
+                        KeyCode::Enter => match dialog.selected {
+                            0 => {
+                                let reply = dialog.reply;
+                                let _ = reply.send(Ok(PlanningDraftDecision {
+                                    kind: PlanningDraftDecisionKind::Accept,
+                                    feedback: None,
+                                }));
+                                self.message = "accepted plan draft".to_owned();
+                                return Ok(true);
+                            }
+                            1 => {
+                                dialog.mode = PlanningDraftMode::Revising {
+                                    textarea: self.new_planning_revision_textarea(&dialog.feedback),
+                                };
+                                self.message = "editing revision feedback".to_owned();
+                            }
+                            2 => {
+                                let reply = dialog.reply;
+                                let _ = reply.send(Ok(PlanningDraftDecision {
+                                    kind: PlanningDraftDecisionKind::Reject,
+                                    feedback: None,
+                                }));
+                                self.message = "rejected plan draft".to_owned();
+                                return Ok(true);
+                            }
+                            _ => {}
+                        },
                         _ => {}
                     },
-                    _ => {}
+                    PlanningDraftMode::Revising { textarea } => {
+                        let input: TextAreaInput = key.into();
+                        match input {
+                            TextAreaInput {
+                                key: TextAreaKey::Char('s'),
+                                ctrl: true,
+                                ..
+                            } => {
+                                let feedback = textarea.lines().join("\n");
+                                if feedback.trim().is_empty() {
+                                    self.message = "enter revision feedback".to_owned();
+                                } else {
+                                    let reply = dialog.reply;
+                                    let _ = reply.send(Ok(PlanningDraftDecision {
+                                        kind: PlanningDraftDecisionKind::Revise,
+                                        feedback: Some(feedback.trim().to_owned()),
+                                    }));
+                                    self.message = "revision feedback captured".to_owned();
+                                    return Ok(true);
+                                }
+                            }
+                            TextAreaInput {
+                                key: TextAreaKey::Char('c'),
+                                ctrl: true,
+                                ..
+                            } => {
+                                dialog.feedback = textarea.lines().join("\n");
+                                dialog.mode = PlanningDraftMode::Review;
+                                self.message = "revision feedback editor canceled".to_owned();
+                            }
+                            input => {
+                                textarea.input(input);
+                                dialog.feedback = textarea.lines().join("\n");
+                            }
+                        }
+                    }
                 }
                 self.active_dialog = Some(ActiveDialog::PlanningDraft(dialog));
             }
@@ -561,6 +658,10 @@ impl TuiApp {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent, screen: Rect) {
+        if self.handle_dialog_mouse(mouse, screen) {
+            return;
+        }
+
         if self.running.is_none() || self.active_dialog.is_some() {
             return;
         }
@@ -579,6 +680,37 @@ impl TuiApp {
             MouseEventKind::ScrollDown => self.scroll_running(-1),
             _ => {}
         }
+    }
+
+    fn handle_dialog_mouse(&mut self, mouse: MouseEvent, screen: Rect) -> bool {
+        let Some(ActiveDialog::PlanningDraft(dialog)) = self.active_dialog.as_mut() else {
+            return false;
+        };
+
+        let layout = planning_draft_layout(screen, dialog.is_revising());
+        let within_dialog = mouse.column >= layout.area.x
+            && mouse.column < layout.area.x.saturating_add(layout.area.width)
+            && mouse.row >= layout.area.y
+            && mouse.row < layout.area.y.saturating_add(layout.area.height);
+        if !within_dialog {
+            return false;
+        }
+
+        if dialog.is_revising() {
+            return true;
+        }
+
+        let max_scroll = max_planning_draft_scroll(dialog, screen);
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                dialog.scroll = dialog.scroll.saturating_sub(1);
+            }
+            MouseEventKind::ScrollDown => {
+                dialog.scroll = (dialog.scroll + 1).min(max_scroll);
+            }
+            _ => {}
+        }
+        true
     }
 
     fn handle_ui_event(
@@ -684,6 +816,8 @@ impl TuiApp {
                 self.active_dialog = Some(ActiveDialog::PlanningDraft(PlanningDraftDialog {
                     draft,
                     selected: 0,
+                    scroll: 0,
+                    mode: PlanningDraftMode::Review,
                     feedback: String::new(),
                     reply,
                 }));
@@ -1460,8 +1594,18 @@ impl TuiApp {
     }
 
     fn footer_text(&self) -> &'static str {
-        if self.active_dialog.is_some() {
-            return "Enter submit  •  ↑/↓ move  •  Esc cancel interaction";
+        if let Some(dialog) = self.active_dialog.as_ref() {
+            return match dialog {
+                ActiveDialog::PlanningQuestion(_) => {
+                    "Enter submit  •  ↑/↓ move  •  Esc cancel interaction"
+                }
+                ActiveDialog::PlanningDraft(dialog) if dialog.is_revising() => {
+                    "Ctrl-S submit feedback  •  Ctrl-C cancel revise editor  •  textarea keys move and edit"
+                }
+                ActiveDialog::PlanningDraft(_) => {
+                    "1/2/3 or ←/→ choose action  •  wheel/↑/↓/PgUp/PgDn/Home/End scroll draft  •  Enter submit  •  Esc cancel"
+                }
+            };
         }
 
         if let Some(running) = self.running.as_ref() {
@@ -1614,60 +1758,113 @@ impl TuiApp {
                 );
             }
             Some(ActiveDialog::PlanningDraft(dialog)) => {
-                let area = centered_rect(100, 24, frame.area());
-                frame.render_widget(Clear, area);
-                let mut lines = vec![
-                    Line::from(vec![
-                        Span::styled(
-                            "Draft Review",
-                            Style::default()
-                                .fg(self.accent_color())
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(" "),
-                        Span::styled(
-                            dialog.draft.target_path.to_string(),
-                            Style::default().fg(self.muted_color()),
-                        ),
-                    ]),
-                    Line::from(""),
-                ];
-                lines.extend(dialog_preview_lines(&dialog.draft.draft, 10));
-                lines.push(Line::from(""));
-                lines.push(self.dialog_option_line(dialog.selected == 0, "1.", "Accept"));
-                lines.push(self.dialog_option_line(dialog.selected == 1, "2.", "Revise"));
-                lines.push(self.dialog_option_line(dialog.selected == 2, "3.", "Reject"));
-                if dialog.selected == 1 {
-                    lines.push(Line::from(""));
-                    let mut feedback = dialog.feedback.clone();
-                    feedback.push('█');
-                    if dialog.feedback.is_empty() {
-                        feedback = "Type revision feedback█".to_owned();
-                    }
-                    lines.push(Line::from(vec![
-                        Span::styled("Feedback ", Style::default().fg(self.subtle_color())),
-                        Span::styled(feedback, Style::default().fg(self.text_color())),
-                    ]));
-                }
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::styled("Enter ", Style::default().fg(self.subtle_color())),
-                    Span::styled("submit", Style::default().fg(self.text_color())),
-                    Span::styled("  •  ", Style::default().fg(self.subtle_color())),
-                    Span::styled("↑/↓", Style::default().fg(self.text_color())),
-                    Span::styled(" move  •  ", Style::default().fg(self.subtle_color())),
-                    Span::styled("Esc", Style::default().fg(self.text_color())),
-                    Span::styled(" cancel", Style::default().fg(self.subtle_color())),
-                ]));
+                let layout = planning_draft_layout(frame.area(), dialog.is_revising());
+                let modal_block = self
+                    .panel_block()
+                    .title(self.title_line("Planning", "Draft review"));
+                let content_block = self.panel_block().title(self.title_line(
+                    "Draft",
+                    &self.planning_draft_scroll_label(dialog, frame.area()),
+                ));
+                let content_inner = content_block.inner(layout.content);
+                let wrapped_lines =
+                    wrap_planning_draft(&dialog.draft.draft, content_inner.width.max(1));
+                let max_scroll = wrapped_lines
+                    .len()
+                    .saturating_sub(content_inner.height as usize);
+                let scroll = dialog.scroll.min(max_scroll);
+                let visible_lines = wrapped_lines
+                    .iter()
+                    .skip(scroll)
+                    .take(content_inner.height as usize)
+                    .map(|line| self.styled_planning_draft_line(line))
+                    .collect::<Vec<_>>();
+
+                frame.render_widget(Clear, layout.area);
+                frame.render_widget(modal_block, layout.area);
                 frame.render_widget(
-                    Paragraph::new(Text::from(lines))
-                        .block(
-                            self.panel_block()
-                                .title(self.title_line("Planning", "Draft review")),
-                        )
-                        .wrap(Wrap { trim: false }),
-                    area,
+                    Paragraph::new(Text::from(vec![
+                        Line::from(vec![
+                            Span::styled("Target ", Style::default().fg(self.subtle_color())),
+                            Span::styled(
+                                dialog.draft.target_path.to_string(),
+                                Style::default().fg(self.text_color()),
+                            ),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("Decision ", Style::default().fg(self.subtle_color())),
+                            self.dialog_choice_span(dialog.selected == 0, "1. Accept"),
+                            Span::raw(" "),
+                            self.dialog_choice_span(dialog.selected == 1, "2. Revise"),
+                            Span::raw(" "),
+                            self.dialog_choice_span(dialog.selected == 2, "3. Reject"),
+                        ]),
+                    ]))
+                    .wrap(Wrap { trim: false }),
+                    layout.header,
                 );
+                frame.render_widget(
+                    Paragraph::new(Text::from(visible_lines)).block(content_block),
+                    layout.content,
+                );
+
+                if let Some(feedback_area) = layout.feedback
+                    && let PlanningDraftMode::Revising { textarea } = &dialog.mode
+                {
+                    frame.render_widget(textarea, feedback_area);
+                }
+
+                let actions = if dialog.is_revising() {
+                    Line::from(vec![
+                        Span::styled("Revise ", Style::default().fg(self.subtle_color())),
+                        Span::styled(
+                            "Ctrl-S submits feedback",
+                            Style::default().fg(self.text_color()),
+                        ),
+                        Span::styled("  •  ", Style::default().fg(self.subtle_color())),
+                        Span::styled("Ctrl-C", Style::default().fg(self.text_color())),
+                        Span::styled(
+                            " returns to draft review",
+                            Style::default().fg(self.subtle_color()),
+                        ),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled("Browse ", Style::default().fg(self.subtle_color())),
+                        Span::styled(
+                            "wheel/↑/↓/PgUp/PgDn/Home/End",
+                            Style::default().fg(self.text_color()),
+                        ),
+                        Span::styled("  •  Action ", Style::default().fg(self.subtle_color())),
+                        Span::styled("1/2/3 or ←/→", Style::default().fg(self.text_color())),
+                        Span::styled("  •  ", Style::default().fg(self.subtle_color())),
+                        Span::styled("Enter", Style::default().fg(self.text_color())),
+                        Span::styled(" confirm", Style::default().fg(self.subtle_color())),
+                    ])
+                };
+                frame.render_widget(
+                    Paragraph::new(actions).wrap(Wrap { trim: true }),
+                    layout.actions,
+                );
+
+                let help = if dialog.is_revising() {
+                    Line::from(vec![
+                        Span::styled("Draft ", Style::default().fg(self.subtle_color())),
+                        Span::styled(
+                            "stays visible while the revise textarea owns the keyboard",
+                            Style::default().fg(self.text_color()),
+                        ),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled("Esc", Style::default().fg(self.text_color())),
+                        Span::styled(
+                            " cancels the planning interaction",
+                            Style::default().fg(self.subtle_color()),
+                        ),
+                    ])
+                };
+                frame.render_widget(Paragraph::new(help).wrap(Wrap { trim: true }), layout.help);
             }
             None => {}
         }
@@ -1687,6 +1884,76 @@ impl TuiApp {
             Span::styled(format!(" {prefix} "), style),
             Span::styled(text.to_owned(), style),
         ])
+    }
+
+    fn dialog_choice_span(&self, selected: bool, label: &str) -> Span<'static> {
+        if selected {
+            let theme = self.theme();
+            Span::styled(
+                format!(" {label} "),
+                Style::default()
+                    .fg(ratatui_color(theme.accent.contrast()))
+                    .bg(self.accent_color())
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(format!(" {label} "), Style::default().fg(self.text_color()))
+        }
+    }
+
+    fn planning_draft_page_step(&self, screen: Rect, show_feedback: bool) -> usize {
+        planning_draft_page_step(screen, show_feedback)
+    }
+
+    fn max_planning_draft_scroll_for_screen(
+        &self,
+        dialog: &PlanningDraftDialog,
+        screen: Rect,
+    ) -> usize {
+        max_planning_draft_scroll(dialog, screen)
+    }
+
+    fn planning_draft_scroll_label(&self, dialog: &PlanningDraftDialog, screen: Rect) -> String {
+        planning_draft_scroll_label(dialog, screen)
+    }
+
+    fn styled_planning_draft_line(&self, line: &DraftWrappedLine) -> Line<'static> {
+        let style = match line.kind {
+            DraftLineKind::Normal => Style::default().fg(self.text_color()),
+            DraftLineKind::Heading1 => Style::default()
+                .fg(self.accent_color())
+                .add_modifier(Modifier::BOLD),
+            DraftLineKind::Heading2 => Style::default()
+                .fg(self.text_color())
+                .add_modifier(Modifier::BOLD),
+            DraftLineKind::Heading3 => Style::default()
+                .fg(self.muted_color())
+                .add_modifier(Modifier::BOLD),
+            DraftLineKind::Quote => Style::default()
+                .fg(self.muted_color())
+                .add_modifier(Modifier::ITALIC),
+            DraftLineKind::Code => Style::default().fg(self.text_color()),
+            DraftLineKind::Rule => Style::default().fg(self.subtle_color()),
+            DraftLineKind::Muted => Style::default().fg(self.muted_color()),
+        };
+        Line::from(Span::styled(line.text.clone(), style))
+    }
+
+    fn new_planning_revision_textarea(&self, initial_text: &str) -> TextArea<'static> {
+        let mut textarea = if initial_text.is_empty() {
+            TextArea::default()
+        } else {
+            TextArea::new(initial_text.split('\n').map(str::to_owned).collect())
+        };
+        textarea.set_block(
+            self.panel_block()
+                .title(self.title_line("Revise", "Ctrl-S submit  ◆  Ctrl-C cancel")),
+        );
+        textarea.set_placeholder_text("Describe what should change in the plan.");
+        textarea.set_placeholder_style(Style::default().fg(self.muted_color()));
+        textarea.set_cursor_line_style(Style::default());
+        textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+        textarea
     }
 
     fn allowed_runtime_sources(&self, runtime: &WorkflowRuntimeRequest) -> String {
@@ -1795,20 +2062,16 @@ impl TuiApp {
                     ratatui_color(theme.accent.contrast()),
                     ratatui_color(theme.accent),
                 ),
-                Some(LastRunStatus::MaxIterations) => {
-                    (
-                        " LIMIT ",
-                        ratatui_color(theme.warning.contrast()),
-                        ratatui_color(theme.warning),
-                    )
-                }
-                Some(LastRunStatus::NeverRun) | None => {
-                    (
-                        " INFO ",
-                        ratatui_color(theme.accent.contrast()),
-                        ratatui_color(theme.accent),
-                    )
-                }
+                Some(LastRunStatus::MaxIterations) => (
+                    " LIMIT ",
+                    ratatui_color(theme.warning.contrast()),
+                    ratatui_color(theme.warning),
+                ),
+                Some(LastRunStatus::NeverRun) | None => (
+                    " INFO ",
+                    ratatui_color(theme.accent.contrast()),
+                    ratatui_color(theme.accent),
+                ),
             }
         } else {
             (
@@ -1831,19 +2094,270 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
-fn dialog_preview_lines(text: &str, max_lines: usize) -> Vec<Line<'static>> {
-    let mut lines = text
-        .lines()
-        .take(max_lines)
-        .map(|line| Line::from(line.to_owned()))
-        .collect::<Vec<_>>();
-    if text.lines().count() > max_lines {
-        lines.push(Line::from("..."));
+fn planning_draft_layout(screen: Rect, show_feedback: bool) -> PlanningDraftLayout {
+    let area = centered_rect(
+        screen.width.saturating_sub(4),
+        screen.height.saturating_sub(2),
+        screen,
+    );
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let constraints = if show_feedback {
+        vec![
+            Constraint::Length(2),
+            Constraint::Min(6),
+            Constraint::Length(8),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ]
+    } else {
+        vec![
+            Constraint::Length(2),
+            Constraint::Min(6),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ]
+    };
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    if show_feedback {
+        PlanningDraftLayout {
+            area,
+            header: sections[0],
+            content: sections[1],
+            feedback: Some(sections[2]),
+            actions: sections[3],
+            help: sections[4],
+        }
+    } else {
+        PlanningDraftLayout {
+            area,
+            header: sections[0],
+            content: sections[1],
+            feedback: None,
+            actions: sections[2],
+            help: sections[3],
+        }
     }
+}
+
+fn planning_draft_content_inner(area: Rect) -> Rect {
+    Block::default().borders(Borders::ALL).inner(area)
+}
+
+fn planning_draft_page_step(screen: Rect, show_feedback: bool) -> usize {
+    let layout = planning_draft_layout(screen, show_feedback);
+    let content_inner = planning_draft_content_inner(layout.content);
+    content_inner.height.saturating_sub(1).max(1) as usize
+}
+
+fn max_planning_draft_scroll(dialog: &PlanningDraftDialog, screen: Rect) -> usize {
+    let layout = planning_draft_layout(screen, dialog.is_revising());
+    let content_inner = planning_draft_content_inner(layout.content);
+    let wrapped = wrap_planning_draft(&dialog.draft.draft, content_inner.width.max(1));
+    wrapped.len().saturating_sub(content_inner.height as usize)
+}
+
+fn planning_draft_scroll_label(dialog: &PlanningDraftDialog, screen: Rect) -> String {
+    let layout = planning_draft_layout(screen, dialog.is_revising());
+    let content_inner = planning_draft_content_inner(layout.content);
+    let wrapped = wrap_planning_draft(&dialog.draft.draft, content_inner.width.max(1));
+    if wrapped.is_empty() || content_inner.height == 0 {
+        return "empty".to_owned();
+    }
+
+    let max_scroll = wrapped.len().saturating_sub(content_inner.height as usize);
+    let scroll = dialog.scroll.min(max_scroll);
+    let start = scroll + 1;
+    let end = (scroll + content_inner.height as usize).min(wrapped.len());
+    format!("{start}-{end} / {}", wrapped.len())
+}
+
+fn wrap_planning_draft(markdown: &str, width: u16) -> Vec<DraftWrappedLine> {
+    let width = width.max(1) as usize;
+    let mut lines = Vec::new();
+    let mut in_code_block = false;
+
+    for raw_line in markdown.lines() {
+        let trimmed = raw_line.trim();
+
+        if is_code_fence(trimmed) {
+            in_code_block = !in_code_block;
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            lines.push(DraftWrappedLine {
+                text: String::new(),
+                kind: DraftLineKind::Normal,
+            });
+            continue;
+        }
+
+        if in_code_block {
+            push_wrapped_draft_lines(
+                &mut lines,
+                raw_line.trim_end(),
+                width,
+                "",
+                "",
+                DraftLineKind::Code,
+            );
+            continue;
+        }
+
+        if is_horizontal_rule(trimmed) {
+            lines.push(DraftWrappedLine {
+                text: "─".repeat(width.min(64).max(3)),
+                kind: DraftLineKind::Rule,
+            });
+            continue;
+        }
+
+        if let Some((level, heading)) = parse_markdown_heading(trimmed) {
+            let kind = match level {
+                1 => DraftLineKind::Heading1,
+                2 => DraftLineKind::Heading2,
+                _ => DraftLineKind::Heading3,
+            };
+            push_wrapped_draft_lines(&mut lines, heading, width, "", "", kind);
+            continue;
+        }
+
+        if let Some(quote) = trimmed
+            .strip_prefix("> ")
+            .or_else(|| trimmed.strip_prefix('>'))
+        {
+            push_wrapped_draft_lines(
+                &mut lines,
+                quote.trim(),
+                width,
+                "│ ",
+                "│ ",
+                DraftLineKind::Quote,
+            );
+            continue;
+        }
+
+        if let Some((first_indent, rest_indent, item, kind)) = parse_markdown_list_item(raw_line) {
+            push_wrapped_draft_lines(&mut lines, item, width, &first_indent, &rest_indent, kind);
+            continue;
+        }
+
+        push_wrapped_draft_lines(
+            &mut lines,
+            raw_line.trim_end(),
+            width,
+            "",
+            "",
+            DraftLineKind::Normal,
+        );
+    }
+
     if lines.is_empty() {
-        lines.push(Line::from("<empty draft>"));
+        lines.push(DraftWrappedLine {
+            text: "<empty draft>".to_owned(),
+            kind: DraftLineKind::Muted,
+        });
     }
+
     lines
+}
+
+fn push_wrapped_draft_lines(
+    lines: &mut Vec<DraftWrappedLine>,
+    text: &str,
+    width: usize,
+    initial_indent: &str,
+    subsequent_indent: &str,
+    kind: DraftLineKind,
+) {
+    let wrapped = textwrap::wrap(
+        text,
+        TextWrapOptions::new(width)
+            .initial_indent(initial_indent)
+            .subsequent_indent(subsequent_indent),
+    );
+    if wrapped.is_empty() {
+        lines.push(DraftWrappedLine {
+            text: initial_indent.to_owned(),
+            kind,
+        });
+        return;
+    }
+
+    for line in wrapped {
+        lines.push(DraftWrappedLine {
+            text: line.into_owned(),
+            kind,
+        });
+    }
+}
+
+fn is_code_fence(line: &str) -> bool {
+    line.starts_with("```") || line.starts_with("~~~")
+}
+
+fn is_horizontal_rule(line: &str) -> bool {
+    matches!(line, "---" | "***" | "___")
+}
+
+fn parse_markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let level = line.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=6).contains(&level) {
+        return None;
+    }
+    let title = line.get(level..)?.strip_prefix(' ')?;
+    Some((level, title.trim()))
+}
+
+fn parse_markdown_list_item(line: &str) -> Option<(String, String, &str, DraftLineKind)> {
+    let indent_width = line.len().saturating_sub(line.trim_start().len());
+    let indent = " ".repeat(indent_width.min(8));
+    let trimmed = line.trim_start();
+
+    for (marker, label) in [
+        ("- [ ] ", "[ ] "),
+        ("* [ ] ", "[ ] "),
+        ("- [x] ", "[x] "),
+        ("* [x] ", "[x] "),
+        ("- [X] ", "[x] "),
+        ("* [X] ", "[x] "),
+        ("- ", "• "),
+        ("* ", "• "),
+        ("+ ", "• "),
+    ] {
+        if let Some(item) = trimmed.strip_prefix(marker) {
+            let first_indent = format!("{indent}{label}");
+            let rest_indent = format!("{indent}{}", " ".repeat(label.len()));
+            return Some((
+                first_indent,
+                rest_indent,
+                item.trim(),
+                DraftLineKind::Normal,
+            ));
+        }
+    }
+
+    let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+
+    let prefix = trimmed.get(..digits)?;
+    let remainder = trimmed.get(digits..)?;
+    let item = remainder.strip_prefix(". ")?;
+    let label = format!("{prefix}. ");
+    let first_indent = format!("{indent}{label}");
+    let rest_indent = format!("{indent}{}", " ".repeat(label.len()));
+    Some((
+        first_indent,
+        rest_indent,
+        item.trim(),
+        DraftLineKind::Normal,
+    ))
 }
 
 struct TuiRunDelegate {
@@ -1899,16 +2413,18 @@ mod tests {
     use std::fs;
 
     use super::{
-        RequestEditKind, RequestMode, RequestOrigin, RunningState, TuiApp, TuiLaunchOptions,
-        TuiPreloadedRequest, TuiRequestSource,
+        ActiveDialog, DraftLineKind, PlanningDraftDialog, PlanningDraftMode, RequestEditKind,
+        RequestMode, RequestOrigin, RunningState, TuiApp, TuiLaunchOptions, TuiPreloadedRequest,
+        TuiRequestSource, planning_draft_layout, wrap_planning_draft,
     };
     use camino::Utf8PathBuf;
-    use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
-    use ralph_app::RalphApp;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+    use ralph_app::{PlanningDraftDecisionKind, PlanningDraftReview, RalphApp};
     use ralph_core::{
         RunControl, ScopedGlobalConfigDirOverride, scoped_global_config_dir_override,
     };
     use ratatui::layout::Rect;
+    use tokio::sync::oneshot;
 
     struct TestProjectDir {
         _config_home: ScopedGlobalConfigDirOverride,
@@ -1963,6 +2479,46 @@ mod tests {
         let scroll = if running.follow { 0 } else { running.scroll };
         running.terminal.set_scrollback(scroll);
         running.terminal.screen().contents()
+    }
+
+    fn new_planning_draft_dialog(
+        draft: &str,
+    ) -> (
+        PlanningDraftDialog,
+        oneshot::Receiver<Result<ralph_app::PlanningDraftDecision, String>>,
+    ) {
+        let (reply, reply_rx) = oneshot::channel();
+        (
+            PlanningDraftDialog {
+                draft: PlanningDraftReview {
+                    target_path: Utf8PathBuf::from("docs/plans/plan.md"),
+                    draft: draft.to_owned(),
+                },
+                selected: 0,
+                scroll: 0,
+                mode: PlanningDraftMode::Review,
+                feedback: String::new(),
+                reply,
+            },
+            reply_rx,
+        )
+    }
+
+    fn planning_draft_dialog(tui: &TuiApp) -> &PlanningDraftDialog {
+        match tui.active_dialog.as_ref() {
+            Some(ActiveDialog::PlanningDraft(dialog)) => dialog,
+            _ => panic!("expected planning draft dialog"),
+        }
+    }
+
+    fn planning_draft_textarea_text(tui: &TuiApp) -> Option<String> {
+        match tui.active_dialog.as_ref() {
+            Some(ActiveDialog::PlanningDraft(PlanningDraftDialog {
+                mode: PlanningDraftMode::Revising { textarea },
+                ..
+            })) => Some(textarea.lines().join("\n")),
+            _ => None,
+        }
     }
 
     #[test]
@@ -2221,5 +2777,143 @@ prompt_env_var = "PROMPT"
             Rect::new(0, 0, 100, 30),
         );
         assert_eq!(tui.running.as_ref().unwrap().scroll, 1);
+    }
+
+    #[test]
+    fn planning_draft_dialog_scrolls_with_keyboard() {
+        let (mut tui, _temp) = new_test_tui();
+        let draft = (1..=48)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (dialog, _reply_rx) = new_planning_draft_dialog(&draft);
+        tui.active_dialog = Some(ActiveDialog::PlanningDraft(dialog));
+        let screen = Rect::new(0, 0, 100, 30);
+
+        tui.handle_dialog_key(KeyEvent::from(KeyCode::Down), screen)
+            .unwrap();
+        assert_eq!(planning_draft_dialog(&tui).scroll, 1);
+        assert_eq!(planning_draft_dialog(&tui).selected, 0);
+
+        tui.handle_dialog_key(KeyEvent::from(KeyCode::PageDown), screen)
+            .unwrap();
+        assert!(planning_draft_dialog(&tui).scroll > 1);
+
+        tui.handle_dialog_key(KeyEvent::from(KeyCode::Right), screen)
+            .unwrap();
+        assert_eq!(planning_draft_dialog(&tui).selected, 1);
+
+        tui.handle_dialog_key(KeyEvent::from(KeyCode::End), screen)
+            .unwrap();
+        let max_scroll =
+            tui.max_planning_draft_scroll_for_screen(planning_draft_dialog(&tui), screen);
+        assert_eq!(planning_draft_dialog(&tui).scroll, max_scroll);
+
+        tui.handle_dialog_key(KeyEvent::from(KeyCode::Home), screen)
+            .unwrap();
+        assert_eq!(planning_draft_dialog(&tui).scroll, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_planning_draft_dialog() {
+        let (mut tui, _temp) = new_test_tui();
+        let draft = (1..=48)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (dialog, _reply_rx) = new_planning_draft_dialog(&draft);
+        tui.active_dialog = Some(ActiveDialog::PlanningDraft(dialog));
+        let screen = Rect::new(0, 0, 100, 30);
+        let layout = planning_draft_layout(screen, false);
+
+        tui.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: layout.area.x + 1,
+                row: layout.area.y + 1,
+                modifiers: KeyModifiers::empty(),
+            },
+            screen,
+        );
+        assert_eq!(planning_draft_dialog(&tui).scroll, 1);
+
+        tui.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: layout.area.x + 1,
+                row: layout.area.y + 1,
+                modifiers: KeyModifiers::empty(),
+            },
+            screen,
+        );
+        assert_eq!(planning_draft_dialog(&tui).scroll, 0);
+    }
+
+    #[test]
+    fn revise_feedback_is_edited_in_textarea_after_confirming_revise() {
+        let (mut tui, _temp) = new_test_tui();
+        let (dialog, reply_rx) = new_planning_draft_dialog("# Title");
+        tui.active_dialog = Some(ActiveDialog::PlanningDraft(dialog));
+        let screen = Rect::new(0, 0, 100, 30);
+
+        tui.handle_dialog_key(KeyEvent::from(KeyCode::Char('2')), screen)
+            .unwrap();
+        tui.handle_dialog_key(KeyEvent::from(KeyCode::Enter), screen)
+            .unwrap();
+
+        assert!(planning_draft_dialog(&tui).is_revising());
+        assert_eq!(planning_draft_dialog(&tui).selected, 1);
+
+        tui.handle_dialog_key(KeyEvent::from(KeyCode::Char('q')), screen)
+            .unwrap();
+        assert_eq!(planning_draft_textarea_text(&tui).as_deref(), Some("q"));
+
+        tui.handle_dialog_key(KeyEvent::from(KeyCode::Left), screen)
+            .unwrap();
+        assert_eq!(planning_draft_dialog(&tui).selected, 1);
+        assert!(planning_draft_dialog(&tui).is_revising());
+
+        tui.handle_dialog_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            screen,
+        )
+        .unwrap();
+        assert!(!planning_draft_dialog(&tui).is_revising());
+        assert_eq!(planning_draft_dialog(&tui).feedback, "q");
+
+        tui.handle_dialog_key(KeyEvent::from(KeyCode::Enter), screen)
+            .unwrap();
+        assert_eq!(planning_draft_textarea_text(&tui).as_deref(), Some("q"));
+
+        tui.handle_dialog_key(
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            screen,
+        )
+        .unwrap();
+        assert!(tui.active_dialog.is_none());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let decision = runtime
+            .block_on(reply_rx)
+            .unwrap()
+            .expect("revision should be accepted");
+        assert_eq!(decision.kind, PlanningDraftDecisionKind::Revise);
+        assert_eq!(decision.feedback.as_deref(), Some("q"));
+    }
+
+    #[test]
+    fn planning_draft_markdown_wrapping_formats_common_blocks() {
+        let lines = wrap_planning_draft(
+            "# Title\n\n- item one\n1. item two\n> quoted\n```\ncode sample\n```",
+            40,
+        );
+
+        assert_eq!(lines[0].text, "Title");
+        assert_eq!(lines[0].kind, DraftLineKind::Heading1);
+        assert_eq!(lines[2].text, "• item one");
+        assert_eq!(lines[3].text, "1. item two");
+        assert_eq!(lines[4].text, "│ quoted");
+        assert_eq!(lines[5].text, "code sample");
+        assert_eq!(lines[5].kind, DraftLineKind::Code);
     }
 }
