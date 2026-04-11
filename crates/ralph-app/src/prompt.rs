@@ -20,6 +20,15 @@ pub(crate) fn interpolate_workflow_prompt(
     request: Option<&str>,
     workflow_options: &BTreeMap<String, String>,
 ) -> Result<String> {
+    interpolate_workflow_value(prompt_text, project_dir, request, workflow_options)
+}
+
+pub(crate) fn interpolate_workflow_value(
+    prompt_text: &str,
+    project_dir: &Utf8Path,
+    request: Option<&str>,
+    workflow_options: &BTreeMap<String, String>,
+) -> Result<String> {
     let project_dir = absolute_unix_path(project_dir)?;
     let context = PromptInterpolationContext {
         project_dir: &project_dir,
@@ -204,9 +213,12 @@ event-body = the body of the event and payload to emit
 - Event bodies may span multiple lines.
 - Do not explain the event in prose; output the marker itself.
 - `RALPH_BIN` points to the Ralph binary for this run.
+- Use `RALPH_BIN` as an executable, not as a file to inspect, print, or `cat`.
 - Ralph automatically records each emitted event on the correct channel for the current prompt or worker.
 - `"$RALPH_BIN" get <event-name>` reads the latest payload for `<event-name>` across all channels in the current run.
 - `"$RALPH_BIN" get --channel <channel-id> <event-name>` reads the latest payload for `<event-name>` from one specific channel.
+- When workflow instructions tell you to read state with `"$RALPH_BIN" get ...`, treat that command's stdout as the canonical current-run state for the requested event.
+- Do not replace `"$RALPH_BIN" get ...` reads with guesses from the filesystem, WAL files, or scratch files.
 </skill>"#,
         render_signal_marker("event-name"),
         render_payload_marker("event-name", "event-body"),
@@ -249,6 +261,9 @@ mod tests {
         assert!(rendered.contains("<<<END-PAYLOAD>>>"));
         assert!(rendered.contains("\"$RALPH_BIN\" get <event-name>"));
         assert!(rendered.contains("\"$RALPH_BIN\" get --channel <channel-id> <event-name>"));
+        assert!(rendered.contains("Use `RALPH_BIN` as an executable"));
+        assert!(rendered.contains("canonical current-run state"));
+        assert!(rendered.contains("WAL files, or scratch files"));
         assert!(rendered.contains("project=/tmp/project"));
         assert!(rendered.contains("request=ship it"));
         assert!(rendered.contains("progress=progress.txt"));

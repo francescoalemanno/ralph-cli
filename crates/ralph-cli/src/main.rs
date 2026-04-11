@@ -2,15 +2,16 @@ mod cli;
 mod output;
 
 use std::{
+    collections::BTreeMap,
     env, fs,
-    io::{self, IsTerminal, Read},
+    io::{self, BufRead, IsTerminal, Read, Write},
     process::{Command, ExitCode},
 };
 
 use crate::{
     cli::{
-        AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, GetArgs, InitArgs,
-        RequestArgs, render_run_workflow_help,
+        AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, GetArgs, GuidedArgs, InitArgs,
+        RequestArgs, RunArgs, RuntimeArgs, render_run_workflow_help,
     },
     output::{
         AgentCurrentRow, CliRunHeader, agent_list_rows, print_agent_current, print_agent_list,
@@ -21,14 +22,18 @@ use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_app::{ConsoleDelegate, RalphApp, WorkflowRequestInput, WorkflowRunInput};
 use ralph_core::{
-    AppConfig, ConfigFileScope, atomic_write, latest_agent_event_body_from_wal_in_channel,
-    load_workflow, seed_builtin_workflows_if_missing,
+    AppConfig, ConfigFileScope, LastRunStatus, agent_events_wal_path, atomic_write,
+    latest_agent_event_body_from_wal_in_channel, load_workflow, seed_builtin_workflows_if_missing,
 };
 use ralph_tui::{
     TuiLaunchOptions, TuiPreloadedRequest, TuiRequestSource, edit_file, run_tui_with_options,
 };
 use serde::Serialize;
 use tracing_subscriber::{EnvFilter, fmt};
+
+const HOST_CHANNEL_ID: &str = "host";
+const PLANNING_PLAN_FILE_EVENT: &str = "planning-plan-file";
+const MISSING_PLAN_FILE_PLACEHOLDER: &str = "<unavailable, ignore>";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -99,6 +104,20 @@ fn build_tui_launch_options(
 
 async fn run_command(project_dir: Utf8PathBuf, command: Commands) -> Result<()> {
     match command {
+        Commands::Guided(args) => run_guided_command(project_dir, args).await,
+        Commands::TasksOnly(args) => {
+            run_special_workflow(project_dir, "task", Some(args.plan_file))
+                .await
+                .map(|_| ())
+        }
+        Commands::ReviewOnly(args) => run_special_workflow(project_dir, "review", args.plan_file)
+            .await
+            .map(|_| ()),
+        Commands::FinalizeOnly(args) => {
+            run_special_workflow(project_dir, "finalize", args.plan_file)
+                .await
+                .map(|_| ())
+        }
         Commands::Run(args) => run_run_command(project_dir, args).await,
         Commands::Get(args) => run_get(args),
         Commands::Ls => {
@@ -127,9 +146,73 @@ async fn run_command(project_dir: Utf8PathBuf, command: Commands) -> Result<()> 
     }
 }
 
+async fn run_guided_command(project_dir: Utf8PathBuf, args: GuidedArgs) -> Result<()> {
+    ensure_interactive_terminal("guided planning")?;
+
+    let description = match args.description {
+        Some(description) => description,
+        None => prompt_nonempty("Plan description: ")?,
+    };
+
+    let plan_summary = run_cli_workflow(
+        project_dir.clone(),
+        &build_run_args("plan", BTreeMap::new(), Some(description)),
+    )
+    .await?;
+
+    if plan_summary.status != LastRunStatus::Completed || !args.build_after_plan {
+        return Ok(());
+    }
+
+    let Some(plan_file) = planning_plan_file(&plan_summary)? else {
+        return Ok(());
+    };
+
+    if prompt_yes_no(&format!("Build this plan now? [{}] ", plan_file), false)? {
+        let task_summary =
+            run_special_workflow(project_dir.clone(), "task", Some(plan_file.clone())).await?;
+        if task_summary.status == LastRunStatus::Completed {
+            let _ = run_special_workflow(project_dir, "review", Some(plan_file)).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_special_workflow(
+    project_dir: Utf8PathBuf,
+    workflow_id: &str,
+    plan_file: Option<String>,
+) -> Result<ralph_core::WorkflowRunSummary> {
+    let plan_file = plan_file.unwrap_or_else(|| MISSING_PLAN_FILE_PLACEHOLDER.to_owned());
+    let args = build_run_args(
+        workflow_id,
+        BTreeMap::from([("plan-file".to_owned(), plan_file)]),
+        None,
+    );
+    run_cli_workflow(project_dir, &args).await
+}
+
+fn build_run_args(
+    workflow: &str,
+    workflow_options: BTreeMap<String, String>,
+    request: Option<String>,
+) -> RunArgs {
+    RunArgs {
+        cli: true,
+        runtime: RuntimeArgs::default(),
+        workflow: workflow.to_owned(),
+        workflow_options,
+        request_args: RequestArgs {
+            request_file: None,
+            request: request.into_iter().collect(),
+        },
+    }
+}
+
 async fn run_run_command(project_dir: Utf8PathBuf, args: cli::RunArgs) -> Result<()> {
     let result = if args.cli {
-        run_cli_workflow(project_dir, &args).await
+        run_cli_workflow(project_dir, &args).await.map(|_| ())
     } else if !io::stdin().is_terminal() {
         Err(anyhow!(
             "stdin preloading is not supported in TUI mode; use `ralph run --cli <workflow-id>` or pass the request as argv text or `--file`"
@@ -141,7 +224,10 @@ async fn run_run_command(project_dir: Utf8PathBuf, args: cli::RunArgs) -> Result
     result.map_err(|error| maybe_with_run_help(&args.workflow, error))
 }
 
-async fn run_cli_workflow(project_dir: Utf8PathBuf, args: &cli::RunArgs) -> Result<()> {
+async fn run_cli_workflow(
+    project_dir: Utf8PathBuf,
+    args: &cli::RunArgs,
+) -> Result<ralph_core::WorkflowRunSummary> {
     let mut app = RalphApp::load(project_dir)?;
     let input = resolve_workflow_run_input(args)?;
     args.runtime.apply_to(&mut app)?;
@@ -180,12 +266,12 @@ async fn run_cli_workflow(project_dir: Utf8PathBuf, args: &cli::RunArgs) -> Resu
                 .to_string(),
         },
     );
-    let mut delegate = ConsoleDelegate::default();
+    let mut delegate = ConsoleDelegate;
     let summary = app
         .run_workflow(&args.workflow, input, &mut delegate)
         .await?;
     print_workflow_run(&app.config().theme, &summary);
-    Ok(())
+    Ok(summary)
 }
 
 fn run_tui_workflow(project_dir: Utf8PathBuf, args: &cli::RunArgs) -> Result<()> {
@@ -297,6 +383,60 @@ fn run_get(args: GetArgs) -> Result<()> {
             .ok_or_else(|| anyhow!("no event with name {event}"))?;
     println!("{body}");
     Ok(())
+}
+
+fn planning_plan_file(summary: &ralph_core::WorkflowRunSummary) -> Result<Option<String>> {
+    let wal_path = agent_events_wal_path(&summary.run_dir);
+    latest_agent_event_body_from_wal_in_channel(
+        &wal_path,
+        PLANNING_PLAN_FILE_EVENT,
+        Some(HOST_CHANNEL_ID),
+    )
+}
+
+fn ensure_interactive_terminal(context: &str) -> Result<()> {
+    if io::stdin().is_terminal() {
+        return Ok(());
+    }
+
+    Err(anyhow!("{context} requires an interactive terminal"))
+}
+
+fn prompt_nonempty(prompt: &str) -> Result<String> {
+    loop {
+        let line = prompt_line(prompt)?;
+        if !line.trim().is_empty() {
+            return Ok(line);
+        }
+        eprintln!("input cannot be empty");
+    }
+}
+
+fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+
+    loop {
+        let answer = prompt_line(&format!("{prompt}{suffix}: "))?;
+        let normalized = answer.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" => return Ok(default_yes),
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => eprintln!("enter y or n"),
+        }
+    }
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    let mut stdout = io::stdout().lock();
+    write!(stdout, "{prompt}")?;
+    stdout.flush()?;
+    drop(stdout);
+
+    let stdin = io::stdin();
+    let mut input = String::new();
+    stdin.lock().read_line(&mut input)?;
+    Ok(input.trim().to_owned())
 }
 
 fn required_env(key: &str) -> Result<String> {

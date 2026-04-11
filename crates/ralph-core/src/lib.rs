@@ -26,6 +26,8 @@ pub use workflow::{
     NO_ROUTE_ERROR, NO_ROUTE_OK, WorkflowDefinition, WorkflowFileRequest, WorkflowOptionDefinition,
     WorkflowParallelDefinition, WorkflowParallelJoin, WorkflowParallelWorkerDefinition,
     WorkflowPromptDefinition, WorkflowRequestDefinition, WorkflowRuntimeRequest, WorkflowSummary,
-    list_all_workflows, list_workflows, load_workflow, load_workflow_from_path,
-    seed_builtin_workflows_if_missing, workflow_config_dir, workflow_option_flag,
+    WorkflowTransitionGuard, WorkflowTransitionGuardFailure, WorkflowTransitionGuardFailureAction,
+    is_protected_builtin_workflow, list_all_workflows, list_workflows, load_workflow,
+    load_workflow_from_path, seed_builtin_workflows_if_missing, workflow_config_dir,
+    workflow_option_flag,
 };

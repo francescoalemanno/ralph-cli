@@ -11,10 +11,11 @@ use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
     AgentEventRecord, LastRunStatus, LoopControlDecision, MAIN_CHANNEL_ID, NO_ROUTE_ERROR,
     NO_ROUTE_OK, ParsedAgentEvent, RunControl, RunnerConfig, RunnerInvocation, WorkflowDefinition,
-    WorkflowParallelWorkerDefinition, WorkflowRunSummary, WorkflowRuntimeRequest,
-    append_agent_event, atomic_write, current_agent_events_offset,
-    latest_agent_event_body_from_wal_in_channel, load_workflow, read_agent_events_since,
-    reduce_loop_control, validate_agent_event, workflow_option_flag,
+    WorkflowParallelWorkerDefinition, WorkflowPromptDefinition, WorkflowRunSummary,
+    WorkflowRuntimeRequest, WorkflowTransitionGuard, WorkflowTransitionGuardFailure,
+    WorkflowTransitionGuardFailureAction, agent_events_wal_path, append_agent_event, atomic_write,
+    current_agent_events_offset, latest_agent_event_body_from_wal_in_channel, load_workflow,
+    read_agent_events_since, reduce_loop_control, validate_agent_event, workflow_option_flag,
 };
 use ralph_runner::{RunnerAdapter, RunnerStreamEvent, format_event_notice};
 use tokio::{
@@ -24,7 +25,8 @@ use tokio::{
 
 use crate::{
     PlanningDraftDecision, PlanningDraftDecisionKind, PlanningDraftReview, PlanningQuestion,
-    PlanningQuestionAnswer, RalphApp, RunDelegate, RunEvent, prompt::interpolate_workflow_prompt,
+    PlanningQuestionAnswer, RalphApp, RunDelegate, RunEvent,
+    prompt::{interpolate_workflow_prompt, interpolate_workflow_value},
 };
 
 const HOST_CHANNEL_ID: &str = "host";
@@ -221,6 +223,7 @@ where
                     .handle_planning_intercept(
                         &workflow,
                         &current_prompt_id,
+                        prompt,
                         request.as_deref(),
                         &workflow_options,
                         &run_id,
@@ -235,38 +238,19 @@ where
                     next_step
                 } else {
                     match reduce_loop_control(&run_events, &current_prompt_id) {
-                        Some(LoopControlDecision::Continue) => NextStep::Continue,
-                        Some(LoopControlDecision::StopOk(body)) => {
-                            return finish_workflow(
+                        Some(decision) => {
+                            self.apply_transition_guards(
+                                &workflow,
+                                &current_prompt_id,
+                                prompt,
+                                request.as_deref(),
+                                &workflow_options,
+                                &run_dir,
+                                decision,
                                 delegate,
-                                WorkflowRunSummary {
-                                    workflow_id: workflow.workflow_id.clone(),
-                                    run_id,
-                                    final_prompt_id: current_prompt_id,
-                                    run_dir,
-                                    workflow_path,
-                                    status: LastRunStatus::Completed,
-                                },
-                                format_summary("Workflow complete", &body),
                             )
-                            .await;
+                            .await?
                         }
-                        Some(LoopControlDecision::StopError(body)) => {
-                            return finish_workflow(
-                                delegate,
-                                WorkflowRunSummary {
-                                    workflow_id: workflow.workflow_id.clone(),
-                                    run_id,
-                                    final_prompt_id: current_prompt_id,
-                                    run_dir,
-                                    workflow_path,
-                                    status: LastRunStatus::Failed,
-                                },
-                                format_summary("Workflow failed", &body),
-                            )
-                            .await;
-                        }
-                        Some(LoopControlDecision::Route(route)) => NextStep::Route(route),
                         None => {
                             self.fallback_step(&workflow, &current_prompt_id, delegate)
                                 .await?
@@ -380,10 +364,139 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn apply_transition_guards<D>(
+        &self,
+        workflow: &WorkflowDefinition,
+        prompt_id: &str,
+        prompt: &WorkflowPromptDefinition,
+        request: Option<&str>,
+        workflow_options: &BTreeMap<String, String>,
+        run_dir: &Utf8Path,
+        decision: LoopControlDecision,
+        delegate: &mut D,
+    ) -> Result<NextStep>
+    where
+        D: RunDelegate,
+    {
+        let transition_id = transition_id_for_loop_control(&decision);
+        let Some(guards) = prompt.transition_guards.get(transition_id.as_str()) else {
+            return Ok(next_step_for_loop_control(decision));
+        };
+
+        for guard in guards {
+            if self
+                .evaluate_transition_guard(guard, request, workflow_options, run_dir)
+                .await?
+            {
+                continue;
+            }
+
+            let failure = transition_guard_failure(guard);
+            if let Some(note) = failure.note.as_deref().map(str::trim)
+                && !note.is_empty()
+            {
+                delegate.on_event(RunEvent::Note(note.to_owned())).await?;
+            }
+
+            return transition_guard_failure_step(
+                workflow,
+                prompt_id,
+                transition_id.as_str(),
+                failure,
+            );
+        }
+
+        Ok(next_step_for_loop_control(decision))
+    }
+
+    async fn evaluate_transition_guard(
+        &self,
+        guard: &WorkflowTransitionGuard,
+        request: Option<&str>,
+        workflow_options: &BTreeMap<String, String>,
+        run_dir: &Utf8Path,
+    ) -> Result<bool> {
+        match guard {
+            WorkflowTransitionGuard::FileExists { path, .. } => {
+                let resolved =
+                    self.resolve_transition_guard_path(path, request, workflow_options)?;
+                Ok(resolved.exists())
+            }
+            WorkflowTransitionGuard::FileContains { path, literal, .. } => {
+                let resolved =
+                    self.resolve_transition_guard_path(path, request, workflow_options)?;
+                match fs::read_to_string(resolved.as_std_path()) {
+                    Ok(contents) => Ok(contents.contains(literal)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                    Err(error) => Err(error).with_context(|| {
+                        format!("failed to read transition guard file {}", resolved)
+                    }),
+                }
+            }
+            WorkflowTransitionGuard::FileNotContains { path, literal, .. } => {
+                let resolved =
+                    self.resolve_transition_guard_path(path, request, workflow_options)?;
+                let contents = fs::read_to_string(resolved.as_std_path()).with_context(|| {
+                    format!("failed to read transition guard file {}", resolved)
+                })?;
+                Ok(!contents.contains(literal))
+            }
+            WorkflowTransitionGuard::EventExists { event, channel, .. } => {
+                let wal_path = agent_events_wal_path(run_dir);
+                Ok(latest_agent_event_body_from_wal_in_channel(
+                    &wal_path,
+                    event,
+                    channel.as_deref(),
+                )?
+                .is_some())
+            }
+            WorkflowTransitionGuard::EventContains {
+                event,
+                channel,
+                literal,
+                ..
+            } => {
+                let wal_path = agent_events_wal_path(run_dir);
+                Ok(latest_agent_event_body_from_wal_in_channel(
+                    &wal_path,
+                    event,
+                    channel.as_deref(),
+                )?
+                .is_some_and(|body| body.contains(literal)))
+            }
+        }
+    }
+
+    fn resolve_transition_guard_path(
+        &self,
+        path: &str,
+        request: Option<&str>,
+        workflow_options: &BTreeMap<String, String>,
+    ) -> Result<Utf8PathBuf> {
+        let rendered =
+            interpolate_workflow_value(path, &self.project_dir, request, workflow_options)
+                .with_context(|| format!("failed to resolve transition guard path '{}'", path))?;
+        let trimmed = rendered.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!(
+                "transition guard path '{}' resolved to an empty path",
+                path
+            ));
+        }
+        let rendered_path = Utf8PathBuf::from(trimmed);
+        Ok(if rendered_path.is_absolute() {
+            rendered_path
+        } else {
+            self.project_dir.join(rendered_path)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn handle_planning_intercept<D>(
         &self,
         _workflow: &WorkflowDefinition,
         prompt_id: &str,
+        _prompt: &WorkflowPromptDefinition,
         request: Option<&str>,
         workflow_options: &BTreeMap<String, String>,
         run_id: &str,
@@ -898,6 +1011,78 @@ fn latest_main_event_body<'a>(run_events: &'a [AgentEventRecord], event: &str) -
         .rev()
         .find(|record| record.channel_id == MAIN_CHANNEL_ID && record.event == event)
         .map(|record| record.body.as_str())
+}
+
+fn transition_id_for_loop_control(decision: &LoopControlDecision) -> String {
+    match decision {
+        LoopControlDecision::Continue => "continue".to_owned(),
+        LoopControlDecision::StopOk(_) => "stop-ok".to_owned(),
+        LoopControlDecision::StopError(_) => "stop-error".to_owned(),
+        LoopControlDecision::Route(route) => format!("route:{route}"),
+    }
+}
+
+fn next_step_for_loop_control(decision: LoopControlDecision) -> NextStep {
+    match decision {
+        LoopControlDecision::Continue => NextStep::Continue,
+        LoopControlDecision::StopOk(body) => {
+            NextStep::FinishOk(format_summary("Workflow complete", &body))
+        }
+        LoopControlDecision::StopError(body) => {
+            NextStep::FinishError(format_summary("Workflow failed", &body))
+        }
+        LoopControlDecision::Route(route) => NextStep::Route(route),
+    }
+}
+
+fn transition_guard_failure(guard: &WorkflowTransitionGuard) -> &WorkflowTransitionGuardFailure {
+    match guard {
+        WorkflowTransitionGuard::FileExists { failure, .. }
+        | WorkflowTransitionGuard::FileContains { failure, .. }
+        | WorkflowTransitionGuard::FileNotContains { failure, .. }
+        | WorkflowTransitionGuard::EventExists { failure, .. }
+        | WorkflowTransitionGuard::EventContains { failure, .. } => failure,
+    }
+}
+
+fn transition_guard_failure_step(
+    workflow: &WorkflowDefinition,
+    prompt_id: &str,
+    transition_id: &str,
+    failure: &WorkflowTransitionGuardFailure,
+) -> Result<NextStep> {
+    Ok(match failure.on_fail {
+        WorkflowTransitionGuardFailureAction::Continue => NextStep::Continue,
+        WorkflowTransitionGuardFailureAction::Error => NextStep::FinishError(
+            failure
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|summary| !summary.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "Workflow failed: transition guard blocked '{}' in prompt '{}'",
+                        transition_id, prompt_id
+                    )
+                }),
+        ),
+        WorkflowTransitionGuardFailureAction::Route => NextStep::Route(
+            failure
+                .route
+                .as_deref()
+                .map(str::trim)
+                .filter(|route| !route.is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "workflow '{}' prompt '{}' transition guard route is missing",
+                        workflow.workflow_id,
+                        prompt_id
+                    )
+                })?
+                .to_owned(),
+        ),
+    })
 }
 
 fn planning_target_path_body_for_draft(
@@ -1628,11 +1813,50 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct GuardedWorkflowRunner {
+        invocations: Arc<Mutex<Vec<RunnerInvocation>>>,
+        events: Arc<Mutex<WorkflowEventQueue>>,
+        plan_path: Utf8PathBuf,
+        plan_states: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl RunnerAdapter for GuardedWorkflowRunner {
+        async fn run(
+            &self,
+            _config: &ralph_core::RunnerConfig,
+            invocation: RunnerInvocation,
+            _control: &RunControl,
+            stream: Option<UnboundedSender<RunnerStreamEvent>>,
+        ) -> Result<RunnerResult> {
+            self.invocations.lock().unwrap().push(invocation.clone());
+            let next_plan_state = self.plan_states.lock().unwrap().remove(0);
+            fs::write(self.plan_path.as_std_path(), next_plan_state).unwrap();
+            let events = self.events.lock().unwrap().remove(0);
+            if let Some(tx) = stream {
+                let _ = tx.send(RunnerStreamEvent::StartedWorking);
+                let _ = tx.send(RunnerStreamEvent::ParsedEvents {
+                    child_pid: 1,
+                    events: events
+                        .into_iter()
+                        .map(|(event, body)| ralph_core::ParsedAgentEvent { event, body })
+                        .collect(),
+                });
+            }
+            Ok(RunnerResult {
+                output: String::new(),
+                exit_code: 0,
+            })
+        }
+    }
+
     #[derive(Default)]
     struct TestDelegate {
         finished: Vec<(ralph_core::LastRunStatus, String)>,
         parallel_events: Vec<String>,
         outputs: Vec<String>,
+        notes: Vec<String>,
         planning_answers: Vec<PlanningQuestionAnswer>,
         planning_decisions: Vec<PlanningDraftDecision>,
         reviewed_drafts: Vec<PlanningDraftReview>,
@@ -1661,6 +1885,9 @@ mod tests {
                 }
                 RunEvent::Output(chunk) => {
                     self.outputs.push(chunk);
+                }
+                RunEvent::Note(note) => {
+                    self.notes.push(note);
                 }
                 _ => {}
             }
@@ -1931,6 +2158,80 @@ prompts:
         let invocation = runner.invocations.lock().unwrap().first().cloned().unwrap();
         assert!(invocation.prompt_text.contains("state=custom-state.txt"));
         assert!(invocation.prompt_text.contains("request=ship it"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transition_guards_can_force_reentry_until_file_predicate_passes() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let plan_path = project_dir.join("PLAN.md");
+        fs::write(plan_path.as_std_path(), "### Task 1\n- [ ] first\n")?;
+
+        let config_home = Utf8PathBuf::from_path_buf(temp.path().join("config-home")).unwrap();
+        fs::create_dir_all(config_home.join("workflows")).unwrap();
+        let _config_home = ScopedConfigHome::new(config_home.clone());
+        fs::write(
+            config_home.join("workflows/guarded-task.yml"),
+            r#"
+version: 1
+workflow_id: guarded-task
+title: Guarded Task
+entrypoint: task
+options:
+  plan-file:
+    value_name: FILE
+prompts:
+  task:
+    title: Task
+    fallback-route: task
+    transition-guards:
+      stop-ok:
+        - type: file_not_contains
+          path: "{ralph-option:plan-file}"
+          literal: "- [ ]"
+          on-fail: continue
+          note: "still incomplete"
+    prompt: hello
+"#,
+        )?;
+
+        let runner = GuardedWorkflowRunner {
+            invocations: Arc::new(Mutex::new(Vec::new())),
+            events: Arc::new(Mutex::new(vec![
+                vec![("loop-stop:ok".to_owned(), "done".to_owned())],
+                vec![("loop-stop:ok".to_owned(), "done".to_owned())],
+            ])),
+            plan_path: plan_path.clone(),
+            plan_states: Arc::new(Mutex::new(vec![
+                "### Task 1\n- [ ] first\n".to_owned(),
+                "### Task 1\n- [x] first\n".to_owned(),
+            ])),
+        };
+        let app = RalphApp::new(
+            project_dir,
+            AppConfig {
+                max_iterations: 3,
+                ..Default::default()
+            },
+            runner.clone(),
+        );
+        let mut delegate = TestDelegate::default();
+
+        let summary = app
+            .run_workflow(
+                "guarded-task",
+                WorkflowRunInput {
+                    options: BTreeMap::from([("plan-file".to_owned(), "PLAN.md".to_owned())]),
+                    ..Default::default()
+                },
+                &mut delegate,
+            )
+            .await?;
+
+        assert_eq!(summary.status, ralph_core::LastRunStatus::Completed);
+        assert_eq!(runner.invocations.lock().unwrap().len(), 2);
+        assert!(delegate.notes.iter().any(|note| note == "still incomplete"));
         Ok(())
     }
 

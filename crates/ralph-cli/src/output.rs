@@ -332,10 +332,10 @@ fn format_limits_line(
 }
 
 fn format_timeout_duration(total_seconds: u64) -> String {
-    if total_seconds % 3600 == 0 {
+    if total_seconds.is_multiple_of(3600) {
         return format!("{}h", total_seconds / 3600);
     }
-    if total_seconds % 60 == 0 {
+    if total_seconds.is_multiple_of(60) {
         return format!("{}m", total_seconds / 60);
     }
     format!("{}s", total_seconds)
