@@ -1542,9 +1542,9 @@ prompts:
         );
         assert!(prompt.contains("emit exactly one `planning-question` instead of a new draft"));
         assert!(prompt.contains(r#"{"question":"Your question here?","options":["Option 1","Option 2","Option 3"],"context":"Why this question matters"}"#));
-        assert!(prompt.contains(
-            "do not include `Other`, `Something else`, or any catch-all option"
-        ));
+        assert!(
+            prompt.contains("do not include `Other`, `Something else`, or any catch-all option")
+        );
         assert!(prompt.contains(
             "do not emit a fresh draft that ignores the existing review feedback or the latest draft file state"
         ));
