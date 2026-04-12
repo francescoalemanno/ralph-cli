@@ -1,19 +1,39 @@
 use std::{
+    env,
     io::{self, BufRead, IsTerminal, Write},
+    process::Command,
     sync::OnceLock,
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use camino::Utf8Path;
+use ralph_core::{LastRunStatus, TerminalTheme, ThemeConfig};
 use termimad::MadSkin;
 
 use crate::{
     PlanningAnswerSource, PlanningDraftDecision, PlanningDraftDecisionKind, PlanningDraftReview,
-    PlanningQuestion, PlanningQuestionAnswer, RunDelegate, RunEvent, format_iteration_banner,
+    PlanningQuestion, PlanningQuestionAnswer, RunDelegate, RunEvent,
 };
 
-#[derive(Default)]
-pub struct ConsoleDelegate;
+#[derive(Debug, Clone, Copy)]
+pub struct ConsoleDelegate {
+    theme: TerminalTheme,
+}
+
+impl ConsoleDelegate {
+    pub fn new(theme_config: &ThemeConfig) -> Self {
+        Self {
+            theme: TerminalTheme::new(theme_config),
+        }
+    }
+}
+
+impl Default for ConsoleDelegate {
+    fn default() -> Self {
+        Self::new(&ThemeConfig::default())
+    }
+}
 
 #[async_trait]
 impl RunDelegate for ConsoleDelegate {
@@ -27,7 +47,7 @@ impl RunDelegate for ConsoleDelegate {
                 println!();
                 println!(
                     "{}",
-                    format_iteration_banner(&prompt_name, iteration, max_iterations)
+                    format_iteration_banner(self.theme, &prompt_name, iteration, max_iterations)
                 );
             }
             RunEvent::Output(chunk) => {
@@ -36,13 +56,13 @@ impl RunDelegate for ConsoleDelegate {
             RunEvent::ParallelWorkerLaunched { channel_id, label } => {
                 println!(
                     "{}",
-                    format_parallel_event("queued", &channel_id, &label, None)
+                    format_parallel_event(self.theme, "queued", &channel_id, &label, None)
                 );
             }
             RunEvent::ParallelWorkerStarted { channel_id, label } => {
                 println!(
                     "{}",
-                    format_parallel_event("running", &channel_id, &label, None)
+                    format_parallel_event(self.theme, "running", &channel_id, &label, None)
                 );
             }
             RunEvent::ParallelWorkerFinished {
@@ -52,14 +72,14 @@ impl RunDelegate for ConsoleDelegate {
             } => {
                 println!(
                     "{}",
-                    format_parallel_event("done", &channel_id, &label, Some(exit_code))
+                    format_parallel_event(self.theme, "done", &channel_id, &label, Some(exit_code))
                 );
             }
             RunEvent::Note(note) => {
-                eprintln!("{}", format_note(&note));
+                eprintln!("{}", format_note(self.theme, &note));
             }
             RunEvent::Finished { status, summary } => {
-                println!("\n{}", format_finish_line(status.label(), &summary));
+                println!("\n{}", format_finish_line(self.theme, status, &summary));
             }
         }
         Ok(())
@@ -108,16 +128,8 @@ impl RunDelegate for ConsoleDelegate {
                 continue;
             }
             if selected == question.options.len() + 1 {
-                let answer = loop {
-                    let line = prompt_line("Enter your answer: ")?;
-                    if line.trim().is_empty() {
-                        eprintln!("answer cannot be empty");
-                        continue;
-                    }
-                    break line;
-                };
                 return Ok(PlanningQuestionAnswer {
-                    answer,
+                    answer: prompt_nonempty("Enter your answer: ")?,
                     source: PlanningAnswerSource::Custom,
                 });
             }
@@ -155,17 +167,9 @@ impl RunDelegate for ConsoleDelegate {
                     });
                 }
                 "2" => {
-                    let feedback = loop {
-                        let line = prompt_line("Enter revision feedback: ")?;
-                        if line.trim().is_empty() {
-                            eprintln!("revision feedback cannot be empty");
-                            continue;
-                        }
-                        break line;
-                    };
                     return Ok(PlanningDraftDecision {
                         kind: PlanningDraftDecisionKind::Revise,
-                        feedback: Some(feedback),
+                        feedback: Some(prompt_nonempty("Enter revision feedback: ")?),
                     });
                 }
                 "3" => {
@@ -182,7 +186,39 @@ impl RunDelegate for ConsoleDelegate {
     }
 }
 
-fn prompt_line(prompt: &str) -> Result<String> {
+pub fn edit_file(path: &Utf8Path, editor_override: Option<&str>) -> Result<()> {
+    let editor = preferred_external_editor(editor_override).ok_or_else(|| {
+        anyhow!("no editor configured; set project `editor_override`, `VISUAL`, or `EDITOR`")
+    })?;
+    edit_file_with_external_editor(path, &editor)
+}
+
+pub fn prompt_nonempty(prompt: &str) -> Result<String> {
+    loop {
+        let line = prompt_line(prompt)?;
+        if !line.trim().is_empty() {
+            return Ok(line);
+        }
+        eprintln!("input cannot be empty");
+    }
+}
+
+pub fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+
+    loop {
+        let answer = prompt_line(&format!("{prompt}{suffix}: "))?;
+        let normalized = answer.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "" => return Ok(default_yes),
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => eprintln!("enter y or n"),
+        }
+    }
+}
+
+pub fn prompt_line(prompt: &str) -> Result<String> {
     let mut stdout = io::stdout().lock();
     write!(stdout, "{prompt}")?;
     stdout.flush()?;
@@ -215,51 +251,125 @@ fn planning_draft_skin() -> &'static MadSkin {
     SKIN.get_or_init(MadSkin::default)
 }
 
+fn preferred_external_editor(editor_override: Option<&str>) -> Option<String> {
+    let visual = env::var("VISUAL").ok();
+    let editor = env::var("EDITOR").ok();
+    resolve_editor_command(editor_override, visual.as_deref(), editor.as_deref())
+}
+
+fn resolve_editor_command(
+    editor_override: Option<&str>,
+    visual: Option<&str>,
+    editor: Option<&str>,
+) -> Option<String> {
+    [editor_override, visual, editor]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn edit_file_with_external_editor(path: &Utf8Path, editor: &str) -> Result<()> {
+    let command = format!("{editor} {}", quote_shell_arg(path.as_str()));
+    let status = if cfg!(windows) {
+        Command::new("cmd").arg("/C").arg(&command).status()
+    } else {
+        Command::new("sh").arg("-lc").arg(&command).status()
+    }
+    .with_context(|| format!("failed to launch editor command '{editor}'"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "editor command '{editor}' exited with status {status}"
+        ))
+    }
+}
+
+fn quote_shell_arg(value: &str) -> String {
+    if cfg!(windows) {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn format_iteration_banner(
+    theme: TerminalTheme,
+    prompt_name: &str,
+    iteration: usize,
+    max_iterations: usize,
+) -> String {
+    let title = format!(" {prompt_name} | iteration {iteration}/{max_iterations} ");
+    let width = title.len().max(72);
+    theme
+        .style()
+        .fg(theme.palette().accent)
+        .bold()
+        .paint(format!("{title:=^width$}", width = width))
+}
+
 fn format_parallel_event(
+    theme: TerminalTheme,
     kind: &str,
     channel_id: &str,
     label: &str,
     exit_code: Option<i32>,
 ) -> String {
-    const ANSI_CYAN: &str = "\x1b[36m";
-    const ANSI_GREEN: &str = "\x1b[32m";
-    const ANSI_RED: &str = "\x1b[31m";
-    const ANSI_DIM: &str = "\x1b[2m";
-    const ANSI_RESET: &str = "\x1b[0m";
-
-    let color = match (kind, exit_code) {
-        ("done", Some(0)) => ANSI_GREEN,
-        ("done", Some(_)) => ANSI_RED,
-        ("running", _) => ANSI_CYAN,
-        _ => ANSI_DIM,
+    let style = match (kind, exit_code) {
+        ("done", Some(0)) => theme.style().fg(theme.palette().success),
+        ("done", Some(_)) => theme.style().fg(theme.palette().error),
+        ("running", _) => theme.style().fg(theme.palette().accent),
+        _ => theme.label_style(),
     };
 
     match exit_code {
-        Some(exit_code) => {
-            format!("{color}[parallel:{channel_id}] {kind} {label} (exit={exit_code}){ANSI_RESET}")
-        }
-        None => format!("{color}[parallel:{channel_id}] {kind} {label}{ANSI_RESET}"),
+        Some(exit_code) => style.paint(format!(
+            "[parallel:{channel_id}] {kind} {label} (exit={exit_code})"
+        )),
+        None => style.paint(format!("[parallel:{channel_id}] {kind} {label}")),
     }
 }
 
-fn format_note(note: &str) -> String {
-    const ANSI_YELLOW: &str = "\x1b[33m";
-    const ANSI_RESET: &str = "\x1b[0m";
-
-    format!("{ANSI_YELLOW}! {note}{ANSI_RESET}")
+fn format_note(theme: TerminalTheme, note: &str) -> String {
+    theme
+        .style()
+        .fg(theme.palette().warning)
+        .paint(format!("! {note}"))
 }
 
-fn format_finish_line(status: &str, summary: &str) -> String {
-    const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
-    const ANSI_BOLD_RED: &str = "\x1b[1;31m";
-    const ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
-    const ANSI_RESET: &str = "\x1b[0m";
+fn format_finish_line(theme: TerminalTheme, status: LastRunStatus, summary: &str) -> String {
+    theme
+        .style()
+        .fg(theme.status_color(status))
+        .bold()
+        .paint(format!("{summary} ({})", status.label()))
+}
 
-    let color = match status {
-        "completed" => ANSI_BOLD_GREEN,
-        "failed" => ANSI_BOLD_RED,
-        _ => ANSI_BOLD_YELLOW,
-    };
+#[cfg(test)]
+mod tests {
+    use super::resolve_editor_command;
 
-    format!("{color}{summary} ({status}){ANSI_RESET}")
+    #[test]
+    fn editor_override_has_highest_priority() {
+        assert_eq!(
+            resolve_editor_command(Some("nvim"), Some("vim"), Some("nano")),
+            Some("nvim".to_owned())
+        );
+    }
+
+    #[test]
+    fn editor_resolution_skips_blank_values() {
+        assert_eq!(
+            resolve_editor_command(Some("   "), Some(" code -w "), Some("nano")),
+            Some("code -w".to_owned())
+        );
+        assert_eq!(
+            resolve_editor_command(None, Some("   "), Some(" nano ")),
+            Some("nano".to_owned())
+        );
+        assert_eq!(resolve_editor_command(None, None, Some("   ")), None);
+    }
 }
