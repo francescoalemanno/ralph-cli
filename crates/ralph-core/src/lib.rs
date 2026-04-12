@@ -2,6 +2,7 @@ mod agent;
 mod agent_events;
 mod atomic;
 mod config;
+mod terminal;
 mod theme;
 mod types;
 mod workflow;
@@ -19,6 +20,7 @@ pub use config::{
     ARTIFACT_DIR_NAME, AppConfig, ConfigFileScope, ScopedGlobalConfigDirOverride, ThemeConfig,
     global_config_dir, scoped_global_config_dir_override,
 };
+pub use terminal::{AnsiStyle, TerminalTheme};
 pub use theme::{ResolvedTheme, ThemeColor, ThemeMode, ThemeVariant};
 pub use types::{LastRunStatus, RunControl, RunnerInvocation, RunnerResult, WorkflowRunSummary};
 pub use workflow::{
