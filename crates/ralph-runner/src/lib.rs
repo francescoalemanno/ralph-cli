@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use ralph_core::{
-    CommandMode, PromptInput, RunControl, RunnerConfig, RunnerInvocation, RunnerResult,
+    AnsiStyle, CommandMode, PromptInput, RunControl, RunnerConfig, RunnerInvocation, RunnerResult,
     agent_events_wal_path,
 };
 use tokio::{
@@ -321,10 +321,8 @@ fn forward_output_chunk(
 pub fn format_event_notice(
     channel_id: Option<&str>,
     event: &ralph_core::ParsedAgentEvent,
+    style: AnsiStyle,
 ) -> String {
-    const ANSI_BOLD_MAGENTA: &str = "\x1b[1;35m";
-    const ANSI_RESET: &str = "\x1b[0m";
-
     let mut message = "◆ event emitted".to_owned();
     if let Some(channel_id) = channel_id {
         message.push(' ');
@@ -370,7 +368,7 @@ pub fn format_event_notice(
         }
     }
 
-    format!("{ANSI_BOLD_MAGENTA}{message}{ANSI_RESET}\n")
+    format!("{}\n", style.paint(message))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -596,6 +594,7 @@ mod tests {
                 event: "planning-target-path".to_owned(),
                 body: "docs/plans/one.md\ndocs/plans/two.md\ndocs/plans/three.md\ndocs/plans/four.md\ndocs/plans/five.md".to_owned(),
             },
+            ralph_core::AnsiStyle::default(),
         );
 
         assert!(rendered.contains("◆ event emitted [host]: planning-target-path"));
