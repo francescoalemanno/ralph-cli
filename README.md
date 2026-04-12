@@ -2,9 +2,7 @@
 
 Ralph is a workflow runner for iterative coding-agent loops.
 
-Think of it as the Ralph Wiggum technique packaged into named workflows: study durable project memory, choose one high-leverage action, do the work, record what changed, and either loop again or stop. By default it opens a terminal UI; add `--cli` when you want a scriptable, plain-terminal run.
-
-![Ralph TUI](tui.png)
+Think of it as the Ralph Wiggum technique packaged into named workflows: study durable project memory, choose one high-leverage action, do the work, record what changed, and either loop again or stop. Ralph runs in the terminal by default, with guided interactive steps where the workflow needs operator input.
 
 ## Ralph Philosophy
 
@@ -124,7 +122,7 @@ Guided behavior:
 
 ### Low-Level Runner
 
-These open the runner UI directly:
+These run directly in the terminal:
 
 ```bash
 ralph run bare "fix the failing tests"
@@ -135,25 +133,12 @@ ralph run plan "add caching for API responses"
 
 Important behavior:
 
-- TUI mode requires a workflow and a request.
-- In TUI mode, provide the request either as argv text or with `--file`.
-- Piped stdin is not supported in TUI mode because the terminal is needed for interaction.
-
-### CLI Mode
-
-Use `--cli` for a plain terminal run:
-
-```bash
-ralph run --cli bare "summarize the current repository"
-ralph run --cli default "finish the top task"
-cat REQ.md | ralph run --cli bare
-```
-
-CLI mode also accepts piped stdin.
+- `ralph run` accepts the request as argv text, `--file <FILE>`, or piped stdin.
+- The request must be provided in exactly one runtime form.
 
 ## Theme
 
-Ralph resolves one shared terminal theme for both the CLI and the TUI.
+Ralph resolves one shared terminal theme for all console output.
 
 - `theme.mode = "auto"` uses `COLORFGBG` when available and falls back to a dark palette.
 - `theme.mode = "dark"` or `theme.mode = "light"` forces a specific palette.
@@ -176,7 +161,7 @@ Ralph accepts the workflow request in exactly one runtime form:
 
 - argv text
 - `--file <FILE>`
-- stdin, but only in `--cli` mode
+- stdin
 
 If you provide more than one, Ralph exits with a usage error.
 
@@ -314,9 +299,8 @@ Editor resolution order:
 1. project `editor_override`
 2. `VISUAL`
 3. `EDITOR`
-4. Ralph's built-in terminal editor
 
-If Ralph falls back to the built-in editor, `Ctrl-S` saves and `Ctrl-Q` closes it.
+If no editor is configured, `ralph edit` exits with an error.
 
 ## Workflow Option Flags
 
@@ -410,7 +394,7 @@ prompts:
       ...
 ```
 
-Parallel workers emit events on their own channel automatically. Their text output is suppressed in the CLI and TUI, but saved under `.ralph-runtime/channels/<channel-id>/output.log`.
+Parallel workers emit events on their own channel automatically. Their text output is suppressed from the main console output, but saved under `.ralph-runtime/channels/<channel-id>/output.log`.
 
 ## A Good Daily Flow
 
@@ -432,8 +416,8 @@ If you want the more explicit dispatcher-style plan gating, use `dbv`:
 ralph run dbv "add SSO to the admin app"
 ```
 
-If you want plain terminal output instead of the UI, or you are scripting a run:
+If you are scripting a run, piping the request works directly:
 
 ```bash
-ralph run --cli dbv "add SSO to the admin app"
+cat REQ.md | ralph run dbv
 ```
