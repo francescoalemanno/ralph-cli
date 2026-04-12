@@ -29,7 +29,6 @@ const PROJECT_DIR_HELP: &str = "Run the command against this project directory";
 const WORKFLOW_HELP: &str = "Workflow ID from the registry";
 const REQUEST_FILE_HELP: &str = "Read the request from a file";
 const REQUEST_HELP: &str = "Provide the request as argv text";
-const RUN_CLI_HELP: &str = "Run in CLI mode instead of opening the TUI";
 const RUN_AGENT_HELP: &str = "Override the configured coding agent for this run";
 const RUN_MAX_ITERATIONS_HELP: &str = "Override the configured workflow iteration limit";
 const RUN_SESSION_TIMEOUT_HELP: &str = "Kill the agent after a fixed duration like 30m, 5m, or 45s";
@@ -59,7 +58,7 @@ const RUN_AFTER_HELP: &str = "\
 Examples:
   ralph run default \"fix the failing tests\"
   ralph run default --file REQ.md
-  cat REQ.md | ralph run --cli bare";
+  cat REQ.md | ralph run bare";
 const GET_LONG_ABOUT: &str = "\
 Print the most recent payload stored for an event in the current Ralph run WAL.
 
@@ -297,7 +296,6 @@ pub(crate) struct OptionalPlanShortcutArgs {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RunArgs {
-    pub(crate) cli: bool,
     pub(crate) runtime: RuntimeArgs,
     pub(crate) workflow: String,
     pub(crate) workflow_options: BTreeMap<String, String>,
@@ -317,10 +315,6 @@ impl RequestArgs {
         } else {
             Some(self.request.join(" "))
         }
-    }
-
-    pub(crate) fn provided_count(&self) -> usize {
-        usize::from(!self.request.is_empty()) + usize::from(self.request_file.is_some())
     }
 }
 
@@ -615,7 +609,7 @@ fn build_cli_command() -> Result<Command> {
 
 fn build_run_command() -> Result<Command> {
     let mut command = Command::new("run")
-        .about("Run a workflow; opens the TUI by default")
+        .about("Run a workflow in the terminal")
         .after_help(RUN_AFTER_HELP)
         .arg_required_else_help(true)
         .subcommand_required(true)
@@ -625,7 +619,7 @@ fn build_run_command() -> Result<Command> {
                 .long("cli")
                 .global(true)
                 .action(ArgAction::SetTrue)
-                .help(RUN_CLI_HELP),
+                .hide(true),
         )
         .arg(
             Arg::new(AGENT_ARG)
@@ -742,7 +736,6 @@ fn parse_run_args(matches: &ArgMatches) -> Result<RunArgs> {
         .collect::<BTreeMap<_, _>>();
 
     Ok(RunArgs {
-        cli: workflow_matches.get_flag(CLI_ARG),
         runtime: RuntimeArgs {
             agent: workflow_matches.get_one::<String>(AGENT_ARG).cloned(),
             max_iterations: workflow_matches
@@ -1064,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn run_subcommand_parses_cli_flag() {
+    fn run_subcommand_accepts_legacy_cli_flag() {
         with_test_workflow_home(|| {
             let cli =
                 Cli::try_parse_from(["ralph", "run", "--cli", "fixture-flow", "fix", "tests"])
@@ -1073,10 +1066,13 @@ mod tests {
             let Commands::Run(args) = cli.command else {
                 panic!("expected run subcommand");
             };
-            assert!(args.cli);
             assert_eq!(args.workflow, "fixture-flow");
             assert_eq!(args.runtime.session_timeout_secs, Some(60 * 60));
             assert_eq!(args.runtime.idle_timeout_secs, Some(10 * 60));
+            assert_eq!(
+                args.request_args.request,
+                vec!["fix".to_owned(), "tests".to_owned()]
+            );
         });
     }
 
