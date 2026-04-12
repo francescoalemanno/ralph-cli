@@ -1,12 +1,9 @@
-use std::{
-    env, fs,
-    io::{self, IsTerminal},
-};
+use std::fs;
 
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 use ralph_core::{
-    AgentConfig, LastRunStatus, ThemeColor, ThemeConfig, WorkflowDefinition, WorkflowRunSummary,
+    AgentConfig, TerminalTheme, ThemeConfig, WorkflowDefinition, WorkflowRunSummary,
     WorkflowSummary,
 };
 
@@ -67,7 +64,7 @@ pub(crate) fn print_bare_file(path: &Utf8Path) -> Result<()> {
 }
 
 pub(crate) fn print_workflow_run(theme_config: &ThemeConfig, summary: &WorkflowRunSummary) {
-    let theme = CliTheme::new(theme_config);
+    let theme = TerminalTheme::new(theme_config);
     let title = " Run Result ";
     let width = title.len().max(72);
     println!(
@@ -140,13 +137,13 @@ pub(crate) fn agent_list_rows(agents: &[AgentConfig]) -> Vec<AgentListRow> {
 }
 
 fn render_run_header(theme_config: &ThemeConfig, header: &CliRunHeader) -> String {
-    let theme = CliTheme::new(theme_config);
-    let title = format!(" RALPH v{} | CLI RUN ", header.version);
+    let theme = TerminalTheme::new(theme_config);
+    let title = format!(" RALPH v{} | RUN ", header.version);
     let width = title.len().max(72);
     let mut lines = vec![
         theme
             .style()
-            .fg(theme.palette.accent)
+            .fg(theme.palette().accent)
             .bold()
             .paint(format!("{title:=^width$}", width = width)),
     ];
@@ -225,89 +222,11 @@ fn render_run_header(theme_config: &ThemeConfig, header: &CliRunHeader) -> Strin
     lines.push(
         theme
             .style()
-            .fg(theme.palette.accent)
+            .fg(theme.palette().accent)
             .bold()
             .paint("=".repeat(width)),
     );
     lines.join("\n")
-}
-
-struct CliTheme {
-    colors_enabled: bool,
-    palette: ralph_core::ResolvedTheme,
-}
-
-impl CliTheme {
-    fn new(theme_config: &ThemeConfig) -> Self {
-        Self {
-            colors_enabled: io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
-            palette: theme_config.resolve(),
-        }
-    }
-
-    fn style(&self) -> AnsiStyle {
-        AnsiStyle {
-            enabled: self.colors_enabled,
-            ..AnsiStyle::default()
-        }
-    }
-
-    fn label_style(&self) -> AnsiStyle {
-        self.style().fg(self.palette.subtle)
-    }
-
-    fn status_color(&self, status: LastRunStatus) -> ThemeColor {
-        match status {
-            LastRunStatus::NeverRun | LastRunStatus::Canceled => self.palette.accent,
-            LastRunStatus::Completed => self.palette.success,
-            LastRunStatus::MaxIterations => self.palette.warning,
-            LastRunStatus::Failed => self.palette.error,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct AnsiStyle {
-    enabled: bool,
-    fg: Option<ThemeColor>,
-    bold: bool,
-}
-
-impl AnsiStyle {
-    fn fg(mut self, color: ThemeColor) -> Self {
-        self.fg = Some(color);
-        self
-    }
-
-    fn bold(mut self) -> Self {
-        self.bold = true;
-        self
-    }
-
-    fn paint(self, text: impl Into<String>) -> String {
-        let text = text.into();
-        if !self.enabled {
-            return text;
-        }
-
-        let mut codes = Vec::new();
-        if self.bold {
-            codes.push(1u16);
-        }
-        if let Some(color) = self.fg {
-            codes.push(u16::from(color.ansi_fg_code()));
-        }
-        if codes.is_empty() {
-            return text;
-        }
-
-        let codes = codes
-            .into_iter()
-            .map(|code| code.to_string())
-            .collect::<Vec<_>>()
-            .join(";");
-        format!("\u{1b}[{codes}m{text}\u{1b}[0m")
-    }
 }
 
 fn format_limits_line(
