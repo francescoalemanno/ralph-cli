@@ -6,12 +6,13 @@ use std::{
     env, fs,
     io::{self, BufRead, IsTerminal, Read, Write},
     process::{Command, ExitCode},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
     cli::{
         AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, GetArgs, GuidedArgs, InitArgs,
-        RequestArgs, RunArgs, RuntimeArgs, render_run_workflow_help,
+        PayloadArgs, RequestArgs, RunArgs, RuntimeArgs, SignalArgs, render_run_workflow_help,
     },
     output::{
         AgentCurrentRow, CliRunHeader, agent_list_rows, print_agent_current, print_agent_list,
@@ -22,8 +23,10 @@ use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_app::{ConsoleDelegate, RalphApp, WorkflowRequestInput, WorkflowRunInput};
 use ralph_core::{
-    AppConfig, ConfigFileScope, LastRunStatus, agent_events_wal_path, atomic_write,
+    AgentEventRecord, AppConfig, ConfigFileScope, LastRunStatus, MAIN_CHANNEL_ID,
+    agent_events_wal_path, append_agent_event_to_wal_path, atomic_write,
     latest_agent_event_body_from_wal_in_channel, load_workflow, seed_builtin_workflows_if_missing,
+    validate_agent_event,
 };
 use ralph_tui::{
     TuiLaunchOptions, TuiPreloadedRequest, TuiRequestSource, edit_file, run_tui_with_options,
@@ -34,6 +37,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 const HOST_CHANNEL_ID: &str = "host";
 const PLANNING_PLAN_FILE_EVENT: &str = "planning-plan-file";
 const MISSING_PLAN_FILE_PLACEHOLDER: &str = "<unavailable, ignore>";
+const RUNTIME_DIR_NAME: &str = ".ralph-runtime";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -119,6 +123,8 @@ async fn run_command(project_dir: Utf8PathBuf, command: Commands) -> Result<()> 
                 .map(|_| ())
         }
         Commands::Run(args) => run_run_command(project_dir, args).await,
+        Commands::Signal(args) => run_signal(args),
+        Commands::Payload(args) => run_payload(args),
         Commands::Get(args) => run_get(args),
         Commands::Ls => {
             let app = RalphApp::load(project_dir)?;
@@ -371,6 +377,65 @@ fn run_config_command(project_dir: Utf8PathBuf, command: ConfigCommands) -> Resu
     }
 }
 
+#[derive(Debug, Clone)]
+struct EmitEventContext {
+    wal_path: Utf8PathBuf,
+    run_dir: Utf8PathBuf,
+    run_id: String,
+    channel_id: String,
+    project_dir: Utf8PathBuf,
+    prompt_path: Utf8PathBuf,
+    prompt_name: String,
+}
+
+impl EmitEventContext {
+    fn from_env() -> Result<Self> {
+        let wal_path = env_utf8_path("RALPH_WAL_PATH")?;
+        let run_dir = run_dir_from_wal_path(&wal_path)?;
+        let run_id = run_dir
+            .file_name()
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| anyhow!("could not determine run id from RALPH_WAL_PATH"))?;
+        let channel_id = required_env("RALPH_CHANNEL_ID")?;
+        let channel_id = channel_id.trim();
+        if channel_id.is_empty() {
+            return Err(anyhow!(
+                "RALPH_CHANNEL_ID cannot be empty; this command only works inside a Ralph agent run"
+            ));
+        }
+        let project_dir = project_dir_from_run_dir(&run_dir)?;
+        let prompt_path = env_utf8_path("RALPH_PROMPT_PATH")?;
+        let prompt_name = prompt_path
+            .file_stem()
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "workflow".to_owned());
+
+        Ok(Self {
+            wal_path,
+            run_dir,
+            run_id,
+            channel_id: channel_id.to_owned(),
+            project_dir,
+            prompt_path,
+            prompt_name,
+        })
+    }
+}
+
+fn run_signal(args: SignalArgs) -> Result<()> {
+    let context = EmitEventContext::from_env()?;
+    append_event(&context, &args.event, "")?;
+    Ok(())
+}
+
+fn run_payload(args: PayloadArgs) -> Result<()> {
+    let context = EmitEventContext::from_env()?;
+    append_event(&context, &args.event, &args.body)?;
+    Ok(())
+}
+
 fn run_get(args: GetArgs) -> Result<()> {
     let event = args.event.trim().to_owned();
     if event.is_empty() {
@@ -383,6 +448,88 @@ fn run_get(args: GetArgs) -> Result<()> {
             .ok_or_else(|| anyhow!("no event with name {event}"))?;
     println!("{body}");
     Ok(())
+}
+
+fn append_event(context: &EmitEventContext, event: &str, body: &str) -> Result<()> {
+    let event = event.trim();
+    if event.is_empty() {
+        return Err(anyhow!("event name cannot be empty"));
+    }
+    if context.channel_id != MAIN_CHANNEL_ID && event.starts_with("loop-") {
+        return Err(anyhow!(
+            "parallel worker '{}' cannot emit loop-control event '{}'",
+            context.channel_id,
+            event
+        ));
+    }
+
+    validate_agent_event(event, body, Some(&context.prompt_path))?;
+    append_agent_event_to_wal_path(
+        &context.wal_path,
+        &AgentEventRecord {
+            v: 1,
+            ts_unix_ms: current_unix_timestamp_ms(),
+            run_id: context.run_id.clone(),
+            channel_id: context.channel_id.clone(),
+            event: event.to_owned(),
+            body: body.to_owned(),
+            project_dir: context.project_dir.clone(),
+            run_dir: context.run_dir.clone(),
+            prompt_path: context.prompt_path.clone(),
+            prompt_name: context.prompt_name.clone(),
+            pid: std::process::id(),
+        },
+    )?;
+    Ok(())
+}
+
+fn run_dir_from_wal_path(wal_path: &Utf8Path) -> Result<Utf8PathBuf> {
+    let runtime_dir = wal_path
+        .parent()
+        .ok_or_else(|| anyhow!("invalid RALPH_WAL_PATH; missing runtime directory"))?;
+    if runtime_dir.file_name() != Some(RUNTIME_DIR_NAME) {
+        return Err(anyhow!(
+            "invalid RALPH_WAL_PATH; expected parent directory '{}'",
+            RUNTIME_DIR_NAME
+        ));
+    }
+    runtime_dir
+        .parent()
+        .map(Utf8Path::to_path_buf)
+        .ok_or_else(|| anyhow!("invalid RALPH_WAL_PATH; missing run directory"))
+}
+
+fn project_dir_from_run_dir(run_dir: &Utf8Path) -> Result<Utf8PathBuf> {
+    let workflow_dir = run_dir
+        .parent()
+        .ok_or_else(|| anyhow!("invalid Ralph run directory; missing workflow directory"))?;
+    let runs_dir = workflow_dir
+        .parent()
+        .ok_or_else(|| anyhow!("invalid Ralph run directory; missing runs directory"))?;
+    if runs_dir.file_name() != Some("runs") {
+        return Err(anyhow!(
+            "invalid Ralph run directory; expected parent directory 'runs'"
+        ));
+    }
+    let ralph_dir = runs_dir
+        .parent()
+        .ok_or_else(|| anyhow!("invalid Ralph run directory; missing .ralph directory"))?;
+    if ralph_dir.file_name() != Some(".ralph") {
+        return Err(anyhow!(
+            "invalid Ralph run directory; expected parent directory '.ralph'"
+        ));
+    }
+    ralph_dir
+        .parent()
+        .map(Utf8Path::to_path_buf)
+        .ok_or_else(|| anyhow!("invalid Ralph run directory; missing project directory"))
+}
+
+fn current_unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn planning_plan_file(summary: &ralph_core::WorkflowRunSummary) -> Result<Option<String>> {
@@ -790,6 +937,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn append_event_writes_to_the_explicit_wal_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().join("project")).unwrap();
+        let run_dir = project_dir.join(".ralph/runs/fixture-flow/run-1");
+        let wal_path = ralph_core::agent_events_wal_path(&run_dir);
+        fs::create_dir_all(run_dir.join(RUNTIME_DIR_NAME).as_std_path()).unwrap();
+
+        let context = EmitEventContext {
+            wal_path: wal_path.clone(),
+            run_dir: run_dir.clone(),
+            run_id: "run-1".to_owned(),
+            channel_id: MAIN_CHANNEL_ID.to_owned(),
+            project_dir: project_dir.clone(),
+            prompt_path: Utf8PathBuf::from("/tmp/workflow.yml"),
+            prompt_name: "fixture-flow".to_owned(),
+        };
+
+        append_event(&context, "handoff", "ready").unwrap();
+
+        let wal = ralph_core::read_agent_events_since_path(&wal_path, 0).unwrap();
+        assert_eq!(wal.records.len(), 1);
+        assert_eq!(wal.records[0].event, "handoff");
+        assert_eq!(wal.records[0].body, "ready");
+        assert_eq!(wal.records[0].run_id, "run-1");
+        assert_eq!(wal.records[0].channel_id, MAIN_CHANNEL_ID);
+        assert_eq!(wal.records[0].project_dir, project_dir);
+        assert_eq!(wal.records[0].run_dir, run_dir);
+    }
+
+    #[test]
+    fn append_event_rejects_loop_control_from_parallel_channels() {
+        let context = EmitEventContext {
+            wal_path: Utf8PathBuf::from("/tmp/agent-events.wal.ndjson"),
+            run_dir: Utf8PathBuf::from("/tmp/project/.ralph/runs/fixture-flow/run-1"),
+            run_id: "run-1".to_owned(),
+            channel_id: "QT".to_owned(),
+            project_dir: Utf8PathBuf::from("/tmp/project"),
+            prompt_path: Utf8PathBuf::from("/tmp/workflow.yml"),
+            prompt_name: "fixture-flow".to_owned(),
+        };
+
+        let error = append_event(&context, "loop-stop:ok", "done")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("parallel worker 'QT' cannot emit loop-control event"));
     }
 
     #[test]

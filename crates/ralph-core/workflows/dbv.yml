@@ -38,9 +38,10 @@ prompts:
       - Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST appear explicitly in `{ralph-option:plan-file}`.
       - If any material part of the request is missing from the plan or only implicitly covered, treat the plan as not aligned and route to `decompose`.
 
-      <<< USER REQUEST
+      User request:
+      ```
       {ralph-request}
-      END USER REQUEST >>> 
+      ```
   build:
     title: Builder
     fallback-route: dispatch
@@ -64,9 +65,10 @@ prompts:
       - YAGNI ruthlessly. No speculative features.
       - Prefer existing shared code and well-integrated solutions over duplication.
 
-      <<< USER REQUEST
+      User request:
+      ```
       {ralph-request}
-      END USER REQUEST >>> 
+      ```
 
   decompose:
     title: Decomposer
@@ -91,9 +93,10 @@ prompts:
       - Every material part of the user request, including appended notes, priorities, constraints, and acceptance details, MUST become explicit in `{ralph-option:plan-file}`.
       - If any material part of the request is not represented explicitly in the plan, the plan is incomplete and you must correct it before stopping.
 
-      <<< USER REQUEST
+      User request:
+      ```
       {ralph-request}
-      END USER REQUEST >>> 
+      ```
 
   verify:
     title: Verifier
@@ -116,6 +119,7 @@ prompts:
       - You MUST emit exactly one loop-stop event in this step.
       - Prefer whole-project validation over narrow item-local checks.
 
-      <<< USER REQUEST
+      User request:
+      ```
       {ralph-request}
-      END USER REQUEST >>> 
+      ```

@@ -345,10 +345,10 @@ Files Ralph commonly reads or updates as part of the workflow itself:
 
 ## Advanced: Agent Events
 
-Ralph can read events directly from the text output emitted by an agent run.
+Ralph records agent events through explicit CLI commands during an agent run.
 
-- Emit an event with no body by printing `<<<SIGNAL:event-name>>>`
-- Emit an event with a body by printing `<<<PAYLOAD:event-name>>>body<<<END-PAYLOAD>>>`
+- Emit an event with no body by running `"$RALPH_BIN" signal <event-name>`
+- Emit an event with a body by running `"$RALPH_BIN" payload <event-name> "<body>"`
 - Read the latest stored payload for an event across all channels in the current run with `"$RALPH_BIN" get <event-name>`
 - Read the latest stored payload for an event from one specific channel with `"$RALPH_BIN" get --channel <channel-id> <event-name>`
 
@@ -363,8 +363,7 @@ Planning workflows also use a host-intercepted event contract:
 
 Agent-emitted planning payloads:
 - `planning-question`: asks exactly one clarifying question; Ralph intercepts it, asks the user directly, and then appends host-side planning state into the WAL before rerouting
-- `planning-target-path`: the current proposed project-relative output path for the draft plan
-- `planning-draft`: the current proposed markdown plan; Ralph intercepts it for `accept` / `revise` / `reject`
+- `planning-target-path`: the current proposed project-relative output path for the draft plan file; Ralph reads that file and intercepts it for `accept` / `revise` / `reject`
 
 Host-emitted planning payloads on channel `host`:
 - `planning-answer`: the user's answer to the latest `planning-question`
@@ -374,11 +373,12 @@ Host-emitted planning payloads on channel `host`:
 
 Important planning rules:
 
-- `planning-question` and `planning-draft` are special host-intercepted payloads, not ordinary loop-control signals
-- do not emit `planning-question` and `planning-draft` in the same iteration
+- `planning-question` and `planning-target-path` are special host-intercepted payloads, not ordinary loop-control signals
+- do not emit `planning-question` and `planning-target-path` in the same iteration
 - do not emit planning payloads together with `loop-route` or `loop-stop:*` in the same iteration
-- the latest `planning-draft` and `planning-target-path` in the WAL are the current working draft state
-- on `accept`, Ralph writes the exact latest `planning-draft` to `planning-target-path` and ends the workflow successfully
+- the latest `planning-target-path` plus the file at that path are the current working draft state
+- when you emit `planning-target-path`, write the markdown draft to that file first
+- on `accept`, Ralph keeps the exact draft file you emitted and ends the workflow successfully
 
 See the built-in workflow definitions with `ralph show <workflow-id>` if you want to study how loop control works in practice.
 

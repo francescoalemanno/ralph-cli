@@ -56,9 +56,10 @@ prompts:
       ...
       -----
 
-      <<< USER REQUEST
+      User request:
+      ```
       {ralph-request}
-      END USER REQUEST >>> 
+      ```
 
   builder:
     title: Builder
@@ -94,9 +95,10 @@ prompts:
       Since the whole plan is complete, add a single line to `{ralph-option:plan-file}` with "<< PLAN COMPLETE >>".
       Then {ralph-route:verify}.
 
-      <<< USER REQUEST
+      User request:
+      ```
       {ralph-request}
-      END USER REQUEST >>> 
+      ```
 
 
   verify:
@@ -120,6 +122,7 @@ prompts:
       - You MUST emit exactly one loop-stop event in this step.
       - Prefer whole-project validation over narrow item-local checks.
 
-      <<< USER REQUEST
+      User request:
+      ```
       {ralph-request}
-      END USER REQUEST >>> 
+      ```

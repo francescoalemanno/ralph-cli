@@ -17,8 +17,8 @@ prompts:
       : > "$log_file"
       echo "init workflow state in $RALPH_RUN_DIR"
       printf '%s\n' "init" >> "$log_file"
-      printf '<<<PAYLOAD:test-phase>>>init<<<END-PAYLOAD>>>\n'
-      printf '<<<PAYLOAD:loop-route>>>alpha<<<END-PAYLOAD>>>\n'
+      "$RALPH_BIN" payload test-phase "init"
+      "$RALPH_BIN" payload loop-route "alpha"
   alpha:
     title: Alpha
     fallback-route: no-route-error
@@ -30,8 +30,8 @@ prompts:
       echo "alpha round $round"
       printf '%s\n' "alpha:$round" >> "$log_file"
       printf '%s\n' "alpha artifact round $round" > "$state_dir/alpha-$round.txt"
-      printf '<<<PAYLOAD:test-phase>>>alpha:%s<<<END-PAYLOAD>>>\n' "$round"
-      printf '<<<PAYLOAD:loop-route>>>beta<<<END-PAYLOAD>>>\n'
+      "$RALPH_BIN" payload test-phase "alpha:$round"
+      "$RALPH_BIN" payload loop-route "beta"
   beta:
     title: Beta
     fallback-route: no-route-error
@@ -45,8 +45,8 @@ prompts:
       echo "beta round $round"
       printf '%s\n' "beta:$round" >> "$log_file"
       printf '%s\n' "beta artifact round $round" > "$state_dir/beta-$round.txt"
-      printf '<<<PAYLOAD:test-phase>>>beta:%s<<<END-PAYLOAD>>>\n' "$round"
-      printf '<<<PAYLOAD:loop-route>>>gamma<<<END-PAYLOAD>>>\n'
+      "$RALPH_BIN" payload test-phase "beta:$round"
+      "$RALPH_BIN" payload loop-route "gamma"
   gamma:
     title: Gamma
     fallback-route: no-route-error
@@ -60,13 +60,13 @@ prompts:
       echo "gamma round $round"
       printf '%s\n' "gamma:$round" >> "$log_file"
       printf '%s\n' "gamma artifact round $round" > "$state_dir/gamma-$round.txt"
-      printf '<<<PAYLOAD:test-phase>>>gamma:%s<<<END-PAYLOAD>>>\n' "$round"
+      "$RALPH_BIN" payload test-phase "gamma:$round"
       if [ "$round" -ge 4 ]; then
-        printf '<<<PAYLOAD:loop-route>>>finalize<<<END-PAYLOAD>>>\n'
+        "$RALPH_BIN" payload loop-route "finalize"
       else
         next_round=$((round + 1))
         printf '%s\n' "$next_round" > "$state_dir/round.txt"
-        printf '<<<PAYLOAD:loop-route>>>alpha<<<END-PAYLOAD>>>\n'
+        "$RALPH_BIN" payload loop-route "alpha"
       fi
   finalize:
     title: Finalize
@@ -85,5 +85,5 @@ prompts:
         printf 'rounds=%s\n' "$round"
         printf 'entries=%s\n' "$entries"
       } > "$RALPH_RUN_DIR/summary.txt"
-      printf '<<<PAYLOAD:test-phase>>>finalize:%s<<<END-PAYLOAD>>>\n' "$round"
-      printf '<<<PAYLOAD:loop-stop:ok>>>completed %s coordinated rounds<<<END-PAYLOAD>>>\n' "$round"
+      "$RALPH_BIN" payload test-phase "finalize:$round"
+      "$RALPH_BIN" payload loop-stop:ok "completed $round coordinated rounds"

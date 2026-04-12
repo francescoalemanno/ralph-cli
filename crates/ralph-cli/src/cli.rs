@@ -35,6 +35,10 @@ const RUN_MAX_ITERATIONS_HELP: &str = "Override the configured workflow iteratio
 const RUN_SESSION_TIMEOUT_HELP: &str = "Kill the agent after a fixed duration like 30m, 5m, or 45s";
 const RUN_IDLE_TIMEOUT_HELP: &str =
     "Kill the agent after this much time with no output like 5m, 30s, or 1h";
+const SIGNAL_EVENT_HELP: &str = "Event name to append to the current Ralph run WAL";
+const PAYLOAD_EVENT_HELP: &str =
+    "Event name whose payload should be appended to the current Ralph run WAL";
+const PAYLOAD_BODY_HELP: &str = "Payload body to append to the current Ralph run WAL";
 const GET_EVENT_HELP: &str = "Event name whose latest payload should be printed";
 const GET_CHANNEL_HELP: &str = "Optional channel ID to filter the event lookup";
 const CONFIG_SCOPE_WRITE_HELP: &str = "Config scope to update";
@@ -62,6 +66,18 @@ Print the most recent payload stored for an event in the current Ralph run WAL.
 Without `--channel`, the lookup scans all channels in the current run.
 
 This command only works inside a Ralph agent run.";
+const SIGNAL_LONG_ABOUT: &str = "\
+Append a signal event with no body into the current Ralph run WAL.
+
+The event is written to the current Ralph channel from `RALPH_CHANNEL_ID`.
+
+This command only works inside a Ralph agent run.";
+const PAYLOAD_LONG_ABOUT: &str = "\
+Append a payload event with a body into the current Ralph run WAL.
+
+The event is written to the current Ralph channel from `RALPH_CHANNEL_ID`.
+
+This command only works inside a Ralph agent run.";
 
 const PROJECT_DIR_ARG: &str = "project_dir";
 const CLI_ARG: &str = "cli";
@@ -72,6 +88,7 @@ const IDLE_TIMEOUT_ARG: &str = "idle_timeout";
 const REQUEST_FILE_ARG: &str = "request_file";
 const REQUEST_ARG: &str = "request";
 const EVENT_ARG: &str = "event";
+const BODY_ARG: &str = "body";
 const CHANNEL_ARG: &str = "channel";
 const WORKFLOW_ID_ARG: &str = "workflow_id";
 const SCOPE_ARG: &str = "scope";
@@ -185,6 +202,8 @@ impl Cli {
                 ));
             }
             Some(("run", submatches)) => Commands::Run(parse_run_args(submatches)?),
+            Some(("signal", submatches)) => Commands::Signal(parse_signal_args(submatches)?),
+            Some(("payload", submatches)) => Commands::Payload(parse_payload_args(submatches)?),
             Some(("get", submatches)) => Commands::Get(parse_get_args(submatches)?),
             Some(("ls", _)) => Commands::Ls,
             Some(("show", submatches)) => Commands::Show(parse_show_args(submatches)?),
@@ -248,6 +267,8 @@ pub(crate) enum Commands {
     ReviewOnly(OptionalPlanShortcutArgs),
     FinalizeOnly(OptionalPlanShortcutArgs),
     Run(RunArgs),
+    Signal(SignalArgs),
+    Payload(PayloadArgs),
     Get(GetArgs),
     Ls,
     Show(ShowArgs),
@@ -307,6 +328,17 @@ impl RequestArgs {
 pub(crate) struct GetArgs {
     pub(crate) event: String,
     pub(crate) channel: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SignalArgs {
+    pub(crate) event: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PayloadArgs {
+    pub(crate) event: String,
+    pub(crate) body: String,
 }
 
 #[derive(Debug, Clone)]
@@ -424,6 +456,37 @@ fn build_cli_command() -> Result<Command> {
                 .help(GUIDED_FINALIZE_HELP),
         )
         .subcommand(build_run_command()?)
+        .subcommand(
+            Command::new("signal")
+                .about("Append a signal event to the current Ralph run WAL")
+                .long_about(SIGNAL_LONG_ABOUT)
+                .arg_required_else_help(true)
+                .arg(
+                    Arg::new(EVENT_ARG)
+                        .value_name("EVENT")
+                        .required(true)
+                        .help(SIGNAL_EVENT_HELP),
+                ),
+        )
+        .subcommand(
+            Command::new("payload")
+                .about("Append a payload event to the current Ralph run WAL")
+                .long_about(PAYLOAD_LONG_ABOUT)
+                .arg_required_else_help(true)
+                .arg(
+                    Arg::new(EVENT_ARG)
+                        .value_name("EVENT")
+                        .required(true)
+                        .help(PAYLOAD_EVENT_HELP),
+                )
+                .arg(
+                    Arg::new(BODY_ARG)
+                        .value_name("BODY")
+                        .required(true)
+                        .allow_hyphen_values(true)
+                        .help(PAYLOAD_BODY_HELP),
+                ),
+        )
         .subcommand(
             Command::new("get")
                 .about("Print the latest payload for an event in the current Ralph run WAL")
@@ -708,6 +771,19 @@ fn parse_get_args(matches: &ArgMatches) -> Result<GetArgs> {
     Ok(GetArgs {
         event: required_string_result(matches, EVENT_ARG)?,
         channel: matches.get_one::<String>(CHANNEL_ARG).cloned(),
+    })
+}
+
+fn parse_signal_args(matches: &ArgMatches) -> Result<SignalArgs> {
+    Ok(SignalArgs {
+        event: required_string_result(matches, EVENT_ARG)?,
+    })
+}
+
+fn parse_payload_args(matches: &ArgMatches) -> Result<PayloadArgs> {
+    Ok(PayloadArgs {
+        event: required_string_result(matches, EVENT_ARG)?,
+        body: required_string_result(matches, BODY_ARG)?,
     })
 }
 
@@ -1112,6 +1188,56 @@ mod tests {
             };
             assert_eq!(args.event, "handoff");
             assert_eq!(args.channel, None);
+        });
+    }
+
+    #[test]
+    fn signal_subcommand_parses_event_name() {
+        with_test_workflow_home(|| {
+            let cli = Cli::try_parse_from(["ralph", "signal", "loop-continue"]).unwrap();
+
+            let Commands::Signal(args) = cli.command else {
+                panic!("expected signal subcommand");
+            };
+            assert_eq!(args.event, "loop-continue");
+        });
+    }
+
+    #[test]
+    fn payload_subcommand_parses_event_and_body() {
+        with_test_workflow_home(|| {
+            let cli = Cli::try_parse_from(["ralph", "payload", "review", "needs-fix"]).unwrap();
+
+            let Commands::Payload(args) = cli.command else {
+                panic!("expected payload subcommand");
+            };
+            assert_eq!(args.event, "review");
+            assert_eq!(args.body, "needs-fix");
+        });
+    }
+
+    #[test]
+    fn signal_subcommand_rejects_channel_flag() {
+        with_test_workflow_home(|| {
+            let error =
+                Cli::try_parse_from(["ralph", "signal", "--channel", "QT", "handoff"]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        });
+    }
+
+    #[test]
+    fn payload_subcommand_rejects_channel_flag() {
+        with_test_workflow_home(|| {
+            let error = Cli::try_parse_from([
+                "ralph",
+                "payload",
+                "review-findings",
+                "--channel",
+                "QT",
+                "ready",
+            ])
+            .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
         });
     }
 

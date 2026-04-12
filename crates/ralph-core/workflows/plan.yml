@@ -2,7 +2,7 @@
 version: 1
 workflow_id: plan
 title: Plan
-description: "Create an implementation plan through a host-mediated planning loop: explore, ask one clarifying question at a time, draft the plan, and let Ralph collect review feedback before writing the accepted markdown file."
+description: "Create an implementation plan through a host-mediated planning loop: explore, ask one clarifying question at a time, write a draft plan file, and let Ralph collect review feedback before final acceptance."
 entrypoint: plan
 options:
   plans-dir:
@@ -26,16 +26,16 @@ prompts:
 
       The accepted plan file must be written under `{ralph-option:plans-dir}`.
 
-      Ralph stores planning state in the current run WAL, not in scratch files.
+      Ralph stores planning progress in the current run WAL and keeps the current draft in the plan file you emit with `planning-target-path`.
 
-      Before you do ANY exploration, ask ANY question, or emit ANY payload, execute these exact commands in order to read the planning state from the WAL. If a payload does not exist yet, treat the output as empty:
+      Before you do ANY exploration, ask ANY question, or emit ANY payload, execute these exact commands in order to read the planning state. If a payload does not exist yet, treat the output as empty:
       1. `"$RALPH_BIN" get --channel host planning-progress 2>/dev/null || true`
       2. `"$RALPH_BIN" get planning-target-path 2>/dev/null || true`
-      3. `"$RALPH_BIN" get planning-draft 2>/dev/null || true`
+      3. If step 2 returns a non-empty path and that file exists, read that file in full immediately.
 
       CRITICAL:
-      - those three reads are the canonical planning-state inputs for this iteration
-      - if any of those commands return content, you MUST use that content before deciding what to do next
+      - those reads are the canonical planning-state inputs for this iteration
+      - if planning progress or a current draft file already exists, you MUST use that state before deciding what to do next
 
       ## Step 0: Check for Existing Plan
 
@@ -46,7 +46,7 @@ prompts:
 
       ## Step 1: Read Planning Progress
 
-      Use the planning progress and latest draft state to understand:
+      Use the planning progress and current draft file to understand:
       - what questions you already asked
       - what answers the user already provided
       - what draft review feedback the user already gave
@@ -54,10 +54,10 @@ prompts:
 
       Do not repeat answered questions.
 
-      If a latest `planning-draft` already exists in the WAL, treat it as the current working draft.
+      If a latest `planning-target-path` already exists and that file exists, treat that file as the current working draft.
       That rule applies after ANY user interaction, including after a clarifying question has been answered.
       Do not discard an existing draft and start over unless the feedback or new answer genuinely requires a full rewrite.
-      If the planning progress or WAL draft state is non-empty, you MUST account for it before emitting a new `planning-question` or `planning-draft`.
+      If the planning progress or current draft file is non-empty, you MUST account for it before emitting a new `planning-question` or `planning-target-path`.
 
       ## Step 2: Explore the Codebase
 
@@ -68,15 +68,14 @@ prompts:
 
       ## Step 3: Ask Clarifying Questions Only When Needed
 
-      If you genuinely need user input to create a good plan, emit exactly one payload named `planning-question` in this exact shape:
+      If you genuinely need user input to create a good plan, emit exactly one payload named `planning-question` with this exact body shape:
 
-      `<<<PAYLOAD:planning-question>>>Question: Your question here?
+      Question: Your question here?
       Options:
       - Option 1
       - Option 2
       - Option 3
       Context: Why this question matters
-      <<<END-PAYLOAD>>>`
 
       Rules for questions:
       - ask ONE question at a time
@@ -88,44 +87,34 @@ prompts:
 
       After emitting `planning-question`, stop immediately. Do not continue. Do not emit loop-control events in the same response.
 
-      ## Step 3.5: Present a Draft Before Writing Anything
+      ## Step 3.5: Write The Draft File Before Emitting The Path
 
       When you have enough information to create a good plan:
-      - if a latest `planning-draft` already exists, update that draft instead of recreating it from scratch
+      - if a latest `planning-target-path` already exists, update that draft file instead of recreating it from scratch
       1. choose the final project-relative target path under `{ralph-option:plans-dir}` in the form `YYYY-MM-DD-slug.md`
-      2. emit that exact relative path as payload `planning-target-path`
-      3. emit the full markdown plan as payload `planning-draft`
+      2. write the full markdown plan draft to that exact file
+      3. emit that exact relative path as payload `planning-target-path`
       4. stop immediately
 
-      Emit them like this:
-
-      `<<<PAYLOAD:planning-target-path>>>{ralph-option:plans-dir}/YYYY-MM-DD-slug.md<<<END-PAYLOAD>>>`
-
-      `<<<PAYLOAD:planning-draft>>># Title
-
-      ## Overview
-      ...
-      <<<END-PAYLOAD>>>`
-
       CRITICAL:
-      - emit BOTH payloads in the same iteration when presenting a draft
-      - do not write the file yourself
-      - do not emit loop-control events in the same response as the draft
-      - Ralph will show the draft to the user, collect `accept` / `revise` / `reject`, and only Ralph will write the accepted draft to disk
+      - always write the draft file before emitting `planning-target-path`
+      - always emit `planning-target-path` when you want Ralph to review a draft, even if the filename did not change
+      - do not emit loop-control events in the same response as `planning-target-path`
+      - Ralph will read the draft from the file you wrote, show it to the user, and collect `accept` / `revise` / `reject`
 
       ## Draft Review Handling
 
       If the planning progress shows `Decision: revise`:
-      - first examine the latest review feedback and latest draft you just read from the WAL
+      - first examine the latest review feedback and the latest draft file you just read
       - if the feedback asks for missing user choices you cannot infer safely (for example library, stack, architecture, or scope preferences), emit exactly one `planning-question` instead of a new draft
-      - revise the latest `planning-draft` you just read from the WAL; do not invent a fresh unrelated draft
+      - revise the latest draft file you just read; do not invent a fresh unrelated draft
       - reuse the latest `planning-target-path` unless the feedback requires a different filename
-      - apply the review feedback directly and preserve unchanged sections of the draft
-      - emit a new `planning-target-path` only if the filename should change
-      - emit a new `planning-draft`
+      - apply the review feedback directly and preserve unchanged sections of the draft where possible
+      - if the filename changes, write the revised draft to the new file under `{ralph-option:plans-dir}`
+      - emit `planning-target-path` after the revised file is written
       - stop immediately
 
-      If the planning progress shows `Decision: revise`, do not emit a fresh draft that ignores the existing review feedback or the latest WAL draft state.
+      If the planning progress shows `Decision: revise`, do not emit a fresh draft that ignores the existing review feedback or the latest draft file state.
 
       If the planning progress shows `Decision: accept` or `Decision: reject`, do not continue planning. Ralph will end the workflow externally.
 
@@ -177,7 +166,7 @@ prompts:
 
       ## Validation Before Drafting
 
-      Before emitting `planning-draft`, verify:
+      Before emitting `planning-target-path`, verify:
 
       **Scope & Feasibility:**
       - tasks are right-sized and executable (aim for 3-7 items; adjust if needed for coherence)
@@ -200,11 +189,10 @@ prompts:
 
       - the path in `planning-target-path` stays under `{ralph-option:plans-dir}`
 
-      If validation fails, fix the plan before emitting the draft.
+      If validation fails, fix the plan file before emitting `planning-target-path`.
 
       CRITICAL RULES:
       - do not ask “should I proceed?”
-      - do not write the plan file yourself
       - do not use natural-language questions outside the structured `planning-question` payload
-      - when you emit `planning-question` or `planning-draft`, stop immediately
-      - plain text response formatting is fine; the plan inside `planning-draft` must be markdown
+      - when you emit `planning-question` or `planning-target-path`, stop immediately
+      - plain text response formatting is fine; the plan file content must be markdown

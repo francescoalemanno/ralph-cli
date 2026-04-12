@@ -12,11 +12,6 @@ use crate::workflow::load_workflow_from_path;
 pub const RUNTIME_DIR_NAME: &str = ".ralph-runtime";
 pub const AGENT_EVENTS_WAL_FILE_NAME: &str = "agent-events.wal.ndjson";
 pub const MAIN_CHANNEL_ID: &str = "main";
-const MARKER_START: &str = "<<<";
-const SIGNAL_START: &str = "<<<SIGNAL:";
-const PAYLOAD_START: &str = "<<<PAYLOAD:";
-const MARKER_END: &str = ">>>";
-const PAYLOAD_END: &str = "<<<END-PAYLOAD>>>";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEventRecord {
@@ -44,17 +39,6 @@ pub struct AgentEventLogRead {
 pub struct ParsedAgentEvent {
     pub event: String,
     pub body: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ParsedAgentOutput {
-    pub visible_text: String,
-    pub events: Vec<ParsedAgentEvent>,
-}
-
-#[derive(Debug, Default)]
-pub struct AgentOutputProcessor {
-    buffer: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +69,13 @@ pub fn current_agent_events_offset(run_dir: &Utf8Path) -> Result<u64> {
 }
 
 pub fn append_agent_event(run_dir: &Utf8Path, record: &AgentEventRecord) -> Result<()> {
-    let wal_path = agent_events_wal_path(run_dir);
+    append_agent_event_to_wal_path(&agent_events_wal_path(run_dir), record)
+}
+
+pub fn append_agent_event_to_wal_path(
+    wal_path: &Utf8Path,
+    record: &AgentEventRecord,
+) -> Result<()> {
     if let Some(parent) = wal_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent))?;
     }
@@ -93,7 +83,7 @@ pub fn append_agent_event(run_dir: &Utf8Path, record: &AgentEventRecord) -> Resu
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&wal_path)
+        .open(wal_path)
         .with_context(|| format!("failed to open {}", wal_path))?;
     serde_json::to_writer(&mut file, record)
         .with_context(|| format!("failed to serialize event for {}", wal_path))?;
@@ -221,127 +211,6 @@ pub fn validate_agent_event(event: &str, body: &str, prompt_path: Option<&Utf8Pa
     }
 }
 
-impl AgentOutputProcessor {
-    pub fn push_str(&mut self, chunk: &str) -> ParsedAgentOutput {
-        self.buffer.push_str(chunk);
-        self.drain(false)
-    }
-
-    pub fn finish(&mut self) -> ParsedAgentOutput {
-        self.drain(true)
-    }
-
-    fn drain(&mut self, eof: bool) -> ParsedAgentOutput {
-        let buffer = std::mem::take(&mut self.buffer);
-        let mut visible_text = String::new();
-        let mut events = Vec::new();
-        let mut cursor = 0;
-
-        while cursor < buffer.len() {
-            let remaining = &buffer[cursor..];
-            let Some(start) = remaining.find(MARKER_START) else {
-                let flush_len = if eof {
-                    remaining.len()
-                } else {
-                    remaining
-                        .len()
-                        .saturating_sub(partial_marker_prefix_len(remaining))
-                };
-                visible_text.push_str(&remaining[..flush_len]);
-                cursor += flush_len;
-                break;
-            };
-
-            visible_text.push_str(&remaining[..start]);
-            cursor += start;
-
-            let remaining = &buffer[cursor..];
-            if let Some(signal_body) = remaining.strip_prefix(SIGNAL_START) {
-                if let Some(end) = signal_body.find(MARKER_END) {
-                    let name = &signal_body[..end];
-                    events.push(ParsedAgentEvent {
-                        event: name.trim().to_owned(),
-                        body: String::new(),
-                    });
-                    cursor += SIGNAL_START.len() + end + MARKER_END.len();
-                    continue;
-                }
-
-                if eof {
-                    let partial_name = signal_body.trim();
-                    if !partial_name.is_empty() {
-                        events.push(ParsedAgentEvent {
-                            event: "truncated-signal".to_owned(),
-                            body: format!(
-                                "incomplete signal marker at end of stream: {}",
-                                partial_name
-                            ),
-                        });
-                    }
-                    visible_text.push_str(remaining);
-                    cursor = buffer.len();
-                }
-                break;
-            }
-
-            if let Some(payload_body) = remaining.strip_prefix(PAYLOAD_START) {
-                if let Some(header_end) = payload_body.find(MARKER_END) {
-                    let name = &payload_body[..header_end];
-                    let body_start = PAYLOAD_START.len() + header_end + MARKER_END.len();
-                    if let Some(body_end) = remaining[body_start..].find(PAYLOAD_END) {
-                        let body = &remaining[body_start..body_start + body_end];
-                        events.push(ParsedAgentEvent {
-                            event: name.trim().to_owned(),
-                            body: body.to_owned(),
-                        });
-                        cursor += body_start + body_end + PAYLOAD_END.len();
-                        continue;
-                    }
-
-                    if eof {
-                        let partial_body = &remaining[body_start..];
-                        events.push(ParsedAgentEvent {
-                            event: name.trim().to_owned(),
-                            body: partial_body.to_owned(),
-                        });
-                        events.push(ParsedAgentEvent {
-                            event: "truncated-payload".to_owned(),
-                            body: format!(
-                                "payload '{}' was truncated at end of stream ({} bytes captured)",
-                                name.trim(),
-                                partial_body.len()
-                            ),
-                        });
-                        cursor = buffer.len();
-                        break;
-                    }
-                }
-
-                if eof {
-                    visible_text.push_str(remaining);
-                    cursor = buffer.len();
-                }
-                break;
-            }
-
-            if !eof && (SIGNAL_START.starts_with(remaining) || PAYLOAD_START.starts_with(remaining))
-            {
-                break;
-            }
-
-            visible_text.push('<');
-            cursor += 1;
-        }
-
-        self.buffer.push_str(&buffer[cursor..]);
-
-        ParsedAgentOutput {
-            visible_text,
-            events,
-        }
-    }
-}
-
 fn validate_loop_route_body(body: &str, prompt_path: Option<&Utf8Path>) -> Result<()> {
     let trimmed = body.trim();
     let routes = available_routes(prompt_path)?;
@@ -385,26 +254,16 @@ fn unsupported_loop_event_message(event: &str) -> String {
     )
 }
 
-fn partial_marker_prefix_len(text: &str) -> usize {
-    if text.ends_with("<<") {
-        2
-    } else if text.ends_with('<') {
-        1
-    } else {
-        0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use camino::Utf8PathBuf;
 
     use super::{
-        AGENT_EVENTS_WAL_FILE_NAME, AgentEventRecord, AgentOutputProcessor, LoopControlDecision,
-        MAIN_CHANNEL_ID, RUNTIME_DIR_NAME, agent_events_wal_path, append_agent_event,
-        current_agent_events_offset, latest_agent_event_body_from_wal,
-        latest_agent_event_body_from_wal_in_channel, read_agent_events_since, reduce_loop_control,
-        validate_agent_event,
+        AGENT_EVENTS_WAL_FILE_NAME, AgentEventRecord, LoopControlDecision, MAIN_CHANNEL_ID,
+        RUNTIME_DIR_NAME, agent_events_wal_path, append_agent_event,
+        append_agent_event_to_wal_path, current_agent_events_offset,
+        latest_agent_event_body_from_wal, latest_agent_event_body_from_wal_in_channel,
+        read_agent_events_since, reduce_loop_control, validate_agent_event,
     };
 
     fn sample_record(event: &str, body: &str, run_id: &str) -> AgentEventRecord {
@@ -451,6 +310,18 @@ mod tests {
     }
 
     #[test]
+    fn append_to_explicit_wal_path_round_trips() {
+        let temp = tempfile::tempdir().unwrap();
+        let wal_path = Utf8PathBuf::from_path_buf(temp.path().join("events.wal.ndjson")).unwrap();
+        let record = sample_record("note", "hello", "run-1");
+
+        append_agent_event_to_wal_path(&wal_path, &record).unwrap();
+
+        let read = super::read_agent_events_since_path(&wal_path, 0).unwrap();
+        assert_eq!(read.records, vec![record]);
+    }
+
+    #[test]
     fn last_loop_event_wins() {
         let records = vec![
             sample_record("note", "observed", "run-1"),
@@ -472,69 +343,6 @@ mod tests {
             reduce_loop_control(&records, "task"),
             Some(LoopControlDecision::Continue)
         );
-    }
-
-    #[test]
-    fn processor_extracts_signal_and_payload_markers() {
-        let mut processor = AgentOutputProcessor::default();
-        let parsed = processor.push_str(
-            "alpha\n<<<SIGNAL:loop-continue>>>\n<<<PAYLOAD:test-phase>>>beta<<<END-PAYLOAD>>>\nomega\n",
-        );
-
-        assert_eq!(parsed.visible_text, "alpha\n\n\nomega\n");
-        assert_eq!(parsed.events.len(), 2);
-        assert_eq!(parsed.events[0].event, "loop-continue");
-        assert_eq!(parsed.events[0].body, "");
-        assert_eq!(parsed.events[1].event, "test-phase");
-        assert_eq!(parsed.events[1].body, "beta");
-    }
-
-    #[test]
-    fn processor_handles_partial_markers_across_chunks() {
-        let mut processor = AgentOutputProcessor::default();
-
-        let first = processor.push_str("before<<<PAYL");
-        assert_eq!(first.visible_text, "before");
-        assert!(first.events.is_empty());
-
-        let second = processor.push_str("OAD:test>>>body");
-        assert_eq!(second.visible_text, "");
-        assert!(second.events.is_empty());
-
-        let third = processor.push_str("<<<END-PAYLOAD>>>after");
-        assert_eq!(third.visible_text, "after");
-        assert_eq!(third.events.len(), 1);
-        assert_eq!(third.events[0].event, "test");
-        assert_eq!(third.events[0].body, "body");
-    }
-
-    #[test]
-    fn processor_flushes_incomplete_signal_with_truncation_warning_on_finish() {
-        let mut processor = AgentOutputProcessor::default();
-        let parsed = processor.push_str("hello<<<SIGNAL:loop-stop:ok");
-        assert_eq!(parsed.visible_text, "hello");
-
-        let finished = processor.finish();
-        assert_eq!(finished.visible_text, "<<<SIGNAL:loop-stop:ok");
-        assert_eq!(finished.events.len(), 1);
-        assert_eq!(finished.events[0].event, "truncated-signal");
-        assert!(finished.events[0].body.contains("loop-stop:ok"));
-    }
-
-    #[test]
-    fn processor_emits_partial_payload_with_truncation_warning_on_finish() {
-        let mut processor = AgentOutputProcessor::default();
-        let parsed = processor.push_str("before<<<PAYLOAD:test-phase>>>partial body content here");
-        assert_eq!(parsed.visible_text, "before");
-        assert!(parsed.events.is_empty());
-
-        let finished = processor.finish();
-        assert_eq!(finished.events.len(), 2);
-        assert_eq!(finished.events[0].event, "test-phase");
-        assert_eq!(finished.events[0].body, "partial body content here");
-        assert_eq!(finished.events[1].event, "truncated-payload");
-        assert!(finished.events[1].body.contains("test-phase"));
-        assert!(finished.events[1].body.contains("truncated"));
     }
 
     #[test]

@@ -1011,8 +1011,9 @@ mod tests {
     use super::{
         NO_ROUTE_ERROR, WorkflowDefinition, WorkflowFileRequest, WorkflowOptionDefinition,
         WorkflowPromptDefinition, WorkflowRequestDefinition, WorkflowRuntimeRequest,
-        is_protected_builtin_workflow, list_all_workflows, list_workflows, load_workflow,
-        load_workflow_from_path, seed_builtin_workflows_if_missing, workflow_config_dir,
+        builtin_workflows, is_protected_builtin_workflow, list_all_workflows, list_workflows,
+        load_workflow, load_workflow_from_path, seed_builtin_workflows_if_missing,
+        workflow_config_dir,
     };
     use crate::config::configure_test_global_config_home;
 
@@ -1426,14 +1427,15 @@ prompts:
 
         let planner = workflow.prompt("plan").expect("plan prompt");
         let prompt = planner.prompt.as_deref().expect("plan prompt text");
+        assert!(
+            prompt.contains("execute these exact commands in order to read the planning state")
+        );
+        assert!(
+            prompt
+                .contains("those reads are the canonical planning-state inputs for this iteration")
+        );
         assert!(prompt.contains(
-            "execute these exact commands in order to read the planning state from the WAL"
-        ));
-        assert!(prompt.contains(
-            "those three reads are the canonical planning-state inputs for this iteration"
-        ));
-        assert!(prompt.contains(
-            "if any of those commands return content, you MUST use that content before deciding what to do next"
+            "if planning progress or a current draft file already exists, you MUST use that state before deciding what to do next"
         ));
     }
 
@@ -1452,7 +1454,7 @@ prompts:
         );
         assert!(prompt.contains("emit exactly one `planning-question` instead of a new draft"));
         assert!(prompt.contains(
-            "do not emit a fresh draft that ignores the existing review feedback or the latest WAL draft state"
+            "do not emit a fresh draft that ignores the existing review feedback or the latest draft file state"
         ));
     }
 
@@ -1465,6 +1467,32 @@ prompts:
 
         let task = workflow.prompt("task").expect("task prompt");
         assert!(task.transition_guards.contains_key("stop-ok"));
+    }
+
+    #[test]
+    fn builtin_workflows_do_not_use_stale_prompt_contract_fragments() {
+        const BANNED_SNIPPETS: &[&str] = &[
+            "<<<",
+            ">>>",
+            "planning-draft",
+            "PLAN DRAFT",
+            "QUESTIOON",
+            "QUESTION markers",
+            "payload --channel",
+            "signal --channel",
+            "always add `--channel",
+        ];
+
+        for workflow in builtin_workflows() {
+            for banned in BANNED_SNIPPETS {
+                assert!(
+                    !workflow.contents.contains(banned),
+                    "workflow '{}' contains stale prompt fragment '{}'",
+                    workflow.workflow_id,
+                    banned
+                );
+            }
+        }
     }
 
     #[test]

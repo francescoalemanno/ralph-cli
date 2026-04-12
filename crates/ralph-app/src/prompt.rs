@@ -169,8 +169,8 @@ fn render_get_macro(spec: &str) -> Result<String> {
 
 fn render_signal_instruction(event: &str) -> String {
     format!(
-        "emit event `{event}` with no body by writing `{}`",
-        render_signal_marker(event)
+        "emit event `{event}` with no body by running `{}`",
+        render_signal_command(event)
     )
 }
 
@@ -188,17 +188,21 @@ fn render_get_in_channel_instruction(channel_id: &str, event: &str) -> String {
 
 fn render_payload_instruction(event: &str, body: &str) -> String {
     format!(
-        "emit event `{event}` with body `{body}` by writing `{}`",
-        render_payload_marker(event, body)
+        "emit event `{event}` with body `{body}` by running `{}`",
+        render_payload_command(event, body)
     )
 }
 
-fn render_signal_marker(event: &str) -> String {
-    format!("<<<SIGNAL:{event}>>>")
+fn render_signal_command(event: &str) -> String {
+    format!("\"$RALPH_BIN\" signal {}", shell_single_quote(event))
 }
 
-fn render_payload_marker(event: &str, body: &str) -> String {
-    format!("<<<PAYLOAD:{event}>>>{body}<<<END-PAYLOAD>>>")
+fn render_payload_command(event: &str, body: &str) -> String {
+    format!(
+        "\"$RALPH_BIN\" payload {} {}",
+        shell_single_quote(event),
+        shell_single_quote(body)
+    )
 }
 
 fn render_skill_emit_content() -> String {
@@ -208,21 +212,26 @@ definitions:
 event-name = the logical name of the event or payload to emit
 channel-id = the logical output channel identifier
 event-body = the body of the event and payload to emit
-- To emit an event without a body, write `{}`
-- To emit an event with a body, write `{}`
+- To emit an event without a body, run `{}`
+- To emit an event with a body, run `{}`
 - Event bodies may span multiple lines.
-- Do not explain the event in prose; output the marker itself.
+- Pass the full event body as one shell argument to `payload`.
 - `RALPH_BIN` points to the Ralph binary for this run.
 - Use `RALPH_BIN` as an executable, not as a file to inspect, print, or `cat`.
 - Ralph automatically records each emitted event on the correct channel for the current prompt or worker.
+- Do not pass a channel flag to `signal` or `payload`; Ralph selects the current channel automatically.
 - `"$RALPH_BIN" get <event-name>` reads the latest payload for `<event-name>` across all channels in the current run.
 - `"$RALPH_BIN" get --channel <channel-id> <event-name>` reads the latest payload for `<event-name>` from one specific channel.
 - When workflow instructions tell you to read state with `"$RALPH_BIN" get ...`, treat that command's stdout as the canonical current-run state for the requested event.
 - Do not replace `"$RALPH_BIN" get ...` reads with guesses from the filesystem, WAL files, or scratch files.
 </skill>"#,
-        render_signal_marker("event-name"),
-        render_payload_marker("event-name", "event-body"),
+        render_signal_command("event-name"),
+        render_payload_command("event-name", "event-body"),
     )
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r#"'"'"'"#))
 }
 
 fn absolute_unix_path(path: &Utf8Path) -> Result<String> {
@@ -255,13 +264,14 @@ mod tests {
         .unwrap();
 
         assert!(rendered.contains("<skill name=\"Ralph event emission\">"));
-        assert!(rendered.contains("<<<SIGNAL:event-name>>>"));
-        assert!(rendered.contains("<<<PAYLOAD:event-name>>>"));
+        assert!(rendered.contains("\"$RALPH_BIN\" signal 'event-name'"));
+        assert!(rendered.contains("\"$RALPH_BIN\" payload 'event-name' 'event-body'"));
         assert!(rendered.contains("event-body"));
-        assert!(rendered.contains("<<<END-PAYLOAD>>>"));
+        assert!(rendered.contains("Pass the full event body as one shell argument"));
         assert!(rendered.contains("\"$RALPH_BIN\" get <event-name>"));
         assert!(rendered.contains("\"$RALPH_BIN\" get --channel <channel-id> <event-name>"));
         assert!(rendered.contains("Use `RALPH_BIN` as an executable"));
+        assert!(rendered.contains("Do not pass a channel flag to `signal` or `payload`"));
         assert!(rendered.contains("canonical current-run state"));
         assert!(rendered.contains("WAL files, or scratch files"));
         assert!(rendered.contains("project=/tmp/project"));
@@ -280,13 +290,13 @@ mod tests {
         .unwrap();
 
         assert!(rendered.contains(
-            "emit event `loop-route` with body `build` by writing `<<<PAYLOAD:loop-route>>>build<<<END-PAYLOAD>>>`"
+            "emit event `loop-route` with body `build` by running `\"$RALPH_BIN\" payload 'loop-route' 'build'`"
         ));
         assert!(rendered.contains(
-            "emit event `loop-stop:ok` with body `verification-passed` by writing `<<<PAYLOAD:loop-stop:ok>>>verification-passed<<<END-PAYLOAD>>>`"
+            "emit event `loop-stop:ok` with body `verification-passed` by running `\"$RALPH_BIN\" payload 'loop-stop:ok' 'verification-passed'`"
         ));
         assert!(rendered.contains(
-            "emit event `loop-stop:error` with no body by writing `<<<SIGNAL:loop-stop:error>>>`"
+            "emit event `loop-stop:error` with no body by running `\"$RALPH_BIN\" signal 'loop-stop:error'`"
         ));
     }
 
