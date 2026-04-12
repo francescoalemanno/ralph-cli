@@ -10,12 +10,13 @@ use std::{
 
 use crate::{
     cli::{
-        AgentCommands, Cli, Commands, ConfigCommands, ConfigViewArg, GetArgs, GuidedArgs, InitArgs,
-        PayloadArgs, RequestArgs, RunArgs, RuntimeArgs, SignalArgs, render_run_workflow_help,
+        Cli, Commands, ConfigMutationArgs, ConfigShowArgs, ConfigViewArg, EditArgs, GetArgs,
+        GuidedArgs, PayloadArgs, PlanShortcutArgs, RequestArgs, RunArgs, RuntimeArgs, ShowArgs,
+        SignalArgs, render_workflow_help,
     },
     output::{
-        AgentCurrentRow, CliRunHeader, agent_list_rows, print_agent_current, print_agent_list,
-        print_run_header, print_workflow_definition, print_workflow_list, print_workflow_run,
+        CliRunHeader, print_run_header, print_workflow_definition, print_workflow_list,
+        print_workflow_run,
     },
 };
 use anyhow::{Context, Result, anyhow};
@@ -27,11 +28,9 @@ use ralph_app::{
 use ralph_core::{
     AgentEventRecord, AppConfig, ConfigFileScope, HOST_CHANNEL_ID, LastRunStatus, MAIN_CHANNEL_ID,
     PLANNING_PLAN_FILE_EVENT, RUNTIME_DIR_NAME, agent_events_wal_path,
-    append_agent_event_to_wal_path, atomic_write, current_unix_timestamp_ms,
-    latest_agent_event_body_from_wal_in_channel, seed_builtin_workflows_if_missing,
-    validate_agent_event,
+    append_agent_event_to_wal_path, current_unix_timestamp_ms,
+    latest_agent_event_body_from_wal_in_channel, validate_agent_event,
 };
-use serde::Serialize;
 use tracing_subscriber::{EnvFilter, fmt};
 
 const SPECIAL_WORKFLOW_PLAN_PLACEHOLDER: &str = "<unavailable, ignore>";
@@ -49,63 +48,44 @@ async fn try_main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     let project_dir = resolve_project_dir(cli.project_dir.clone())?;
+    apply_config_mutations(&project_dir, &cli.config_mutations)?;
 
-    run_command(project_dir, cli.command).await
+    match cli.command {
+        Some(command) => run_command(project_dir, command).await,
+        None => Ok(()),
+    }
 }
 
 async fn run_command(project_dir: Utf8PathBuf, command: Commands) -> Result<()> {
     match command {
         Commands::Guided(args) => run_guided_command(project_dir, args).await,
-        Commands::TasksOnly(args) => {
-            run_special_workflow(project_dir, "task", Some(args.plan_file))
-                .await
-                .map(|_| ())
-        }
-        Commands::ReviewOnly(args) => run_special_workflow(project_dir, "review", args.plan_file)
-            .await
-            .map(|_| ()),
-        Commands::FinalizeOnly(args) => {
-            run_special_workflow(project_dir, "finalize", args.plan_file)
-                .await
-                .map(|_| ())
-        }
-        Commands::Run(args) => run_run_command(project_dir, args).await,
+        Commands::TasksOnly(args) => run_tasks_only(project_dir, args).await,
+        Commands::ReviewOnly(args) => run_review_only(project_dir, args).await,
+        Commands::FinalizeOnly(args) => run_finalize_only(project_dir, args).await,
+        Commands::Workflow(args) => run_workflow_command(project_dir, args).await,
         Commands::Signal(args) => run_signal(args),
         Commands::Payload(args) => run_payload(args),
         Commands::Get(args) => run_get(args),
-        Commands::Ls => {
+        Commands::Workflows => {
             let app = RalphApp::load(project_dir)?;
             print_workflow_list(app.list_workflows()?);
             Ok(())
         }
-        Commands::Show(args) => {
-            let app = RalphApp::load(project_dir)?;
-            let workflow = app.load_workflow(&args.workflow_id)?;
-            print_workflow_definition(&workflow)
-        }
-        Commands::Edit(args) => {
-            let app = RalphApp::load(project_dir)?;
-            let path = app.resolve_workflow_edit_path(&args.workflow_id)?;
-            edit_file(&path, app.config().editor_override.as_deref())
-        }
-        Commands::Agent(command) => run_agent_command(project_dir, command),
-        Commands::Config(command) => run_config_command(project_dir, command),
-        Commands::Init(args) => run_init(project_dir, args),
-        Commands::Doctor => run_doctor(project_dir),
+        Commands::ShowWorkflow(args) => run_show_workflow(project_dir, args),
+        Commands::EditWorkflow(args) => run_edit_workflow(project_dir, args),
+        Commands::ShowConfig(args) => run_show_config(project_dir, args),
     }
 }
 
 async fn run_guided_command(project_dir: Utf8PathBuf, args: GuidedArgs) -> Result<()> {
-    ensure_interactive_terminal("guided planning")?;
-
-    let description = match args.description {
-        Some(description) => description,
-        None => prompt_nonempty("Plan description: ")?,
-    };
-
-    let plan_summary = run_cli_workflow(
+    let plan_summary = run_workflow_with_input(
         project_dir.clone(),
-        &build_run_args("plan", BTreeMap::new(), Some(description)),
+        &args.runtime,
+        "plan",
+        WorkflowRunInput {
+            request: resolve_cli_request_input(&args.request_args, Some("Plan description: "))?,
+            options: BTreeMap::new(),
+        },
     )
     .await?;
 
@@ -118,18 +98,49 @@ async fn run_guided_command(project_dir: Utf8PathBuf, args: GuidedArgs) -> Resul
     };
 
     if prompt_yes_no(&format!("Build this plan now? [{}] ", plan_file), false)? {
-        let task_summary =
-            run_special_workflow(project_dir.clone(), "task", Some(plan_file.clone())).await?;
+        let task_summary = run_special_workflow(
+            project_dir.clone(),
+            &args.runtime,
+            "task",
+            Some(plan_file.clone()),
+        )
+        .await?;
         if task_summary.status == LastRunStatus::Completed {
-            let _ = run_special_workflow(project_dir, "review", Some(plan_file)).await?;
+            let _ =
+                run_special_workflow(project_dir, &args.runtime, "review", Some(plan_file)).await?;
         }
     }
 
     Ok(())
 }
 
+async fn run_tasks_only(project_dir: Utf8PathBuf, args: PlanShortcutArgs) -> Result<()> {
+    run_special_workflow(project_dir, &args.runtime, "task", Some(args.plan_file))
+        .await
+        .map(|_| ())
+}
+
+async fn run_review_only(
+    project_dir: Utf8PathBuf,
+    args: cli::OptionalPlanShortcutArgs,
+) -> Result<()> {
+    run_special_workflow(project_dir, &args.runtime, "review", args.plan_file)
+        .await
+        .map(|_| ())
+}
+
+async fn run_finalize_only(
+    project_dir: Utf8PathBuf,
+    args: cli::OptionalPlanShortcutArgs,
+) -> Result<()> {
+    run_special_workflow(project_dir, &args.runtime, "finalize", args.plan_file)
+        .await
+        .map(|_| ())
+}
+
 async fn run_special_workflow(
     project_dir: Utf8PathBuf,
+    runtime: &RuntimeArgs,
     workflow_id: &str,
     plan_file: Option<String>,
 ) -> Result<ralph_core::WorkflowRunSummary> {
@@ -140,7 +151,7 @@ async fn run_special_workflow(
         .collect();
     run_workflow_with_input(
         project_dir,
-        &RuntimeArgs::default(),
+        runtime,
         workflow_id,
         WorkflowRunInput {
             options,
@@ -150,23 +161,7 @@ async fn run_special_workflow(
     .await
 }
 
-fn build_run_args(
-    workflow: &str,
-    workflow_options: BTreeMap<String, String>,
-    request: Option<String>,
-) -> RunArgs {
-    RunArgs {
-        runtime: RuntimeArgs::default(),
-        workflow: workflow.to_owned(),
-        workflow_options,
-        request_args: RequestArgs {
-            request_file: None,
-            request: request.into_iter().collect(),
-        },
-    }
-}
-
-async fn run_run_command(project_dir: Utf8PathBuf, args: cli::RunArgs) -> Result<()> {
+async fn run_workflow_command(project_dir: Utf8PathBuf, args: RunArgs) -> Result<()> {
     run_cli_workflow(project_dir, &args)
         .await
         .map(|_| ())
@@ -240,7 +235,7 @@ fn maybe_with_run_help(workflow_id: &str, error: anyhow::Error) -> anyhow::Error
 
 fn with_run_help(workflow_id: &str, error: anyhow::Error) -> anyhow::Error {
     let message = format!("{error:#}");
-    match render_run_workflow_help(workflow_id) {
+    match render_workflow_help(workflow_id) {
         Ok(help) => anyhow!("{}\n\n{}", message.trim_end(), help.trim_end()),
         Err(_) => anyhow!("{message}"),
     }
@@ -252,8 +247,8 @@ fn is_run_usage_error(error: &anyhow::Error) -> bool {
         "provide the workflow request in exactly one runtime form",
         "does not accept argv requests",
         "does not accept stdin requests",
-        "does not accept --request-file",
-        "requires a request via argv, stdin, or --request-file",
+        "does not accept --file",
+        "requires a request via argv, stdin, or --file",
         "requires option '--",
         "failed to read request file ",
         "failed to read workflow request file ",
@@ -263,58 +258,41 @@ fn is_run_usage_error(error: &anyhow::Error) -> bool {
     .any(|pattern| message.contains(pattern))
 }
 
-fn run_agent_command(project_dir: Utf8PathBuf, command: AgentCommands) -> Result<()> {
-    match command {
-        AgentCommands::List => {
-            let app = RalphApp::load(project_dir)?;
-            let rows = agent_list_rows(app.all_agents());
-            print_agent_list(&rows);
-            Ok(())
-        }
-        AgentCommands::Current => {
-            let app = RalphApp::load(project_dir.clone())?;
-            let row = AgentCurrentRow {
-                effective_agent: format!("{} ({})", app.agent_name(), app.agent_id()),
-                project_dir: project_dir.to_string(),
-            };
-            print_agent_current(&row);
-            Ok(())
-        }
-        AgentCommands::Set(args) => {
-            AppConfig::persist_scoped_coding_agent(&project_dir, args.scope.into(), &args.agent)
-        }
+fn apply_config_mutations(project_dir: &Utf8Path, mutations: &ConfigMutationArgs) -> Result<()> {
+    if let Some(agent) = &mutations.set_user_agent {
+        AppConfig::persist_scoped_coding_agent(project_dir, ConfigFileScope::User, agent)?;
     }
+    if let Some(agent) = &mutations.set_project_agent {
+        AppConfig::persist_scoped_coding_agent(project_dir, ConfigFileScope::Project, agent)?;
+    }
+    Ok(())
 }
 
-fn run_config_command(project_dir: Utf8PathBuf, command: ConfigCommands) -> Result<()> {
-    match command {
-        ConfigCommands::Show(args) => {
-            let app = RalphApp::load(project_dir.clone())?;
-            let raw = match args.scope {
-                ConfigViewArg::User => {
-                    AppConfig::scoped_config_toml(&project_dir, ConfigFileScope::User)?
-                        .unwrap_or_else(|| "<missing>".to_owned())
-                }
-                ConfigViewArg::Project => {
-                    AppConfig::scoped_config_toml(&project_dir, ConfigFileScope::Project)?
-                        .unwrap_or_else(|| "<missing>".to_owned())
-                }
-                ConfigViewArg::Effective => app.config().effective_toml()?,
-            };
-            println!("{raw}");
-            Ok(())
+fn run_show_workflow(project_dir: Utf8PathBuf, args: ShowArgs) -> Result<()> {
+    let app = RalphApp::load(project_dir)?;
+    let workflow = app.load_workflow(&args.workflow_id)?;
+    print_workflow_definition(&workflow)
+}
+
+fn run_edit_workflow(project_dir: Utf8PathBuf, args: EditArgs) -> Result<()> {
+    let app = RalphApp::load(project_dir)?;
+    let path = app.resolve_workflow_edit_path(&args.workflow_id)?;
+    edit_file(&path, app.config().editor_override.as_deref())
+}
+
+fn run_show_config(project_dir: Utf8PathBuf, args: ConfigShowArgs) -> Result<()> {
+    let app = RalphApp::load(project_dir.clone())?;
+    let raw = match args.scope {
+        ConfigViewArg::User => AppConfig::scoped_config_toml(&project_dir, ConfigFileScope::User)?
+            .unwrap_or_else(|| "<missing>".to_owned()),
+        ConfigViewArg::Project => {
+            AppConfig::scoped_config_toml(&project_dir, ConfigFileScope::Project)?
+                .unwrap_or_else(|| "<missing>".to_owned())
         }
-        ConfigCommands::Path => {
-            let user = AppConfig::user_config_path()?.map(|path| path.to_string());
-            let project = AppConfig::project_config_path(&project_dir).to_string();
-            println!(
-                "user={}\nproject={}",
-                user.unwrap_or_else(|| "<unavailable>".to_owned()),
-                project
-            );
-            Ok(())
-        }
-    }
+        ConfigViewArg::Effective => app.config().effective_toml()?,
+    };
+    println!("{raw}");
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -553,19 +531,40 @@ fn env_utf8_path(key: &str) -> Result<Utf8PathBuf> {
 
 fn resolve_workflow_run_input(args: &cli::RunArgs) -> Result<WorkflowRunInput> {
     Ok(WorkflowRunInput {
-        request: build_request_input(&args.request_args)?,
+        request: resolve_cli_request_input(&args.request_args, None)?,
         options: args.workflow_options.clone(),
     })
 }
 
-fn build_request_input(request_args: &RequestArgs) -> Result<WorkflowRequestInput> {
-    let stdin = read_stdin_if_piped()?;
+fn resolve_cli_request_input(
+    request_args: &RequestArgs,
+    prompt_if_missing: Option<&str>,
+) -> Result<WorkflowRequestInput> {
+    resolve_cli_request_input_with_stdin(request_args, prompt_if_missing, read_stdin_if_piped()?)
+}
 
-    Ok(WorkflowRequestInput {
+fn resolve_cli_request_input_with_stdin(
+    request_args: &RequestArgs,
+    prompt_if_missing: Option<&str>,
+    piped_stdin: Option<String>,
+) -> Result<WorkflowRequestInput> {
+    let mut request_input = WorkflowRequestInput {
         argv: request_args.argv_text(),
-        stdin,
+        stdin: piped_stdin,
         request_file: request_args.request_file.clone(),
-    })
+    };
+
+    if request_input.clone().into_source()?.is_some() {
+        return Ok(request_input);
+    }
+
+    let Some(prompt) = prompt_if_missing else {
+        return Ok(request_input);
+    };
+
+    ensure_interactive_terminal("guided planning")?;
+    request_input.argv = Some(prompt_nonempty(prompt)?);
+    Ok(request_input)
 }
 
 fn read_stdin_if_piped() -> Result<Option<String>> {
@@ -663,69 +662,6 @@ fn git_branch(project_dir: &Utf8Path) -> Option<String> {
     } else {
         Some(branch)
     }
-}
-
-fn run_init(project_dir: Utf8PathBuf, args: InitArgs) -> Result<()> {
-    let path = AppConfig::project_config_path(&project_dir);
-    if path.exists() && !args.force {
-        return Err(anyhow!(
-            "config already exists at {}; use --force to overwrite",
-            path
-        ));
-    }
-
-    let config = AppConfig::load(&project_dir)?;
-    if let Some(agent) = args.agent.as_deref()
-        && config.agent_definition(agent).is_none()
-    {
-        return Err(anyhow!("agent '{}' is not defined", agent));
-    }
-
-    #[derive(Serialize)]
-    struct ProjectConfigFile {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        agent: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        editor_override: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        max_iterations: Option<usize>,
-    }
-
-    let project_config = ProjectConfigFile {
-        agent: args.agent,
-        editor_override: args.editor,
-        max_iterations: args.max_iterations,
-    };
-
-    atomic_write(&path, toml::to_string_pretty(&project_config)?)
-        .with_context(|| format!("failed to write config at {path}"))?;
-    println!("{path}");
-    Ok(())
-}
-
-fn run_doctor(project_dir: Utf8PathBuf) -> Result<()> {
-    AppConfig::validate_scoped_config(&project_dir, ConfigFileScope::User)?;
-    AppConfig::validate_scoped_config(&project_dir, ConfigFileScope::Project)?;
-    seed_builtin_workflows_if_missing()?;
-    fs::create_dir_all(project_dir.join(".ralph"))
-        .with_context(|| format!("failed to write under {}", project_dir))?;
-
-    let app = RalphApp::load(project_dir)?;
-    let available = app.available_agents();
-    if available.is_empty() {
-        println!("doctor: no supported agents detected on PATH");
-    } else {
-        println!(
-            "doctor: detected agents: {}",
-            available
-                .iter()
-                .map(|agent| agent.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    println!("doctor: ok");
-    Ok(())
 }
 
 fn resolve_project_dir(project_dir: Option<Utf8PathBuf>) -> Result<Utf8PathBuf> {
@@ -948,9 +884,54 @@ mod tests {
 
             assert!(rendered.contains("provide the workflow request in exactly one runtime form"));
             assert!(rendered.contains("Usage:"));
-            assert!(rendered.contains("ralph run fixture-flow"));
+            assert!(rendered.contains("ralph w fixture-flow"));
             assert!(rendered.contains("--statefile"));
         });
+    }
+
+    #[test]
+    fn guided_request_resolution_preserves_stdin_as_stdin() {
+        let request_input = resolve_cli_request_input_with_stdin(
+            &RequestArgs::default(),
+            Some("Plan description: "),
+            Some("ship auth".to_owned()),
+        )
+        .unwrap();
+
+        assert!(request_input.argv.is_none());
+        assert_eq!(request_input.stdin.as_deref(), Some("ship auth"));
+    }
+
+    #[test]
+    fn guided_request_resolution_rejects_multiple_sources() {
+        let error = resolve_cli_request_input_with_stdin(
+            &RequestArgs {
+                request_file: Some(Utf8PathBuf::from("REQ.md")),
+                ..Default::default()
+            },
+            Some("Plan description: "),
+            Some("ship auth".to_owned()),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("exactly one runtime form"));
+    }
+
+    #[test]
+    fn request_resolution_preserves_argv_source() {
+        let input = resolve_cli_request_input_with_stdin(
+            &RequestArgs {
+                request: vec!["ship auth".to_owned()],
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(input.argv.as_deref(), Some("ship auth"));
+        assert!(input.stdin.is_none());
     }
 
     #[test]

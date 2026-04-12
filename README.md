@@ -70,12 +70,11 @@ cargo build --release -p ralph-cli
 Start with:
 
 ```bash
-ralph doctor
-ralph agent list
-ralph ls
+ralph --workflows
+ralph --show-config
 ```
 
-`ralph doctor` validates config, seeds the built-in workflow registry if missing, ensures `.ralph/` can be created in the current project, and reports which supported agents were detected on `PATH`.
+Ralph seeds its user config and built-in workflow registry automatically the first time it loads them.
 
 ## Choose The Right Workflow
 
@@ -86,7 +85,7 @@ ralph ls
 
 ## Core Concepts
 
-- Workflow: a YAML definition selected with `ralph run <workflow-id> ...`
+- Workflow: a YAML definition selected with `ralph w <workflow-id> ...`
 - Agent: the coding tool Ralph launches underneath the workflow
 - Request: the task text for the workflow
 - Design docs/specs: optional durable reference material when the request needs them
@@ -105,8 +104,12 @@ These use the new top-level guided entrypoint:
 
 ```bash
 ralph
+ralph "add caching for API responses"
+ralph --file REQ.md
 ralph --plan
 ralph --plan="add caching for API responses"
+cat REQ.md | ralph
+cat REQ.md | ralph --plan
 ralph -t docs/plans/2026-04-11-cache-plan.md
 ralph -r
 ralph -f
@@ -114,28 +117,27 @@ ralph -f
 
 Guided behavior:
 
-- `ralph` asks for a plan description, runs `plan` interactively in the terminal, and can continue into `task` then `review`.
-- `ralph --plan[=DESCRIPTION]` runs the same interactive planning flow and stops after the plan file is written.
+- `ralph` accepts the planning request from argv text, root `--file <FILE>`, piped stdin, or an interactive prompt, then runs `plan` and can continue into `task` then `review`.
+- `ralph --plan[=DESCRIPTION]` runs the same planning flow and stops after the plan file is written. The request may come from `--plan=...`, root `--file <FILE>`, piped stdin, or the interactive prompt.
 - `ralph -t <PLAN_FILE>` runs only `task`.
 - `ralph -r [PLAN_FILE]` runs only `review`. If you omit `PLAN_FILE`, Ralph first reuses the latest accepted plan from `ralph --plan`; if none can be found, it still runs by injecting the sentinel plan value `"<unavailable, ignore>"`.
 - `ralph -f [PLAN_FILE]` runs only `finalize`. If you omit `PLAN_FILE`, Ralph first reuses the latest accepted plan from `ralph --plan`; if none can be found, it still runs by injecting the sentinel plan value `"<unavailable, ignore>"`.
 
-### Low-Level Runner
+### Workflow Runner
 
 These run directly in the terminal:
 
 ```bash
-ralph run bare "fix the failing tests"
-ralph run default "ship the auth refactor"
-ralph run dbv "ship the auth refactor"
-ralph run plan "add caching for API responses"
+ralph w bare "fix the failing tests"
+ralph w default "ship the auth refactor"
+ralph w dbv "ship the auth refactor"
+ralph w plan "add caching for API responses"
 ```
 
 Important behavior:
 
 - The allowed request forms come from each workflow's `request.runtime` definition.
-- Built-in `bare`, `default`, and `dbv` accept argv text, `--file <FILE>`, or piped stdin.
-- Built-in `plan` accepts argv text or `--file <FILE>` and does not accept stdin.
+- Built-in `bare`, `default`, `dbv`, and `plan` accept argv text, root `--file <FILE>`, or piped stdin.
 - The request must be provided in exactly one runtime form.
 
 ## Theme
@@ -161,8 +163,8 @@ error_color = "red"
 
 Ralph accepts the workflow request in exactly one runtime form, but the allowed forms depend on the selected workflow.
 
-- `bare`, `default`, and `dbv`: argv text, `--file <FILE>`, or stdin
-- `plan`: argv text or `--file <FILE>`
+- Guided mode: argv text, `--file <FILE>`, or stdin
+- `bare`, `default`, `dbv`, and `plan`: argv text, `--file <FILE>`, or stdin
 
 If you provide a form that the workflow does not allow, or provide more than one form, Ralph exits with a usage error.
 
@@ -190,7 +192,7 @@ If you provide a form that the workflow does not allow, or provide more than one
 List them at any time with:
 
 ```bash
-ralph ls
+ralph --workflows
 ```
 
 ## Tuning The Loop
@@ -205,39 +207,25 @@ ralph ls
 
 ```bash
 ralph --help
-ralph run --help
-ralph run dbv --help
-ralph ls
-ralph show dbv
-ralph edit dbv
-ralph agent list
-ralph agent current
-ralph agent set claude --scope user
-ralph config show --scope effective
-ralph config path
-ralph init --agent opencode --editor nvim --max-iterations 20
-ralph doctor
+ralph w --help
+ralph w dbv --help
+ralph --workflows
+ralph --show-workflow dbv
+ralph --edit-workflow dbv
+ralph --show-config
+ralph --show-config=user
+ralph --set-user-agent claude
+ralph --set-project-agent opencode
+ralph --agent claude w dbv "ship the auth refactor"
 ```
 
 ## Agents And Config
 
-Inspect detected agents:
-
-```bash
-ralph agent list
-```
-
-Show the effective agent for the current project:
-
-```bash
-ralph agent current
-```
-
 Persist a default agent:
 
 ```bash
-ralph agent set opencode --scope user
-ralph agent set claude --scope project
+ralph --set-user-agent opencode
+ralph --set-project-agent claude
 ```
 
 Config scopes:
@@ -251,15 +239,9 @@ Set `RALPH_CONFIG_HOME` if you want Ralph's user config and workflow registry so
 Show config:
 
 ```bash
-ralph config show --scope user
-ralph config show --scope project
-ralph config show --scope effective
-```
-
-Create a project config file:
-
-```bash
-ralph init --agent opencode --editor nvim --max-iterations 20
+ralph --show-config=user
+ralph --show-config=project
+ralph --show-config=effective
 ```
 
 Notes:
@@ -267,27 +249,26 @@ Notes:
 - The default built-in agent is `opencode`.
 - On startup Ralph keeps the configured agent when it is available; otherwise it falls back to the first detected agent in priority order: `opencode`, `raijin`, then the remaining configured agents.
 - The default workflow iteration limit is `40`.
-- `ralph init` writes `.ralph/config.toml`.
-- Re-run `ralph init` with `--force` to overwrite an existing project config.
+- Persisting a project agent writes `.ralph/config.toml` on demand.
 
 ## Inspecting And Editing Workflows
 
 List workflow definitions and where they live:
 
 ```bash
-ralph ls
+ralph --workflows
 ```
 
 Print the raw YAML for one workflow:
 
 ```bash
-ralph show default
+ralph --show-workflow default
 ```
 
 Edit a workflow in place:
 
 ```bash
-ralph edit default
+ralph --edit-workflow default
 ```
 
 Protected built-ins:
@@ -301,7 +282,7 @@ Editor resolution order:
 2. `VISUAL`
 3. `EDITOR`
 
-If no editor is configured, `ralph edit` exits with an error.
+If no editor is configured, `ralph --edit-workflow ...` exits with an error.
 
 ## Workflow Option Flags
 
@@ -365,7 +346,7 @@ Important planning rules:
 - when you emit `planning-target-path`, write the markdown draft to that file first
 - on `accept`, Ralph keeps the exact draft file you emitted and ends the workflow successfully
 
-See the built-in workflow definitions with `ralph show <workflow-id>` if you want to study how loop control works in practice.
+See the built-in workflow definitions with `ralph --show-workflow <workflow-id>` if you want to study how loop control works in practice.
 
 ## Parallel Prompts
 
@@ -402,23 +383,23 @@ Parallel workers emit events on their own channel automatically. Their text outp
 If the work is still fuzzy but you already want a concrete implementation plan in the repo, start with `plan`:
 
 ```bash
-ralph run plan "add SSO to the admin app"
+ralph --plan="add SSO to the admin app"
 ```
 
 If the work is implementation-ready and you want a durable plan plus one-item-at-a-time execution, use `default`:
 
 ```bash
-ralph run default "add SSO to the admin app"
+ralph w default "add SSO to the admin app"
 ```
 
 If you want the more explicit dispatcher-style plan gating, use `dbv`:
 
 ```bash
-ralph run dbv "add SSO to the admin app"
+ralph w dbv "add SSO to the admin app"
 ```
 
 If you are scripting a run, piping the request works directly:
 
 ```bash
-cat REQ.md | ralph run dbv
+cat REQ.md | ralph w dbv
 ```

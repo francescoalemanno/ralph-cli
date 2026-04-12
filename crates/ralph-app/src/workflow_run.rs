@@ -33,11 +33,24 @@ pub struct WorkflowRequestInput {
     pub request_file: Option<Utf8PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowRequestSource {
+    Argv(String),
+    Stdin(String),
+    File(Utf8PathBuf),
+}
+
 impl WorkflowRequestInput {
-    fn provided_source_count(&self) -> usize {
-        usize::from(self.argv.is_some())
-            + usize::from(self.stdin.is_some())
-            + usize::from(self.request_file.is_some())
+    pub fn into_source(self) -> Result<Option<WorkflowRequestSource>> {
+        match (self.argv, self.stdin, self.request_file) {
+            (Some(argv), None, None) => Ok(Some(WorkflowRequestSource::Argv(argv))),
+            (None, Some(stdin), None) => Ok(Some(WorkflowRequestSource::Stdin(stdin))),
+            (None, None, Some(path)) => Ok(Some(WorkflowRequestSource::File(path))),
+            (None, None, None) => Ok(None),
+            _ => Err(anyhow!(
+                "provide the workflow request in exactly one runtime form: argv, stdin, or --file"
+            )),
+        }
     }
 }
 
@@ -893,15 +906,10 @@ where
             }
             return Ok(None);
         };
-
-        if request_input.provided_source_count() > 1 {
-            return Err(anyhow!(
-                "provide the workflow request in exactly one runtime form: argv, stdin, or --request-file"
-            ));
-        }
+        let request_source = request_input.into_source()?;
 
         if let Some(runtime) = &request.runtime {
-            return self.resolve_runtime_request(workflow, runtime, request_input);
+            return self.resolve_runtime_request(workflow, runtime, request_source);
         }
 
         if let Some(file) = &request.file {
@@ -922,48 +930,44 @@ where
         &self,
         workflow: &WorkflowDefinition,
         runtime: &WorkflowRuntimeRequest,
-        request_input: WorkflowRequestInput,
+        request_source: Option<WorkflowRequestSource>,
     ) -> Result<Option<String>> {
-        if request_input.argv.is_some() && !runtime.argv {
-            return Err(anyhow!(
-                "workflow '{}' does not accept argv requests",
-                workflow.workflow_id
-            ));
-        }
-        if request_input.stdin.is_some() && !runtime.stdin {
-            return Err(anyhow!(
-                "workflow '{}' does not accept stdin requests",
-                workflow.workflow_id
-            ));
-        }
-        if request_input.request_file.is_some() && !runtime.file_flag {
-            return Err(anyhow!(
-                "workflow '{}' does not accept --request-file",
-                workflow.workflow_id
-            ));
-        }
-
-        match (
-            request_input.argv,
-            request_input.stdin,
-            request_input.request_file,
-        ) {
-            (Some(argv), None, None) => Ok(Some(argv)),
-            (None, Some(stdin), None) => Ok(Some(stdin)),
-            (None, None, Some(path)) => {
+        match request_source {
+            Some(WorkflowRequestSource::Argv(argv)) => {
+                if !runtime.argv {
+                    return Err(anyhow!(
+                        "workflow '{}' does not accept argv requests",
+                        workflow.workflow_id
+                    ));
+                }
+                Ok(Some(argv))
+            }
+            Some(WorkflowRequestSource::Stdin(stdin)) => {
+                if !runtime.stdin {
+                    return Err(anyhow!(
+                        "workflow '{}' does not accept stdin requests",
+                        workflow.workflow_id
+                    ));
+                }
+                Ok(Some(stdin))
+            }
+            Some(WorkflowRequestSource::File(path)) => {
+                if !runtime.file_flag {
+                    return Err(anyhow!(
+                        "workflow '{}' does not accept --file",
+                        workflow.workflow_id
+                    ));
+                }
                 let path = self.resolve_project_relative_path(&path);
                 let contents = fs::read_to_string(path.as_std_path())
                     .with_context(|| format!("failed to read request file {}", path))?;
                 Ok(Some(contents))
             }
-            (None, None, None) if workflow.uses_request_token() => Err(anyhow!(
-                "workflow '{}' requires a request via argv, stdin, or --request-file",
+            None if workflow.uses_request_token() => Err(anyhow!(
+                "workflow '{}' requires a request via argv, stdin, or --file",
                 workflow.workflow_id
             )),
-            (None, None, None) => Ok(None),
-            _ => Err(anyhow!(
-                "provide the workflow request in exactly one runtime form: argv, stdin, or --request-file"
-            )),
+            None => Ok(None),
         }
     }
 
@@ -2427,12 +2431,16 @@ prompts:
     }
 
     #[test]
-    fn request_input_counts_only_populated_sources() {
-        let input = WorkflowRequestInput {
+    fn request_input_rejects_multiple_sources() {
+        let error = WorkflowRequestInput {
             argv: Some("a".to_owned()),
             stdin: None,
             request_file: Some(Utf8PathBuf::from("b")),
-        };
-        assert_eq!(input.provided_source_count(), 2);
+        }
+        .into_source()
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("exactly one runtime form"));
     }
 }
