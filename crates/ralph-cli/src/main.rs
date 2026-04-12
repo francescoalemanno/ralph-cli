@@ -85,6 +85,7 @@ async fn run_guided_command(project_dir: Utf8PathBuf, args: GuidedArgs) -> Resul
         WorkflowRunInput {
             request: resolve_cli_request_input(&args.request_args, Some("Plan description: "))?,
             options: BTreeMap::new(),
+            ..Default::default()
         },
     )
     .await?;
@@ -180,11 +181,15 @@ async fn run_workflow_with_input(
     project_dir: Utf8PathBuf,
     runtime: &RuntimeArgs,
     workflow_id: &str,
-    input: WorkflowRunInput,
+    mut input: WorkflowRunInput,
 ) -> Result<ralph_core::WorkflowRunSummary> {
     let mut app = RalphApp::load(project_dir)?;
     runtime.apply_to(&mut app)?;
     let workflow = app.load_workflow(workflow_id)?;
+    input.max_iterations_override = input.max_iterations_override.or(runtime.max_iterations);
+    let effective_max_iterations = input
+        .max_iterations_override
+        .unwrap_or(workflow.max_iterations);
     let request_preview = resolve_request_preview(app.project_dir(), &workflow, &input.request)?;
     let agent = app
         .config()
@@ -203,7 +208,7 @@ async fn run_workflow_with_input(
             branch: git_branch(app.project_dir()),
             request_source: describe_request_source(&workflow, &input.request),
             request_preview,
-            max_iterations: app.config().max_iterations,
+            max_iterations: effective_max_iterations,
             session_timeout_secs: agent.runner.session_timeout_secs,
             idle_timeout_secs: agent.runner.idle_timeout_secs,
             workflow_options: input
@@ -533,6 +538,7 @@ fn resolve_workflow_run_input(args: &cli::RunArgs) -> Result<WorkflowRunInput> {
     Ok(WorkflowRunInput {
         request: resolve_cli_request_input(&args.request_args, None)?,
         options: args.workflow_options.clone(),
+        ..Default::default()
     })
 }
 
@@ -746,6 +752,7 @@ pub(crate) mod test_support {
 version: 1
 workflow_id: fixture-flow
 title: Fixture Flow
+max_iterations: 40
 entrypoint: main
 options:
   state-file:

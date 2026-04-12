@@ -2,6 +2,7 @@ version: 1
 workflow_id: default
 title: Decompose Build Verify
 description: Repairs a durable plan, executes one plan item per loop, and verifies the whole project when the plan is complete.
+max_iterations: 40
 entrypoint: decompose
 options:
   plan-file:

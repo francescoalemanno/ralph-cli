@@ -37,6 +37,7 @@ fn hidden_test_workflow_runs_end_to_end_via_the_cli_binary() {
         "stdout:\n{stdout}\n\nstderr:\n{stderr}"
     );
 
+    assert!(stdout.contains("max 14 iterations"));
     assert!(stdout.contains("alpha round 1"));
     assert!(stdout.contains("beta round 4"));
     assert!(stdout.contains("gamma round 4"));
@@ -104,6 +105,43 @@ fn hidden_test_workflow_runs_end_to_end_via_the_cli_binary() {
         wal.records.last().map(|record| record.body.as_str()),
         Some("completed 4 coordinated rounds")
     );
+}
+
+#[test]
+fn cli_max_iterations_overrides_workflow_default() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("project");
+    let config_home = temp.path().join("config-home");
+    let home_dir = temp.path().join("home");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::create_dir_all(&config_home).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ralph"))
+        .arg("--project-dir")
+        .arg(&project_dir)
+        .arg("--agent")
+        .arg("__test_shell")
+        .arg("--max-iterations")
+        .arg("2")
+        .arg("w")
+        .arg("test-workflow")
+        .env("HOME", &home_dir)
+        .env("RALPH_CONFIG_HOME", &config_home)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\n\nstderr:\n{stderr}"
+    );
+
+    assert!(stdout.contains("max 2 iterations"));
+    assert!(stdout.contains("Reached max iterations for workflow test-workflow"));
+    assert!(stdout.contains("test-workflow [max_iterations] prompt=beta"));
+    assert!(!stdout.contains("finalize after 4 rounds"));
 }
 
 #[test]

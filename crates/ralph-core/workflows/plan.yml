@@ -3,6 +3,7 @@ version: 1
 workflow_id: plan
 title: Plan
 description: "Create an implementation plan through a host-mediated planning loop: explore, ask one clarifying question at a time, write a draft plan file, and let Ralph collect review feedback before final acceptance."
+max_iterations: 1000
 entrypoint: plan
 options:
   plans-dir:

@@ -3,6 +3,7 @@ version: 1
 workflow_id: task
 title: Task
 description: "Execute all markdown task sections one at a time until the plan's implementation stage is complete. Review and finalize remain separate workflows."
+max_iterations: 45
 entrypoint: task
 options:
   plan-file:

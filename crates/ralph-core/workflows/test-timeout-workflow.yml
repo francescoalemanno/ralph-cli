@@ -3,6 +3,7 @@ workflow_id: test-timeout-workflow
 title: Test Timeout Workflow
 description: Internal workflow for exercising runner timeout behavior.
 hidden: true
+max_iterations: 1
 entrypoint: main
 options:
   script:

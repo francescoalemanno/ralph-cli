@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{atomic_write, config::global_config_dir};
 
 const WORKFLOW_VERSION: u8 = 1;
+const DEFAULT_WORKFLOW_MAX_ITERATIONS: usize = 40;
 const REQUEST_TOKEN: &str = "{ralph-request}";
 const PROJECT_DIR_TOKEN: &str = "{ralph-env:PROJECT_DIR}";
 const REMOVED_RUN_DIR_TOKEN: &str = "{ralph-env:RUN_DIR}";
@@ -29,6 +30,8 @@ pub struct WorkflowDefinition {
     pub description: String,
     #[serde(default)]
     pub hidden: bool,
+    #[serde(default = "default_workflow_max_iterations")]
+    pub max_iterations: usize,
     pub entrypoint: String,
     #[serde(default)]
     pub options: BTreeMap<String, WorkflowOptionDefinition>,
@@ -55,6 +58,12 @@ impl WorkflowDefinition {
         if self.entrypoint.trim().is_empty() {
             return Err(anyhow!(
                 "workflow '{}' must define a non-empty entrypoint",
+                self.workflow_id
+            ));
+        }
+        if self.max_iterations == 0 {
+            return Err(anyhow!(
+                "workflow '{}' max_iterations must be greater than 0",
                 self.workflow_id
             ));
         }
@@ -545,6 +554,10 @@ impl WorkflowDefinition {
 
         Ok(())
     }
+}
+
+fn default_workflow_max_iterations() -> usize {
+    DEFAULT_WORKFLOW_MAX_ITERATIONS
 }
 
 fn validate_worker_id(worker_id: &str) -> Result<()> {
@@ -1253,6 +1266,7 @@ prompts:
             title: "Broken".to_owned(),
             description: String::new(),
             hidden: false,
+            max_iterations: 40,
             entrypoint: "main".to_owned(),
             options: BTreeMap::new(),
             request: Some(WorkflowRequestDefinition {
@@ -1291,6 +1305,7 @@ prompts:
             title: "Broken".to_owned(),
             description: String::new(),
             hidden: false,
+            max_iterations: 40,
             entrypoint: "main".to_owned(),
             options: BTreeMap::new(),
             request: None,
@@ -1320,6 +1335,7 @@ prompts:
             title: "Broken".to_owned(),
             description: String::new(),
             hidden: false,
+            max_iterations: 40,
             entrypoint: "main".to_owned(),
             options: BTreeMap::new(),
             request: None,
@@ -1348,6 +1364,7 @@ prompts:
             title: "Broken".to_owned(),
             description: String::new(),
             hidden: false,
+            max_iterations: 40,
             entrypoint: "main".to_owned(),
             options: BTreeMap::from([
                 (
@@ -1383,6 +1400,56 @@ prompts:
 
         let error = workflow.validate().unwrap_err().to_string();
         assert!(error.contains("both map to CLI flag '--progressfile'"));
+    }
+
+    #[test]
+    fn workflows_default_max_iterations_when_omitted() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("workflow.yml")).unwrap();
+        let workflow = load_workflow_from_path_for_test(
+            &path,
+            r#"
+version: 1
+workflow_id: default-limit
+title: Default Limit
+entrypoint: main
+prompts:
+  main:
+    title: Main
+    fallback-route: no-route-error
+    prompt: hello
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(workflow.max_iterations, 40);
+    }
+
+    #[test]
+    fn validation_rejects_zero_max_iterations() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("workflow.yml")).unwrap();
+        let error = format!(
+            "{:#}",
+            load_workflow_from_path_for_test(
+                &path,
+                r#"
+version: 1
+workflow_id: zero-limit
+title: Zero Limit
+max_iterations: 0
+entrypoint: main
+prompts:
+  main:
+    title: Main
+    fallback-route: no-route-error
+    prompt: hello
+"#,
+            )
+            .unwrap_err()
+        );
+
+        assert!(error.contains("max_iterations must be greater than 0"));
     }
 
     #[test]

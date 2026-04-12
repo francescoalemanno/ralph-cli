@@ -29,7 +29,7 @@ const PROJECT_DIR_HELP: &str = "Run the command against this project directory";
 const REQUEST_FILE_HELP: &str = "Read the request from a file";
 const REQUEST_HELP: &str = "Provide the request as argv text";
 const RUNTIME_AGENT_HELP: &str = "Override the configured coding agent for this invocation";
-const RUNTIME_MAX_ITERATIONS_HELP: &str = "Override the configured workflow iteration limit";
+const RUNTIME_MAX_ITERATIONS_HELP: &str = "Override the workflow's iteration limit";
 const RUNTIME_SESSION_TIMEOUT_HELP: &str =
     "Kill the agent after a fixed duration like 30m, 5m, or 45s";
 const RUNTIME_IDLE_TIMEOUT_HELP: &str =
@@ -112,9 +112,6 @@ impl RuntimeArgs {
     pub(crate) fn apply_to<R>(&self, app: &mut RalphApp<R>) -> anyhow::Result<()> {
         if let Some(agent) = &self.agent {
             app.set_agent(agent)?;
-        }
-        if let Some(max_iterations) = self.max_iterations {
-            app.config_mut().max_iterations = max_iterations;
         }
         if self.session_timeout_secs.is_some() || self.idle_timeout_secs.is_some() {
             let agent_id = app.agent_id().to_owned();

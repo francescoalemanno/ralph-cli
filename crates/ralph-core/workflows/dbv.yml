@@ -2,6 +2,7 @@ version: 1
 workflow_id: dbv
 title: Decompose Build Verify
 description: Iterate between plan repair, one-item execution, and whole-project verification.
+max_iterations: 40
 entrypoint: dispatch
 options:
   plan-file:

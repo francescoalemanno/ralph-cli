@@ -3,6 +3,7 @@ version: 1
 workflow_id: review
 title: Review
 description: "Run the parallel review passes as a standalone workflow, fix confirmed findings, and stop when review is clean."
+max_iterations: 5
 entrypoint: review-first-fanout
 options:
   plan-file:

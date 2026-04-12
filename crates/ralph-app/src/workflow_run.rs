@@ -58,6 +58,7 @@ impl WorkflowRequestInput {
 pub struct WorkflowRunInput {
     pub request: WorkflowRequestInput,
     pub options: BTreeMap<String, String>,
+    pub max_iterations_override: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -191,7 +192,9 @@ where
                 .with_context(|| format!("failed to write request.txt under {}", run_dir))?;
         }
 
-        let max_iterations = self.config.max_iterations;
+        let max_iterations = input
+            .max_iterations_override
+            .unwrap_or(workflow.max_iterations);
         let wal_write_lock = Arc::new(AsyncMutex::new(()));
         let mut current_prompt_id = workflow.entrypoint.clone();
 
@@ -1835,14 +1838,7 @@ prompts:
             ])),
             ..Default::default()
         };
-        let app = RalphApp::new(
-            project_dir.clone(),
-            AppConfig {
-                max_iterations: 4,
-                ..Default::default()
-            },
-            runner.clone(),
-        );
+        let app = RalphApp::new(project_dir.clone(), AppConfig::default(), runner.clone());
         let mut delegate = TestDelegate::default();
 
         let summary = app
@@ -2037,6 +2033,7 @@ prompts:
                     ..Default::default()
                 },
                 options: BTreeMap::from([("state-file".to_owned(), "custom-state.txt".to_owned())]),
+                ..Default::default()
             },
             &mut delegate,
         )
@@ -2064,6 +2061,7 @@ prompts:
 version: 1
 workflow_id: guarded-task
 title: Guarded Task
+max_iterations: 3
 entrypoint: task
 options:
   plan-file:
@@ -2095,14 +2093,7 @@ prompts:
                 "### Task 1\n- [x] first\n".to_owned(),
             ])),
         };
-        let app = RalphApp::new(
-            project_dir,
-            AppConfig {
-                max_iterations: 3,
-                ..Default::default()
-            },
-            runner.clone(),
-        );
+        let app = RalphApp::new(project_dir, AppConfig::default(), runner.clone());
         let mut delegate = TestDelegate::default();
 
         let summary = app
@@ -2119,6 +2110,45 @@ prompts:
         assert_eq!(summary.status, ralph_core::LastRunStatus::Completed);
         assert_eq!(runner.invocations.lock().unwrap().len(), 2);
         assert!(delegate.notes.iter().any(|note| note == "still incomplete"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_max_iterations_default_is_enforced() -> Result<()> {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let config_home = Utf8PathBuf::from_path_buf(temp.path().join("config-home")).unwrap();
+        fs::create_dir_all(config_home.join("workflows")).unwrap();
+        let _config_home = ScopedConfigHome::new(config_home.clone());
+        fs::write(
+            config_home.join("workflows/max-iterations.yml"),
+            r#"
+version: 1
+workflow_id: max-iterations
+title: Max Iterations
+max_iterations: 2
+entrypoint: main
+prompts:
+  main:
+    title: Main
+    fallback-route: main
+    prompt: hello
+"#,
+        )?;
+
+        let runner = WorkflowSpyRunner {
+            events: Arc::new(Mutex::new(vec![vec![], vec![]])),
+            ..Default::default()
+        };
+        let app = RalphApp::new(project_dir, AppConfig::default(), runner.clone());
+        let mut delegate = TestDelegate::default();
+
+        let summary = app
+            .run_workflow("max-iterations", WorkflowRunInput::default(), &mut delegate)
+            .await?;
+
+        assert_eq!(summary.status, ralph_core::LastRunStatus::MaxIterations);
+        assert_eq!(runner.invocations.lock().unwrap().len(), 2);
         Ok(())
     }
 
@@ -2264,6 +2294,7 @@ prompts:
                         ..Default::default()
                     },
                     options: BTreeMap::from([("plans-dir".to_owned(), "docs/plans".to_owned())]),
+                    ..Default::default()
                 },
                 &mut delegate,
             )
@@ -2353,6 +2384,7 @@ prompts:
                         ..Default::default()
                     },
                     options: BTreeMap::from([("plans-dir".to_owned(), "docs/plans".to_owned())]),
+                    ..Default::default()
                 },
                 &mut delegate,
             )
@@ -2419,6 +2451,7 @@ prompts:
                         ..Default::default()
                     },
                     options: BTreeMap::from([("plans-dir".to_owned(), "docs/plans".to_owned())]),
+                    ..Default::default()
                 },
                 &mut delegate,
             )

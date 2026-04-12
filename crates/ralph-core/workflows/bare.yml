@@ -2,6 +2,7 @@ version: 1
 workflow_id: bare
 title: Bare
 description: Loop the supplied request verbatim with no extra workflow scaffolding.
+max_iterations: 10
 entrypoint: main
 request:
   runtime:

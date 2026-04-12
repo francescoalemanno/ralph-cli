@@ -248,7 +248,7 @@ Notes:
 
 - The default built-in agent is `opencode`.
 - On startup Ralph keeps the configured agent when it is available; otherwise it falls back to the first detected agent in priority order: `opencode`, `raijin`, then the remaining configured agents.
-- The default workflow iteration limit is `40`.
+- Workflow iteration limits live in each workflow YAML as `max_iterations`; the user-facing built-in workflows default to `40`, and `--max-iterations` overrides that per run.
 - Persisting a project agent writes `.ralph/config.toml` on demand.
 
 ## Inspecting And Editing Workflows

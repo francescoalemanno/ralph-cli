@@ -51,8 +51,6 @@ pub struct AppConfig {
     pub agent: Option<String>,
     #[serde(default = "builtin_agents")]
     pub agents: Vec<AgentConfig>,
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: usize,
     #[serde(default)]
     pub editor_override: Option<String>,
     #[serde(default)]
@@ -65,7 +63,6 @@ impl Default for AppConfig {
             default_agent: default_default_agent(),
             agent: None,
             agents: builtin_agents(),
-            max_iterations: default_max_iterations(),
             editor_override: None,
             theme: ThemeConfig::default(),
         }
@@ -256,8 +253,6 @@ struct PartialAppConfig {
     agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agents: Option<Vec<AgentConfig>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_iterations: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     editor_override: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -451,9 +446,6 @@ fn merge_config(mut base: AppConfig, partial: PartialAppConfig) -> AppConfig {
     if let Some(agents) = partial.agents {
         base.agents = agents;
     }
-    if let Some(max_iterations) = partial.max_iterations {
-        base.max_iterations = max_iterations;
-    }
     if let Some(editor_override) = partial.editor_override {
         base.editor_override = normalize_optional_string(editor_override);
     }
@@ -504,10 +496,6 @@ fn agent_priority_bucket(agent_id: &str) -> usize {
 
 fn default_default_agent() -> String {
     "opencode".to_owned()
-}
-
-fn default_max_iterations() -> usize {
-    40
 }
 
 fn default_accent_color() -> String {
@@ -613,6 +601,7 @@ mod tests {
         assert!(raw.contains("id = \"opencode\""));
         assert!(raw.contains("id = \"pi\""));
         assert!(raw.contains("id = \"raijin\""));
+        assert!(!raw.contains("max_iterations"));
     }
 
     #[test]
@@ -758,6 +747,12 @@ mod tests {
     fn canonical_global_config_dir_uses_dot_config() {
         let path = super::canonical_global_config_dir().unwrap();
         assert!(path.as_str().ends_with("/.config/ralph"));
+    }
+
+    #[test]
+    fn effective_config_omits_workflow_iteration_limit() {
+        let raw = AppConfig::default().effective_toml().unwrap();
+        assert!(!raw.contains("max_iterations"));
     }
 
     fn shell_agent(id: &str, name: &str) -> AgentConfig {

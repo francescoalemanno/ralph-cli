@@ -3,6 +3,7 @@ version: 1
 workflow_id: finalize
 title: Finalize
 description: "Run the best-effort finalize step as a standalone workflow: fetch, rebase onto the base ref, tidy commits, and rerun relevant checks."
+max_iterations: 40
 entrypoint: finalize
 options:
   plan-file:

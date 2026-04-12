@@ -3,6 +3,7 @@ workflow_id: test-workflow
 title: Test Workflow
 description: Internal end-to-end workflow for exercising Ralph loop control and event emission.
 hidden: true
+max_iterations: 14
 entrypoint: init
 prompts:
   init:
