@@ -19,8 +19,10 @@ Ralph starts in guided mode by default.
 \nthen can continue into `task` and `review`.
 \n`ralph --plan[=DESCRIPTION]` creates a plan interactively and stops after the plan file is written.
 \n`ralph -t <PLAN_FILE>` runs only the `task` workflow.
+\n`ralph -b [REQUEST]` runs only the `bare` workflow.
 \n`ralph -r [PLAN_FILE]` runs only the `review` workflow.
 \n`ralph -f [PLAN_FILE]` runs only the `finalize` workflow.
+\n`ralph --agents` lists configured agents and shows which ones are currently available.
 \
 \n\
 \nUse `ralph w <workflow-id> ...` when you want the lower-level workflow runner,\
@@ -38,9 +40,12 @@ const GUIDED_PLAN_HELP: &str =
     "Create a plan interactively and stop after the plan file is written.";
 const GUIDED_TASKS_ONLY_HELP: &str =
     "Execute the plan tasks only, then stop without running review or finalize.";
+const GUIDED_BARE_HELP: &str =
+    "Run the bare workflow only, sending the supplied request straight to the agent.";
 const GUIDED_REVIEW_HELP: &str = "Run the full review pipeline only, skipping task execution.";
 const GUIDED_FINALIZE_HELP: &str =
     "Run the finalize workflow only, skipping task execution and review.";
+const AGENTS_HELP: &str = "List configured agents and which ones are currently available";
 const WORKFLOWS_HELP: &str = "List available workflows";
 const SHOW_WORKFLOW_HELP: &str = "Print a workflow definition";
 const EDIT_WORKFLOW_HELP: &str = "Edit a workflow definition in your configured editor";
@@ -90,8 +95,10 @@ const BODY_ARG: &str = "body";
 const CHANNEL_ARG: &str = "channel";
 const PLAN_ARG: &str = "plan";
 const TASKS_ONLY_ARG: &str = "tasks_only";
+const BARE_ARG: &str = "bare";
 const REVIEW_ARG: &str = "review";
 const FINALIZE_ARG: &str = "finalize";
+const AGENTS_ARG: &str = "agents";
 const WORKFLOWS_ARG: &str = "workflows";
 const SHOW_WORKFLOW_ARG: &str = "show_workflow";
 const EDIT_WORKFLOW_ARG: &str = "edit_workflow";
@@ -196,8 +203,10 @@ impl Cli {
 
         let has_plan = arg_present(matches, PLAN_ARG);
         let has_tasks_only = arg_present(matches, TASKS_ONLY_ARG);
+        let has_bare = arg_present(matches, BARE_ARG);
         let has_review = arg_present(matches, REVIEW_ARG);
         let has_finalize = arg_present(matches, FINALIZE_ARG);
+        let has_agents = arg_present(matches, AGENTS_ARG);
         let has_workflows = arg_present(matches, WORKFLOWS_ARG);
         let has_show_workflow = arg_present(matches, SHOW_WORKFLOW_ARG);
         let has_edit_workflow = arg_present(matches, EDIT_WORKFLOW_ARG);
@@ -210,11 +219,17 @@ impl Cli {
         if has_tasks_only {
             primary_actions.push("--tasks-only");
         }
+        if has_bare {
+            primary_actions.push("--bare");
+        }
         if has_review {
             primary_actions.push("--review");
         }
         if has_finalize {
             primary_actions.push("--finalize");
+        }
+        if has_agents {
+            primary_actions.push("--agents");
         }
         if has_workflows {
             primary_actions.push("--workflows");
@@ -288,6 +303,10 @@ impl Cli {
                     plan_file: required_string_result(matches, TASKS_ONLY_ARG)?,
                 }))
             }
+            None if has_bare => Some(Commands::Bare(RequestShortcutArgs {
+                runtime,
+                request_args: parse_root_request_args(matches, false, false)?,
+            })),
             None if has_review => {
                 ensure_request_file_absent(matches, "--review")?;
                 ensure_guided_request_absent(matches, "--review")?;
@@ -303,6 +322,12 @@ impl Cli {
                     runtime,
                     plan_file: normalize_optional_value(matches.get_one::<String>(FINALIZE_ARG)),
                 }))
+            }
+            None if has_agents => {
+                ensure_runtime_flags_absent(runtime_flags_present, "--agents")?;
+                ensure_request_file_absent(matches, "--agents")?;
+                ensure_guided_request_absent(matches, "--agents")?;
+                Some(Commands::Agents)
             }
             None if has_workflows => {
                 ensure_runtime_flags_absent(runtime_flags_present, "--workflows")?;
@@ -378,8 +403,10 @@ pub(crate) fn render_workflow_help(workflow_id: &str) -> Result<String> {
 pub(crate) enum Commands {
     Guided(GuidedArgs),
     TasksOnly(PlanShortcutArgs),
+    Bare(RequestShortcutArgs),
     ReviewOnly(OptionalPlanShortcutArgs),
     FinalizeOnly(OptionalPlanShortcutArgs),
+    Agents,
     Workflow(RunArgs),
     Workflows,
     ShowWorkflow(ShowArgs),
@@ -407,6 +434,12 @@ pub(crate) struct PlanShortcutArgs {
 pub(crate) struct OptionalPlanShortcutArgs {
     pub(crate) runtime: RuntimeArgs,
     pub(crate) plan_file: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RequestShortcutArgs {
+    pub(crate) runtime: RuntimeArgs,
+    pub(crate) request_args: RequestArgs,
 }
 
 #[derive(Debug, Clone)]
@@ -553,7 +586,7 @@ fn build_cli_command_with_internal_commands(
                 .num_args(0..=1)
                 .require_equals(true)
                 .default_missing_value("")
-                .conflicts_with_all([TASKS_ONLY_ARG, REVIEW_ARG, FINALIZE_ARG])
+                .conflicts_with_all([TASKS_ONLY_ARG, BARE_ARG, REVIEW_ARG, FINALIZE_ARG])
                 .help(GUIDED_PLAN_HELP),
         )
         .arg(
@@ -562,8 +595,16 @@ fn build_cli_command_with_internal_commands(
                 .long("tasks-only")
                 .value_name("PLAN_FILE")
                 .action(ArgAction::Set)
-                .conflicts_with_all([PLAN_ARG, REVIEW_ARG, FINALIZE_ARG])
+                .conflicts_with_all([PLAN_ARG, BARE_ARG, REVIEW_ARG, FINALIZE_ARG])
                 .help(GUIDED_TASKS_ONLY_HELP),
+        )
+        .arg(
+            Arg::new(BARE_ARG)
+                .short('b')
+                .long("bare")
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all([PLAN_ARG, TASKS_ONLY_ARG, REVIEW_ARG, FINALIZE_ARG])
+                .help(GUIDED_BARE_HELP),
         )
         .arg(
             Arg::new(REVIEW_ARG)
@@ -572,7 +613,7 @@ fn build_cli_command_with_internal_commands(
                 .value_name("PLAN_FILE")
                 .num_args(0..=1)
                 .default_missing_value("")
-                .conflicts_with_all([PLAN_ARG, TASKS_ONLY_ARG, FINALIZE_ARG])
+                .conflicts_with_all([PLAN_ARG, TASKS_ONLY_ARG, BARE_ARG, FINALIZE_ARG])
                 .help(GUIDED_REVIEW_HELP),
         )
         .arg(
@@ -582,8 +623,14 @@ fn build_cli_command_with_internal_commands(
                 .value_name("PLAN_FILE")
                 .num_args(0..=1)
                 .default_missing_value("")
-                .conflicts_with_all([PLAN_ARG, TASKS_ONLY_ARG, REVIEW_ARG])
+                .conflicts_with_all([PLAN_ARG, TASKS_ONLY_ARG, BARE_ARG, REVIEW_ARG])
                 .help(GUIDED_FINALIZE_HELP),
+        )
+        .arg(
+            Arg::new(AGENTS_ARG)
+                .long("agents")
+                .action(ArgAction::SetTrue)
+                .help(AGENTS_HELP),
         )
         .arg(
             Arg::new(WORKFLOWS_ARG)
@@ -837,10 +884,10 @@ fn parse_show_config_args(matches: &ArgMatches) -> Result<ConfigShowArgs> {
     })
 }
 
-fn parse_guided_request_args(
+fn parse_root_request_args(
     matches: &ArgMatches,
     planning_flag_mode: bool,
-    internal_event_commands_enabled: bool,
+    reserve_internal_event_commands: bool,
 ) -> Result<RequestArgs> {
     let guided_request = matches
         .get_many::<String>(GUIDED_REQUEST_ARG)
@@ -853,7 +900,7 @@ fn parse_guided_request_args(
             "--plan=<DESCRIPTION> cannot be combined with positional request text"
         ));
     }
-    if !internal_event_commands_enabled
+    if reserve_internal_event_commands
         && guided_request
             .first()
             .is_some_and(|value| INTERNAL_EVENT_COMMAND_NAMES.contains(&value.as_str()))
@@ -871,6 +918,18 @@ fn parse_guided_request_args(
             None => guided_request,
         },
     })
+}
+
+fn parse_guided_request_args(
+    matches: &ArgMatches,
+    planning_flag_mode: bool,
+    internal_event_commands_enabled: bool,
+) -> Result<RequestArgs> {
+    parse_root_request_args(
+        matches,
+        planning_flag_mode,
+        !internal_event_commands_enabled,
+    )
 }
 
 fn required_string_result(matches: &ArgMatches, id: &str) -> Result<String> {
@@ -1072,6 +1131,22 @@ mod tests {
     }
 
     #[test]
+    fn bare_flag_routes_request_text_to_the_bare_workflow() {
+        with_test_workflow_home(|| {
+            let cli = Cli::try_parse_from(["ralph", "-b", "get", "handoff"]).unwrap();
+
+            let Some(Commands::Bare(args)) = cli.command else {
+                panic!("expected bare command");
+            };
+            assert_eq!(
+                args.request_args.argv_text().as_deref(),
+                Some("get handoff")
+            );
+            assert!(args.request_args.request_file.is_none());
+        });
+    }
+
+    #[test]
     fn review_and_finalize_flags_accept_optional_plan_file() {
         with_test_workflow_home(|| {
             let review = Cli::try_parse_from(["ralph", "-r"]).unwrap();
@@ -1097,6 +1172,17 @@ mod tests {
                 panic!("expected finalize-only command");
             };
             assert_eq!(args.plan_file.as_deref(), Some("PLAN.md"));
+        });
+    }
+
+    #[test]
+    fn agents_flag_parses_as_a_primary_action() {
+        with_test_workflow_home(|| {
+            let cli = Cli::try_parse_from(["ralph", "--agents"]).unwrap();
+
+            let Some(Commands::Agents) = cli.command else {
+                panic!("expected agents command");
+            };
         });
     }
 
@@ -1242,6 +1328,7 @@ mod tests {
     fn non_runnable_actions_reject_runtime_overrides() {
         with_test_workflow_home(|| {
             assert!(Cli::try_parse_from(["ralph", "--agent", "claude", "--workflows"]).is_err());
+            assert!(Cli::try_parse_from(["ralph", "--idle-timeout", "3m", "--agents"]).is_err());
             assert!(
                 Cli::try_parse_from([
                     "ralph",
@@ -1267,6 +1354,14 @@ mod tests {
                 error
                     .to_string()
                     .contains("--workflows does not accept positional request text")
+            );
+
+            let error = Cli::try_parse_from(["ralph", "--agents", "ship auth"]).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidValue);
+            assert!(
+                error
+                    .to_string()
+                    .contains("--agents does not accept positional request text")
             );
         });
     }

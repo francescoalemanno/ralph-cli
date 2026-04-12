@@ -3,8 +3,8 @@ use std::fs;
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 use ralph_core::{
-    TerminalTheme, ThemeConfig, WorkflowDefinition, WorkflowRunSummary, WorkflowSummary,
-    format_timeout_duration,
+    AgentConfig, TerminalTheme, ThemeConfig, WorkflowDefinition, WorkflowRunSummary,
+    WorkflowSummary, format_timeout_duration,
 };
 
 pub(crate) struct CliRunHeader {
@@ -82,6 +82,23 @@ pub(crate) fn print_workflow_list(workflows: Vec<WorkflowSummary>) {
             .join("\n")
     };
     println!("{text}");
+}
+
+pub(crate) fn print_agent_list(
+    configured_agent_id: &str,
+    effective_agent_id: &str,
+    all_agents: &[AgentConfig],
+    available_agents: &[&AgentConfig],
+) {
+    println!(
+        "{}",
+        render_agent_list(
+            configured_agent_id,
+            effective_agent_id,
+            all_agents,
+            available_agents
+        )
+    );
 }
 
 pub(crate) fn print_workflow_definition(workflow: &WorkflowDefinition) -> Result<()> {
@@ -223,10 +240,85 @@ fn preview_text(text: &str, max_lines: usize) -> Vec<String> {
     preview
 }
 
+fn render_agent_list(
+    configured_agent_id: &str,
+    effective_agent_id: &str,
+    all_agents: &[AgentConfig],
+    available_agents: &[&AgentConfig],
+) -> String {
+    let visible_agents = all_agents
+        .iter()
+        .filter(|agent| !agent.hidden)
+        .collect::<Vec<_>>();
+
+    let configured = format_agent_identity(
+        configured_agent_id,
+        all_agents
+            .iter()
+            .find(|agent| agent.id == configured_agent_id),
+    );
+    let effective = format_agent_identity(
+        effective_agent_id,
+        all_agents
+            .iter()
+            .find(|agent| agent.id == effective_agent_id),
+    );
+
+    let mut lines = vec![
+        format!("configured  {configured}"),
+        format!("effective    {effective}"),
+        String::new(),
+        "available".to_owned(),
+    ];
+
+    if available_agents.is_empty() {
+        lines.push("<none>".to_owned());
+    } else {
+        lines.extend(
+            available_agents
+                .iter()
+                .map(|agent| format_agent_identity(&agent.id, Some(agent))),
+        );
+    }
+
+    lines.push(String::new());
+    lines.push("configured registry".to_owned());
+    if visible_agents.is_empty() {
+        lines.push("<none>".to_owned());
+    } else {
+        lines.extend(visible_agents.into_iter().map(|agent| {
+            let mut markers = vec![if agent.is_available() {
+                "available".to_owned()
+            } else {
+                "unavailable".to_owned()
+            }];
+            if agent.id == configured_agent_id {
+                markers.push("configured".to_owned());
+            }
+            if agent.id == effective_agent_id {
+                markers.push("effective".to_owned());
+            }
+            format!(
+                "{} [{}]",
+                format_agent_identity(&agent.id, Some(agent)),
+                markers.join(", ")
+            )
+        }));
+    }
+
+    lines.join("\n")
+}
+
+fn format_agent_identity(agent_id: &str, agent: Option<&AgentConfig>) -> String {
+    agent
+        .map(|agent| format!("{} ({})", agent.id, agent.name))
+        .unwrap_or_else(|| agent_id.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{CliRunHeader, render_run_header};
-    use ralph_core::ThemeConfig;
+    use super::{CliRunHeader, render_agent_list, render_run_header};
+    use ralph_core::{AgentConfig, CommandMode, PromptInput, RunnerConfig, ThemeConfig};
 
     fn strip_ansi(input: &str) -> String {
         let mut stripped = String::new();
@@ -276,5 +368,55 @@ mod tests {
         assert!(rendered.contains("  three"));
         assert!(rendered.contains("  ... (+1 more line)"));
         assert!(!rendered.contains("  four"));
+    }
+
+    #[test]
+    fn render_agent_list_marks_availability_and_effective_fallback() {
+        let missing = AgentConfig {
+            id: "missing".to_owned(),
+            name: "Missing".to_owned(),
+            builtin: false,
+            hidden: false,
+            runner: RunnerConfig {
+                mode: CommandMode::Exec,
+                program: Some("/definitely/missing".to_owned()),
+                args: Vec::new(),
+                command: None,
+                prompt_input: PromptInput::Stdin,
+                prompt_env_var: "PROMPT".to_owned(),
+                env: Default::default(),
+                session_timeout_secs: None,
+                idle_timeout_secs: None,
+            },
+        };
+        let working = AgentConfig {
+            id: "working".to_owned(),
+            name: "Working".to_owned(),
+            builtin: false,
+            hidden: false,
+            runner: RunnerConfig {
+                mode: CommandMode::Shell,
+                program: None,
+                args: Vec::new(),
+                command: Some("echo hi".to_owned()),
+                prompt_input: PromptInput::Argv,
+                prompt_env_var: "PROMPT".to_owned(),
+                env: Default::default(),
+                session_timeout_secs: None,
+                idle_timeout_secs: None,
+            },
+        };
+        let rendered = render_agent_list(
+            "missing",
+            "working",
+            &[missing.clone(), working.clone()],
+            &[&working],
+        );
+
+        assert!(rendered.contains("configured  missing (Missing)"));
+        assert!(rendered.contains("effective    working (Working)"));
+        assert!(rendered.contains("available\nworking (Working)"));
+        assert!(rendered.contains("missing (Missing) [unavailable, configured]"));
+        assert!(rendered.contains("working (Working) [available, effective]"));
     }
 }

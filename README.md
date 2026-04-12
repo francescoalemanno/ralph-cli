@@ -71,6 +71,7 @@ Start with:
 
 ```bash
 ralph --workflows
+ralph --agents
 ralph --show-config
 ```
 
@@ -120,6 +121,7 @@ Guided behavior:
 - `ralph` accepts the planning request from argv text, root `--file <FILE>`, piped stdin, or an interactive prompt, then runs `plan` and can continue into `task` then `review`.
 - `ralph --plan[=DESCRIPTION]` runs the same planning flow and stops after the plan file is written. The request may come from `--plan=...`, root `--file <FILE>`, piped stdin, or the interactive prompt.
 - `ralph -t <PLAN_FILE>` runs only `task`.
+- `ralph --agents` lists the configured agents, the current effective agent, and which visible agents are currently available.
 - `ralph -r [PLAN_FILE]` runs only `review`. If you omit `PLAN_FILE`, Ralph first reuses the latest accepted plan from `ralph --plan`; if none can be found, it still runs by injecting the sentinel plan value `"<unavailable, ignore>"`.
 - `ralph -f [PLAN_FILE]` runs only `finalize`. If you omit `PLAN_FILE`, Ralph first reuses the latest accepted plan from `ralph --plan`; if none can be found, it still runs by injecting the sentinel plan value `"<unavailable, ignore>"`.
 
@@ -209,6 +211,7 @@ ralph --workflows
 ralph --help
 ralph w --help
 ralph w dbv --help
+ralph --agents
 ralph --workflows
 ralph --show-workflow dbv
 ralph --edit-workflow dbv
@@ -239,6 +242,7 @@ Set `RALPH_CONFIG_HOME` if you want Ralph's user config and workflow registry so
 Show config:
 
 ```bash
+ralph --agents
 ralph --show-config=user
 ralph --show-config=project
 ralph --show-config=effective

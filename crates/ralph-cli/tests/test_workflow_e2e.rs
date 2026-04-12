@@ -108,6 +108,76 @@ fn hidden_test_workflow_runs_end_to_end_via_the_cli_binary() {
 }
 
 #[test]
+fn agents_flag_lists_configured_and_available_agents() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("project");
+    let config_home = temp.path().join("config-home");
+    let home_dir = temp.path().join("home");
+    fs::create_dir_all(project_dir.join(".ralph")).unwrap();
+    fs::create_dir_all(&config_home).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    let missing_program = temp.path().join("missing-agent");
+    fs::write(
+        project_dir.join(".ralph/config.toml"),
+        format!(
+            r#"
+default_agent = "missing"
+agent = "missing"
+
+[[agents]]
+id = "missing"
+name = "Missing"
+builtin = false
+hidden = false
+
+[agents.runner]
+mode = "exec"
+program = "{}"
+args = []
+prompt_input = "stdin"
+prompt_env_var = "PROMPT"
+
+[[agents]]
+id = "working"
+name = "Working"
+builtin = false
+hidden = false
+
+[agents.runner]
+mode = "shell"
+command = "echo hi"
+prompt_input = "argv"
+prompt_env_var = "PROMPT"
+"#,
+            missing_program.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ralph"))
+        .arg("--project-dir")
+        .arg(&project_dir)
+        .arg("--agents")
+        .env("HOME", &home_dir)
+        .env("RALPH_CONFIG_HOME", &config_home)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\n\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("configured  missing (Missing)"));
+    assert!(stdout.contains("effective    working (Working)"));
+    assert!(stdout.contains("available\nworking (Working)"));
+    assert!(stdout.contains("missing (Missing) [unavailable, configured]"));
+    assert!(stdout.contains("working (Working) [available, effective]"));
+}
+
+#[test]
 fn cli_max_iterations_overrides_workflow_default() {
     let temp = tempfile::tempdir().unwrap();
     let project_dir = temp.path().join("project");
@@ -197,6 +267,53 @@ fn bare_workflow_accepts_piped_stdin_requests() {
     assert_eq!(
         fs::read_to_string(run_dir.join("request.txt")).unwrap(),
         "printf stdin-request\n\"$RALPH_BIN\" payload 'loop-stop:ok' 'done'\n"
+    );
+}
+
+#[test]
+fn bare_shortcut_routes_argv_requests_to_the_bare_workflow() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("project");
+    let config_home = temp.path().join("config-home");
+    let home_dir = temp.path().join("home");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::create_dir_all(&config_home).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    let request = "printf argv-shortcut\n\"$RALPH_BIN\" payload 'loop-stop:ok' 'done'\n";
+    let output = Command::new(env!("CARGO_BIN_EXE_ralph"))
+        .arg("--project-dir")
+        .arg(&project_dir)
+        .arg("--agent")
+        .arg("__test_shell")
+        .arg("-b")
+        .arg(request)
+        .env("HOME", &home_dir)
+        .env("RALPH_CONFIG_HOME", &config_home)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\n\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("bare (Bare)"));
+    assert!(stdout.contains("argv-shortcut"));
+    assert!(stdout.contains("workflow bare [completed] prompt=main"));
+
+    let run_root = project_dir.join(".ralph").join("runs").join("bare");
+    let mut run_dirs = fs::read_dir(&run_root)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(run_dirs.len(), 1);
+    let run_dir = run_dirs.pop().unwrap();
+    assert_eq!(
+        fs::read_to_string(run_dir.join("request.txt")).unwrap(),
+        request
     );
 }
 

@@ -11,12 +11,12 @@ use std::{
 use crate::{
     cli::{
         Cli, Commands, ConfigMutationArgs, ConfigShowArgs, ConfigViewArg, EditArgs, GetArgs,
-        GuidedArgs, PayloadArgs, PlanShortcutArgs, RequestArgs, RunArgs, RuntimeArgs, ShowArgs,
-        SignalArgs, render_workflow_help,
+        GuidedArgs, PayloadArgs, PlanShortcutArgs, RequestArgs, RequestShortcutArgs, RunArgs,
+        RuntimeArgs, ShowArgs, SignalArgs, render_workflow_help,
     },
     output::{
-        CliRunHeader, print_run_header, print_workflow_definition, print_workflow_list,
-        print_workflow_run,
+        CliRunHeader, print_agent_list, print_run_header, print_workflow_definition,
+        print_workflow_list, print_workflow_run,
     },
 };
 use anyhow::{Context, Result, anyhow};
@@ -60,8 +60,10 @@ async fn run_command(project_dir: Utf8PathBuf, command: Commands) -> Result<()> 
     match command {
         Commands::Guided(args) => run_guided_command(project_dir, args).await,
         Commands::TasksOnly(args) => run_tasks_only(project_dir, args).await,
+        Commands::Bare(args) => run_bare_command(project_dir, args).await,
         Commands::ReviewOnly(args) => run_review_only(project_dir, args).await,
         Commands::FinalizeOnly(args) => run_finalize_only(project_dir, args).await,
+        Commands::Agents => run_agents(project_dir),
         Commands::Workflow(args) => run_workflow_command(project_dir, args).await,
         Commands::Signal(args) => run_signal(args),
         Commands::Payload(args) => run_payload(args),
@@ -119,6 +121,21 @@ async fn run_tasks_only(project_dir: Utf8PathBuf, args: PlanShortcutArgs) -> Res
     run_special_workflow(project_dir, &args.runtime, "task", Some(args.plan_file))
         .await
         .map(|_| ())
+}
+
+async fn run_bare_command(project_dir: Utf8PathBuf, args: RequestShortcutArgs) -> Result<()> {
+    run_workflow_with_input(
+        project_dir,
+        &args.runtime,
+        "bare",
+        WorkflowRunInput {
+            request: resolve_cli_request_input(&args.request_args, None)?,
+            ..Default::default()
+        },
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| maybe_with_run_help("bare", error))
 }
 
 async fn run_review_only(
@@ -297,6 +314,17 @@ fn run_show_config(project_dir: Utf8PathBuf, args: ConfigShowArgs) -> Result<()>
         ConfigViewArg::Effective => app.config().effective_toml()?,
     };
     println!("{raw}");
+    Ok(())
+}
+
+fn run_agents(project_dir: Utf8PathBuf) -> Result<()> {
+    let app = RalphApp::load(project_dir)?;
+    print_agent_list(
+        app.config().configured_agent_id(),
+        app.agent_id(),
+        app.all_agents(),
+        &app.available_agents(),
+    );
     Ok(())
 }
 
@@ -556,7 +584,7 @@ fn resolve_cli_request_input_with_stdin(
 ) -> Result<WorkflowRequestInput> {
     let mut request_input = WorkflowRequestInput {
         argv: request_args.argv_text(),
-        stdin: piped_stdin,
+        stdin: piped_stdin.filter(|stdin| !stdin.is_empty()),
         request_file: request_args.request_file.clone(),
     };
 
@@ -934,6 +962,22 @@ mod tests {
             },
             None,
             None,
+        )
+        .unwrap();
+
+        assert_eq!(input.argv.as_deref(), Some("ship auth"));
+        assert!(input.stdin.is_none());
+    }
+
+    #[test]
+    fn request_resolution_ignores_empty_piped_stdin() {
+        let input = resolve_cli_request_input_with_stdin(
+            &RequestArgs {
+                request: vec!["ship auth".to_owned()],
+                ..Default::default()
+            },
+            None,
+            Some(String::new()),
         )
         .unwrap();
 
