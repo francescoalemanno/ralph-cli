@@ -21,7 +21,6 @@ camino.workspace = true
 clap.workspace = true
 ralph-app = { version = "0.4.4", path = "../ralph-app" }
 ralph-core = { version = "0.4.4", path = "../ralph-core" }
-ralph-tui = { version = "0.4.4", path = "../ralph-tui" }
 serde.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true
