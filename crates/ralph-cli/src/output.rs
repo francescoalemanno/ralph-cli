@@ -1,25 +1,11 @@
-use std::{
-    env, fs,
-    io::{self, IsTerminal},
-};
+use std::fs;
 
 use anyhow::{Context, Result};
 use camino::Utf8Path;
 use ralph_core::{
-    AgentConfig, LastRunStatus, ThemeColor, ThemeConfig, WorkflowDefinition, WorkflowRunSummary,
-    WorkflowSummary,
+    TerminalTheme, ThemeConfig, WorkflowDefinition, WorkflowRunSummary, WorkflowSummary,
+    format_timeout_duration,
 };
-
-pub(crate) struct AgentListRow {
-    pub(crate) agent: String,
-    pub(crate) detected: bool,
-    pub(crate) command: String,
-}
-
-pub(crate) struct AgentCurrentRow {
-    pub(crate) effective_agent: String,
-    pub(crate) project_dir: String,
-}
 
 pub(crate) struct CliRunHeader {
     pub(crate) version: &'static str,
@@ -39,27 +25,6 @@ pub(crate) struct CliRunHeader {
     pub(crate) artifact_root: String,
 }
 
-pub(crate) fn print_agent_list(rows: &[AgentListRow]) {
-    let text = rows
-        .iter()
-        .map(|row| {
-            format!(
-                "{:<9} detected={} command={}",
-                row.agent, row.detected, row.command
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    println!("{text}");
-}
-
-pub(crate) fn print_agent_current(row: &AgentCurrentRow) {
-    println!(
-        "effective_agent={}\nproject_dir={}",
-        row.effective_agent, row.project_dir
-    );
-}
-
 pub(crate) fn print_bare_file(path: &Utf8Path) -> Result<()> {
     let contents = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
     println!("{contents}");
@@ -67,7 +32,7 @@ pub(crate) fn print_bare_file(path: &Utf8Path) -> Result<()> {
 }
 
 pub(crate) fn print_workflow_run(theme_config: &ThemeConfig, summary: &WorkflowRunSummary) {
-    let theme = CliTheme::new(theme_config);
+    let theme = TerminalTheme::new(theme_config);
     let title = " Run Result ";
     let width = title.len().max(72);
     println!(
@@ -127,26 +92,14 @@ pub(crate) fn print_workflow_definition(workflow: &WorkflowDefinition) -> Result
     Ok(())
 }
 
-pub(crate) fn agent_list_rows(agents: &[AgentConfig]) -> Vec<AgentListRow> {
-    agents
-        .iter()
-        .filter(|agent| !agent.hidden)
-        .map(|agent| AgentListRow {
-            agent: format!("{} ({})", agent.name, agent.id),
-            detected: agent.is_available(),
-            command: agent.runner.command_preview(),
-        })
-        .collect()
-}
-
 fn render_run_header(theme_config: &ThemeConfig, header: &CliRunHeader) -> String {
-    let theme = CliTheme::new(theme_config);
-    let title = format!(" RALPH v{} | CLI RUN ", header.version);
+    let theme = TerminalTheme::new(theme_config);
+    let title = format!(" RALPH v{} | RUN ", header.version);
     let width = title.len().max(72);
     let mut lines = vec![
         theme
             .style()
-            .fg(theme.palette.accent)
+            .fg(theme.palette().accent)
             .bold()
             .paint(format!("{title:=^width$}", width = width)),
     ];
@@ -225,89 +178,11 @@ fn render_run_header(theme_config: &ThemeConfig, header: &CliRunHeader) -> Strin
     lines.push(
         theme
             .style()
-            .fg(theme.palette.accent)
+            .fg(theme.palette().accent)
             .bold()
             .paint("=".repeat(width)),
     );
     lines.join("\n")
-}
-
-struct CliTheme {
-    colors_enabled: bool,
-    palette: ralph_core::ResolvedTheme,
-}
-
-impl CliTheme {
-    fn new(theme_config: &ThemeConfig) -> Self {
-        Self {
-            colors_enabled: io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none(),
-            palette: theme_config.resolve(),
-        }
-    }
-
-    fn style(&self) -> AnsiStyle {
-        AnsiStyle {
-            enabled: self.colors_enabled,
-            ..AnsiStyle::default()
-        }
-    }
-
-    fn label_style(&self) -> AnsiStyle {
-        self.style().fg(self.palette.subtle)
-    }
-
-    fn status_color(&self, status: LastRunStatus) -> ThemeColor {
-        match status {
-            LastRunStatus::NeverRun | LastRunStatus::Canceled => self.palette.accent,
-            LastRunStatus::Completed => self.palette.success,
-            LastRunStatus::MaxIterations => self.palette.warning,
-            LastRunStatus::Failed => self.palette.error,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct AnsiStyle {
-    enabled: bool,
-    fg: Option<ThemeColor>,
-    bold: bool,
-}
-
-impl AnsiStyle {
-    fn fg(mut self, color: ThemeColor) -> Self {
-        self.fg = Some(color);
-        self
-    }
-
-    fn bold(mut self) -> Self {
-        self.bold = true;
-        self
-    }
-
-    fn paint(self, text: impl Into<String>) -> String {
-        let text = text.into();
-        if !self.enabled {
-            return text;
-        }
-
-        let mut codes = Vec::new();
-        if self.bold {
-            codes.push(1u16);
-        }
-        if let Some(color) = self.fg {
-            codes.push(u16::from(color.ansi_fg_code()));
-        }
-        if codes.is_empty() {
-            return text;
-        }
-
-        let codes = codes
-            .into_iter()
-            .map(|code| code.to_string())
-            .collect::<Vec<_>>()
-            .join(";");
-        format!("\u{1b}[{codes}m{text}\u{1b}[0m")
-    }
 }
 
 fn format_limits_line(
@@ -331,16 +206,6 @@ fn format_limits_line(
     parts.join(" | ")
 }
 
-fn format_timeout_duration(total_seconds: u64) -> String {
-    if total_seconds.is_multiple_of(3600) {
-        return format!("{}h", total_seconds / 3600);
-    }
-    if total_seconds.is_multiple_of(60) {
-        return format!("{}m", total_seconds / 60);
-    }
-    format!("{}s", total_seconds)
-}
-
 fn preview_text(text: &str, max_lines: usize) -> Vec<String> {
     let lines = text.lines().map(str::to_owned).collect::<Vec<_>>();
     let mut preview = lines.iter().take(max_lines).cloned().collect::<Vec<_>>();
@@ -360,7 +225,7 @@ fn preview_text(text: &str, max_lines: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliRunHeader, agent_list_rows, render_run_header};
+    use super::{CliRunHeader, render_run_header};
     use ralph_core::ThemeConfig;
 
     fn strip_ansi(input: &str) -> String {
@@ -379,13 +244,6 @@ mod tests {
             stripped.push(ch);
         }
         stripped
-    }
-
-    #[test]
-    fn agent_list_rows_hide_internal_agents() {
-        let agents = ralph_core::builtin_agents();
-        let rows = agent_list_rows(&agents);
-        assert!(rows.iter().all(|row| !row.agent.contains("__test_shell")));
     }
 
     #[test]

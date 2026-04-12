@@ -12,6 +12,7 @@ options:
 request:
   runtime:
     argv: true
+    stdin: true
     file_flag: true
 prompts:
   plan:

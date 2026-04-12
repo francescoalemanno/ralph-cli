@@ -11,7 +11,7 @@ use ralph_core::{
 };
 use ralph_runner::CommandRunner;
 
-pub use console::ConsoleDelegate;
+pub use console::{ConsoleDelegate, edit_file, prompt_nonempty, prompt_yes_no};
 pub use workflow_run::{WorkflowRequestInput, WorkflowRunInput};
 
 #[derive(Debug)]
@@ -97,22 +97,6 @@ impl PlanningDraftDecisionKind {
 pub struct PlanningDraftDecision {
     pub kind: PlanningDraftDecisionKind,
     pub feedback: Option<String>,
-}
-
-pub fn format_iteration_banner(
-    prompt_name: &str,
-    iteration: usize,
-    max_iterations: usize,
-) -> String {
-    const ANSI_BOLD_CYAN: &str = "\x1b[1;36m";
-    const ANSI_RESET: &str = "\x1b[0m";
-
-    let title = format!(" {prompt_name} | iteration {iteration}/{max_iterations} ");
-    let width = title.len().max(72);
-    format!(
-        "{ANSI_BOLD_CYAN}{title:=^width$}{ANSI_RESET}",
-        width = width
-    )
 }
 
 #[async_trait]

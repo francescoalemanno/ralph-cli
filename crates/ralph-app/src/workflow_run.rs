@@ -1,21 +1,18 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::Component,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeMap, fs, path::Component, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
-    AgentEventRecord, LastRunStatus, LoopControlDecision, MAIN_CHANNEL_ID, NO_ROUTE_ERROR,
-    NO_ROUTE_OK, ParsedAgentEvent, RunControl, RunnerConfig, RunnerInvocation, WorkflowDefinition,
-    WorkflowParallelWorkerDefinition, WorkflowPromptDefinition, WorkflowRunSummary,
-    WorkflowRuntimeRequest, WorkflowTransitionGuard, WorkflowTransitionGuardFailure,
-    WorkflowTransitionGuardFailureAction, agent_events_wal_path, append_agent_event,
-    current_agent_events_offset, latest_agent_event_body_from_wal_in_channel, load_workflow,
-    read_agent_events_since, reduce_loop_control, validate_agent_event, workflow_option_flag,
+    AgentEventRecord, AnsiStyle, HOST_CHANNEL_ID, LastRunStatus, LoopControlDecision,
+    MAIN_CHANNEL_ID, NO_ROUTE_ERROR, NO_ROUTE_OK, PLANNING_ANSWER_EVENT, PLANNING_PLAN_FILE_EVENT,
+    PLANNING_PROGRESS_EVENT, PLANNING_QUESTION_EVENT, PLANNING_REVIEW_EVENT,
+    PLANNING_TARGET_PATH_EVENT, ParsedAgentEvent, RUNTIME_DIR_NAME, RunControl, RunnerConfig,
+    RunnerInvocation, TerminalTheme, WorkflowDefinition, WorkflowParallelWorkerDefinition,
+    WorkflowPromptDefinition, WorkflowRunSummary, WorkflowRuntimeRequest, WorkflowTransitionGuard,
+    WorkflowTransitionGuardFailure, WorkflowTransitionGuardFailureAction, agent_events_wal_path,
+    append_agent_event, current_agent_events_offset, current_unix_timestamp_ms,
+    latest_agent_event_body_from_wal_in_channel, load_workflow, read_agent_events_since,
+    reduce_loop_control, validate_agent_event, workflow_option_flag,
 };
 use ralph_runner::{RunnerAdapter, RunnerStreamEvent, format_event_notice};
 use tokio::{
@@ -29,14 +26,6 @@ use crate::{
     prompt::{interpolate_workflow_prompt, interpolate_workflow_value},
 };
 
-const HOST_CHANNEL_ID: &str = "host";
-const PLANNING_QUESTION_EVENT: &str = "planning-question";
-const PLANNING_ANSWER_EVENT: &str = "planning-answer";
-const PLANNING_REVIEW_EVENT: &str = "planning-review";
-const PLANNING_PROGRESS_EVENT: &str = "planning-progress";
-const PLANNING_PLAN_FILE_EVENT: &str = "planning-plan-file";
-const PLANNING_TARGET_PATH_EVENT: &str = "planning-target-path";
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkflowRequestInput {
     pub argv: Option<String>,
@@ -44,11 +33,24 @@ pub struct WorkflowRequestInput {
     pub request_file: Option<Utf8PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowRequestSource {
+    Argv(String),
+    Stdin(String),
+    File(Utf8PathBuf),
+}
+
 impl WorkflowRequestInput {
-    fn provided_source_count(&self) -> usize {
-        usize::from(self.argv.is_some())
-            + usize::from(self.stdin.is_some())
-            + usize::from(self.request_file.is_some())
+    pub fn into_source(self) -> Result<Option<WorkflowRequestSource>> {
+        match (self.argv, self.stdin, self.request_file) {
+            (Some(argv), None, None) => Ok(Some(WorkflowRequestSource::Argv(argv))),
+            (None, Some(stdin), None) => Ok(Some(WorkflowRequestSource::Stdin(stdin))),
+            (None, None, Some(path)) => Ok(Some(WorkflowRequestSource::File(path))),
+            (None, None, None) => Ok(None),
+            _ => Err(anyhow!(
+                "provide the workflow request in exactly one runtime form: argv, stdin, or --file"
+            )),
+        }
     }
 }
 
@@ -85,6 +87,71 @@ impl<R> RalphApp<R>
 where
     R: RunnerAdapter + Clone + 'static,
 {
+    fn event_notice_style(&self) -> AnsiStyle {
+        let theme = TerminalTheme::new(&self.config.theme);
+        theme.style().fg(theme.palette().accent).bold()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_host_payloads<D>(
+        &self,
+        run_id: &str,
+        run_dir: &Utf8Path,
+        workflow_path: &Utf8Path,
+        prompt_id: &str,
+        payloads: &[(&str, String)],
+        wal_write_lock: Arc<AsyncMutex<()>>,
+        delegate: &mut D,
+    ) -> Result<()>
+    where
+        D: RunDelegate,
+    {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+
+        let guard = wal_write_lock.lock().await;
+        for (event, body) in payloads {
+            append_agent_event(
+                run_dir,
+                &AgentEventRecord {
+                    v: 1,
+                    ts_unix_ms: current_unix_timestamp_ms(),
+                    run_id: run_id.to_owned(),
+                    channel_id: HOST_CHANNEL_ID.to_owned(),
+                    event: (*event).to_owned(),
+                    body: body.clone(),
+                    project_dir: self.project_dir.clone(),
+                    run_dir: run_dir.to_path_buf(),
+                    prompt_path: workflow_path.to_path_buf(),
+                    prompt_name: prompt_id.to_owned(),
+                    pid: 0,
+                },
+            )?;
+        }
+        drop(guard);
+
+        for (event, body) in payloads {
+            let notice_body = if *event == PLANNING_PROGRESS_EVENT {
+                "updated".to_owned()
+            } else {
+                body.clone()
+            };
+            delegate
+                .on_event(RunEvent::Output(format_event_notice(
+                    Some(HOST_CHANNEL_ID),
+                    &ParsedAgentEvent {
+                        event: (*event).to_owned(),
+                        body: notice_body,
+                    },
+                    self.event_notice_style(),
+                )))
+                .await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn run_workflow<D>(
         &self,
         workflow_id: &str,
@@ -543,9 +610,8 @@ where
             let question = parse_planning_question(question_body)?;
             let answer = delegate.answer_planning_question(&question).await?;
             let progress_after = append_question_progress(&progress_before, &question, &answer);
-            append_host_payloads(
+            self.append_host_payloads(
                 run_id,
-                &self.project_dir,
                 run_dir,
                 workflow_path,
                 prompt_id,
@@ -579,9 +645,8 @@ where
 
         match decision.kind {
             PlanningDraftDecisionKind::Accept => {
-                append_host_payloads(
+                self.append_host_payloads(
                     run_id,
-                    &self.project_dir,
                     run_dir,
                     workflow_path,
                     prompt_id,
@@ -606,9 +671,8 @@ where
                 ))))
             }
             PlanningDraftDecisionKind::Revise => {
-                append_host_payloads(
+                self.append_host_payloads(
                     run_id,
-                    &self.project_dir,
                     run_dir,
                     workflow_path,
                     prompt_id,
@@ -626,9 +690,8 @@ where
                 Ok(Some(NextStep::Continue))
             }
             PlanningDraftDecisionKind::Reject => {
-                append_host_payloads(
+                self.append_host_payloads(
                     run_id,
-                    &self.project_dir,
                     run_dir,
                     workflow_path,
                     prompt_id,
@@ -711,6 +774,7 @@ where
             let worker_wal_write_lock = wal_write_lock.clone();
             let output_log_path = parallel_output_log_path(run_dir, channel_id);
             let worker_label = label.clone();
+            let event_notice_style = self.event_notice_style();
             join_set.spawn(async move {
                 execute_parallel_worker(
                     worker_runner,
@@ -720,6 +784,7 @@ where
                     worker_wal_write_lock,
                     worker_ui_tx,
                     worker_label,
+                    event_notice_style,
                     output_log_path,
                 )
                 .await
@@ -841,15 +906,10 @@ where
             }
             return Ok(None);
         };
-
-        if request_input.provided_source_count() > 1 {
-            return Err(anyhow!(
-                "provide the workflow request in exactly one runtime form: argv, stdin, or --request-file"
-            ));
-        }
+        let request_source = request_input.into_source()?;
 
         if let Some(runtime) = &request.runtime {
-            return self.resolve_runtime_request(workflow, runtime, request_input);
+            return self.resolve_runtime_request(workflow, runtime, request_source);
         }
 
         if let Some(file) = &request.file {
@@ -870,48 +930,44 @@ where
         &self,
         workflow: &WorkflowDefinition,
         runtime: &WorkflowRuntimeRequest,
-        request_input: WorkflowRequestInput,
+        request_source: Option<WorkflowRequestSource>,
     ) -> Result<Option<String>> {
-        if request_input.argv.is_some() && !runtime.argv {
-            return Err(anyhow!(
-                "workflow '{}' does not accept argv requests",
-                workflow.workflow_id
-            ));
-        }
-        if request_input.stdin.is_some() && !runtime.stdin {
-            return Err(anyhow!(
-                "workflow '{}' does not accept stdin requests",
-                workflow.workflow_id
-            ));
-        }
-        if request_input.request_file.is_some() && !runtime.file_flag {
-            return Err(anyhow!(
-                "workflow '{}' does not accept --request-file",
-                workflow.workflow_id
-            ));
-        }
-
-        match (
-            request_input.argv,
-            request_input.stdin,
-            request_input.request_file,
-        ) {
-            (Some(argv), None, None) => Ok(Some(argv)),
-            (None, Some(stdin), None) => Ok(Some(stdin)),
-            (None, None, Some(path)) => {
+        match request_source {
+            Some(WorkflowRequestSource::Argv(argv)) => {
+                if !runtime.argv {
+                    return Err(anyhow!(
+                        "workflow '{}' does not accept argv requests",
+                        workflow.workflow_id
+                    ));
+                }
+                Ok(Some(argv))
+            }
+            Some(WorkflowRequestSource::Stdin(stdin)) => {
+                if !runtime.stdin {
+                    return Err(anyhow!(
+                        "workflow '{}' does not accept stdin requests",
+                        workflow.workflow_id
+                    ));
+                }
+                Ok(Some(stdin))
+            }
+            Some(WorkflowRequestSource::File(path)) => {
+                if !runtime.file_flag {
+                    return Err(anyhow!(
+                        "workflow '{}' does not accept --file",
+                        workflow.workflow_id
+                    ));
+                }
                 let path = self.resolve_project_relative_path(&path);
                 let contents = fs::read_to_string(path.as_std_path())
                     .with_context(|| format!("failed to read request file {}", path))?;
                 Ok(Some(contents))
             }
-            (None, None, None) if workflow.uses_request_token() => Err(anyhow!(
-                "workflow '{}' requires a request via argv, stdin, or --request-file",
+            None if workflow.uses_request_token() => Err(anyhow!(
+                "workflow '{}' requires a request via argv, stdin, or --file",
                 workflow.workflow_id
             )),
-            (None, None, None) => Ok(None),
-            _ => Err(anyhow!(
-                "provide the workflow request in exactly one runtime form: argv, stdin, or --request-file"
-            )),
+            None => Ok(None),
         }
     }
 
@@ -1267,65 +1323,6 @@ fn display_project_path(project_dir: &Utf8Path, path: &Utf8Path) -> String {
     path.strip_prefix(project_dir).unwrap_or(path).to_string()
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn append_host_payloads<D>(
-    run_id: &str,
-    project_dir: &Utf8Path,
-    run_dir: &Utf8Path,
-    workflow_path: &Utf8Path,
-    prompt_id: &str,
-    payloads: &[(&str, String)],
-    wal_write_lock: Arc<AsyncMutex<()>>,
-    delegate: &mut D,
-) -> Result<()>
-where
-    D: RunDelegate,
-{
-    if payloads.is_empty() {
-        return Ok(());
-    }
-
-    let guard = wal_write_lock.lock().await;
-    for (event, body) in payloads {
-        append_agent_event(
-            run_dir,
-            &AgentEventRecord {
-                v: 1,
-                ts_unix_ms: current_unix_timestamp_ms(),
-                run_id: run_id.to_owned(),
-                channel_id: HOST_CHANNEL_ID.to_owned(),
-                event: (*event).to_owned(),
-                body: body.clone(),
-                project_dir: project_dir.to_path_buf(),
-                run_dir: run_dir.to_path_buf(),
-                prompt_path: workflow_path.to_path_buf(),
-                prompt_name: prompt_id.to_owned(),
-                pid: 0,
-            },
-        )?;
-    }
-    drop(guard);
-
-    for (event, body) in payloads {
-        let notice_body = if *event == PLANNING_PROGRESS_EVENT {
-            "updated".to_owned()
-        } else {
-            body.clone()
-        };
-        delegate
-            .on_event(RunEvent::Output(format_event_notice(
-                Some(HOST_CHANNEL_ID),
-                &ParsedAgentEvent {
-                    event: (*event).to_owned(),
-                    body: notice_body,
-                },
-            )))
-            .await?;
-    }
-
-    Ok(())
-}
-
 async fn execute_runner<R, D>(
     runner: &R,
     config: &RunnerConfig,
@@ -1400,6 +1397,7 @@ async fn execute_parallel_worker<R>(
     wal_write_lock: Arc<AsyncMutex<()>>,
     ui_tx: tokio::sync::mpsc::UnboundedSender<ParallelWorkerUiEvent>,
     label: String,
+    event_notice_style: AnsiStyle,
     output_log_path: Utf8PathBuf,
 ) -> Result<ParallelWorkerOutcome>
 where
@@ -1445,7 +1443,11 @@ where
                             .await?;
                             for event in events {
                                 let _ = ui_tx.send(ParallelWorkerUiEvent::Output {
-                                    chunk: format_event_notice(Some(&channel_id), &event),
+                                    chunk: format_event_notice(
+                                        Some(&channel_id),
+                                        &event,
+                                        event_notice_style,
+                                    ),
                                 });
                             }
                         }
@@ -1485,7 +1487,11 @@ where
                             .await?;
                             for event in events {
                                 let _ = ui_tx.send(ParallelWorkerUiEvent::Output {
-                                    chunk: format_event_notice(Some(&channel_id), &event),
+                                    chunk: format_event_notice(
+                                        Some(&channel_id),
+                                        &event,
+                                        event_notice_style,
+                                    ),
                                 });
                             }
                         }
@@ -1540,13 +1546,6 @@ async fn persist_agent_events(
     Ok(())
 }
 
-fn current_unix_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 fn parallel_worker_label(channel_id: &str, worker: &WorkflowParallelWorkerDefinition) -> String {
     worker
         .title
@@ -1556,7 +1555,7 @@ fn parallel_worker_label(channel_id: &str, worker: &WorkflowParallelWorkerDefini
 
 fn parallel_output_log_path(run_dir: &Utf8Path, channel_id: &str) -> Utf8PathBuf {
     run_dir
-        .join(".ralph-runtime")
+        .join(RUNTIME_DIR_NAME)
         .join("channels")
         .join(channel_id)
         .join("output.log")
@@ -1608,11 +1607,7 @@ fn format_summary(prefix: &str, body: &str) -> String {
 }
 
 fn next_workflow_run_id() -> String {
-    let ts_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    format!("{}-{ts_unix_ms}", std::process::id())
+    format!("{}-{}", std::process::id(), current_unix_timestamp_ms())
 }
 
 #[cfg(test)]
@@ -2155,7 +2150,7 @@ prompts:
         let runner = WorkflowSpyRunner {
             events: Arc::new(Mutex::new(vec![
                 vec![(
-                    "planning-question".to_owned(),
+                    ralph_core::PLANNING_QUESTION_EVENT.to_owned(),
                     "Question: Which cache backend?\nOptions:\n- Redis\n- In-memory\nContext: Needed for the implementation plan".to_owned(),
                 )],
                 vec![("loop-stop:ok".to_owned(), "done".to_owned())],
@@ -2436,12 +2431,16 @@ prompts:
     }
 
     #[test]
-    fn request_input_counts_only_populated_sources() {
-        let input = WorkflowRequestInput {
+    fn request_input_rejects_multiple_sources() {
+        let error = WorkflowRequestInput {
             argv: Some("a".to_owned()),
             stdin: None,
             request_file: Some(Utf8PathBuf::from("b")),
-        };
-        assert_eq!(input.provided_source_count(), 2);
+        }
+        .into_source()
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("exactly one runtime form"));
     }
 }

@@ -2,6 +2,8 @@ mod agent;
 mod agent_events;
 mod atomic;
 mod config;
+mod protocol;
+mod terminal;
 mod theme;
 mod types;
 mod workflow;
@@ -19,6 +21,12 @@ pub use config::{
     ARTIFACT_DIR_NAME, AppConfig, ConfigFileScope, ScopedGlobalConfigDirOverride, ThemeConfig,
     global_config_dir, scoped_global_config_dir_override,
 };
+pub use protocol::{
+    HOST_CHANNEL_ID, PLANNING_ANSWER_EVENT, PLANNING_PLAN_FILE_EVENT, PLANNING_PROGRESS_EVENT,
+    PLANNING_QUESTION_EVENT, PLANNING_REVIEW_EVENT, PLANNING_TARGET_PATH_EVENT,
+    current_unix_timestamp_ms, format_timeout_duration,
+};
+pub use terminal::{AnsiStyle, TerminalTheme};
 pub use theme::{ResolvedTheme, ThemeColor, ThemeMode, ThemeVariant};
 pub use types::{LastRunStatus, RunControl, RunnerInvocation, RunnerResult, WorkflowRunSummary};
 pub use workflow::{

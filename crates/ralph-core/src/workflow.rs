@@ -1440,6 +1440,23 @@ prompts:
     }
 
     #[test]
+    fn plan_workflow_accepts_all_runtime_request_forms() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(temp.path().join("plan.yml")).unwrap();
+        let workflow =
+            load_workflow_from_path_for_test(&path, include_str!("../workflows/plan.yml")).unwrap();
+
+        let runtime = workflow
+            .request
+            .as_ref()
+            .and_then(|request| request.runtime.as_ref())
+            .expect("plan runtime request");
+        assert!(runtime.argv);
+        assert!(runtime.stdin);
+        assert!(runtime.file_flag);
+    }
+
+    #[test]
     fn plan_workflow_allows_question_on_revise_when_feedback_requests_missing_choices() {
         let temp = tempfile::tempdir().unwrap();
         let path = Utf8PathBuf::from_path_buf(temp.path().join("plan.yml")).unwrap();

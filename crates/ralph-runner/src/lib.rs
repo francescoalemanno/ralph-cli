@@ -4,8 +4,8 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use ralph_core::{
-    CommandMode, PromptInput, RunControl, RunnerConfig, RunnerInvocation, RunnerResult,
-    agent_events_wal_path,
+    AnsiStyle, CommandMode, PromptInput, RunControl, RunnerConfig, RunnerInvocation, RunnerResult,
+    agent_events_wal_path, format_timeout_duration,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -321,10 +321,8 @@ fn forward_output_chunk(
 pub fn format_event_notice(
     channel_id: Option<&str>,
     event: &ralph_core::ParsedAgentEvent,
+    style: AnsiStyle,
 ) -> String {
-    const ANSI_BOLD_MAGENTA: &str = "\x1b[1;35m";
-    const ANSI_RESET: &str = "\x1b[0m";
-
     let mut message = "◆ event emitted".to_owned();
     if let Some(channel_id) = channel_id {
         message.push(' ');
@@ -370,7 +368,7 @@ pub fn format_event_notice(
         }
     }
 
-    format!("{ANSI_BOLD_MAGENTA}{message}{ANSI_RESET}\n")
+    format!("{}\n", style.paint(message))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,16 +442,6 @@ fn render_template(template: &str, context: &TemplateContext) -> String {
         rendered = rendered.replace(needle, value);
     }
     rendered
-}
-
-fn format_timeout_duration(total_seconds: u64) -> String {
-    if total_seconds.is_multiple_of(3600) {
-        return format!("{}h", total_seconds / 3600);
-    }
-    if total_seconds.is_multiple_of(60) {
-        return format!("{}m", total_seconds / 60);
-    }
-    format!("{}s", total_seconds)
 }
 
 fn resolved_prompt_path(context: &TemplateContext) -> &str {
@@ -591,14 +579,19 @@ mod tests {
     #[test]
     fn truncates_multiline_event_notice_after_three_lines() {
         let rendered = super::format_event_notice(
-            Some("host"),
+            Some(ralph_core::HOST_CHANNEL_ID),
             &ralph_core::ParsedAgentEvent {
-                event: "planning-target-path".to_owned(),
+                event: ralph_core::PLANNING_TARGET_PATH_EVENT.to_owned(),
                 body: "docs/plans/one.md\ndocs/plans/two.md\ndocs/plans/three.md\ndocs/plans/four.md\ndocs/plans/five.md".to_owned(),
             },
+            ralph_core::AnsiStyle::default(),
         );
 
-        assert!(rendered.contains("◆ event emitted [host]: planning-target-path"));
+        assert!(rendered.contains(&format!(
+            "◆ event emitted [{}]: {}",
+            ralph_core::HOST_CHANNEL_ID,
+            ralph_core::PLANNING_TARGET_PATH_EVENT
+        )));
         assert!(
             rendered
                 .contains("\n  docs/plans/one.md\n  docs/plans/two.md\n  docs/plans/three.md\n")
@@ -606,6 +599,25 @@ mod tests {
         assert!(rendered.contains("  ... (+2 more lines)"));
         assert!(!rendered.contains("\n  docs/plans/four.md\n"));
         assert!(!rendered.contains("\n  docs/plans/five.md\n"));
+    }
+
+    #[test]
+    fn event_notice_uses_the_supplied_ansi_style() {
+        let rendered = super::format_event_notice(
+            Some("main"),
+            &ralph_core::ParsedAgentEvent {
+                event: "status".to_owned(),
+                body: "ready".to_owned(),
+            },
+            ralph_core::AnsiStyle::default()
+                .with_enabled(true)
+                .fg(ralph_core::ThemeColor::Cyan)
+                .bold(),
+        );
+
+        assert!(rendered.starts_with("\u{1b}[1;36m"));
+        assert!(rendered.contains("◆ event emitted [main]: status | ready"));
+        assert!(rendered.ends_with("\u{1b}[0m\n"));
     }
 
     #[test]
