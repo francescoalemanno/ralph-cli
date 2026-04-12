@@ -9,13 +9,14 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
-    AgentEventRecord, LastRunStatus, LoopControlDecision, MAIN_CHANNEL_ID, NO_ROUTE_ERROR,
-    NO_ROUTE_OK, ParsedAgentEvent, RunControl, RunnerConfig, RunnerInvocation, WorkflowDefinition,
-    WorkflowParallelWorkerDefinition, WorkflowPromptDefinition, WorkflowRunSummary,
-    WorkflowRuntimeRequest, WorkflowTransitionGuard, WorkflowTransitionGuardFailure,
-    WorkflowTransitionGuardFailureAction, agent_events_wal_path, append_agent_event,
-    current_agent_events_offset, latest_agent_event_body_from_wal_in_channel, load_workflow,
-    read_agent_events_since, reduce_loop_control, validate_agent_event, workflow_option_flag,
+    AgentEventRecord, AnsiStyle, LastRunStatus, LoopControlDecision, MAIN_CHANNEL_ID,
+    NO_ROUTE_ERROR, NO_ROUTE_OK, ParsedAgentEvent, RunControl, RunnerConfig, RunnerInvocation,
+    TerminalTheme, WorkflowDefinition, WorkflowParallelWorkerDefinition, WorkflowPromptDefinition,
+    WorkflowRunSummary, WorkflowRuntimeRequest, WorkflowTransitionGuard,
+    WorkflowTransitionGuardFailure, WorkflowTransitionGuardFailureAction, agent_events_wal_path,
+    append_agent_event, current_agent_events_offset, latest_agent_event_body_from_wal_in_channel,
+    load_workflow, read_agent_events_since, reduce_loop_control, validate_agent_event,
+    workflow_option_flag,
 };
 use ralph_runner::{RunnerAdapter, RunnerStreamEvent, format_event_notice};
 use tokio::{
@@ -85,6 +86,11 @@ impl<R> RalphApp<R>
 where
     R: RunnerAdapter + Clone + 'static,
 {
+    fn event_notice_style(&self) -> AnsiStyle {
+        let theme = TerminalTheme::new(&self.config.theme);
+        theme.style().fg(theme.palette().accent).bold()
+    }
+
     pub async fn run_workflow<D>(
         &self,
         workflow_id: &str,
@@ -556,6 +562,7 @@ where
                     ),
                     (PLANNING_PROGRESS_EVENT, progress_after),
                 ],
+                self.event_notice_style(),
                 wal_write_lock,
                 delegate,
             )
@@ -596,6 +603,7 @@ where
                             display_project_path(&self.project_dir, &target_path),
                         ),
                     ],
+                    self.event_notice_style(),
                     wal_write_lock,
                     delegate,
                 )
@@ -619,6 +627,7 @@ where
                         ),
                         (PLANNING_PROGRESS_EVENT, progress_after),
                     ],
+                    self.event_notice_style(),
                     wal_write_lock,
                     delegate,
                 )
@@ -639,6 +648,7 @@ where
                         ),
                         (PLANNING_PROGRESS_EVENT, progress_after),
                     ],
+                    self.event_notice_style(),
                     wal_write_lock,
                     delegate,
                 )
@@ -711,6 +721,7 @@ where
             let worker_wal_write_lock = wal_write_lock.clone();
             let output_log_path = parallel_output_log_path(run_dir, channel_id);
             let worker_label = label.clone();
+            let event_notice_style = self.event_notice_style();
             join_set.spawn(async move {
                 execute_parallel_worker(
                     worker_runner,
@@ -720,6 +731,7 @@ where
                     worker_wal_write_lock,
                     worker_ui_tx,
                     worker_label,
+                    event_notice_style,
                     output_log_path,
                 )
                 .await
@@ -1275,6 +1287,7 @@ async fn append_host_payloads<D>(
     workflow_path: &Utf8Path,
     prompt_id: &str,
     payloads: &[(&str, String)],
+    event_notice_style: AnsiStyle,
     wal_write_lock: Arc<AsyncMutex<()>>,
     delegate: &mut D,
 ) -> Result<()>
@@ -1319,6 +1332,7 @@ where
                     event: (*event).to_owned(),
                     body: notice_body,
                 },
+                event_notice_style,
             )))
             .await?;
     }
@@ -1400,6 +1414,7 @@ async fn execute_parallel_worker<R>(
     wal_write_lock: Arc<AsyncMutex<()>>,
     ui_tx: tokio::sync::mpsc::UnboundedSender<ParallelWorkerUiEvent>,
     label: String,
+    event_notice_style: AnsiStyle,
     output_log_path: Utf8PathBuf,
 ) -> Result<ParallelWorkerOutcome>
 where
@@ -1445,7 +1460,11 @@ where
                             .await?;
                             for event in events {
                                 let _ = ui_tx.send(ParallelWorkerUiEvent::Output {
-                                    chunk: format_event_notice(Some(&channel_id), &event),
+                                    chunk: format_event_notice(
+                                        Some(&channel_id),
+                                        &event,
+                                        event_notice_style,
+                                    ),
                                 });
                             }
                         }
@@ -1485,7 +1504,11 @@ where
                             .await?;
                             for event in events {
                                 let _ = ui_tx.send(ParallelWorkerUiEvent::Output {
-                                    chunk: format_event_notice(Some(&channel_id), &event),
+                                    chunk: format_event_notice(
+                                        Some(&channel_id),
+                                        &event,
+                                        event_notice_style,
+                                    ),
                                 });
                             }
                         }
