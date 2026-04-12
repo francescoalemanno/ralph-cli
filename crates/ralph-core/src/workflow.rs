@@ -1497,6 +1497,10 @@ prompts:
         assert!(
             prompt.contains("execute these exact commands in order to read the planning state")
         );
+        assert!(prompt.contains(r#""$RALPH_BIN" get --channel host planning-progress"#));
+        assert!(prompt.contains(r#""$RALPH_BIN" get planning-target-path"#));
+        assert!(!prompt.contains("2>/dev/null"));
+        assert!(!prompt.contains("|| true"));
         assert!(
             prompt
                 .contains("those reads are the canonical planning-state inputs for this iteration")
@@ -1537,6 +1541,10 @@ prompts:
                 .contains("if the feedback asks for missing user choices you cannot infer safely")
         );
         assert!(prompt.contains("emit exactly one `planning-question` instead of a new draft"));
+        assert!(prompt.contains(r#"{"question":"Your question here?","options":["Option 1","Option 2","Option 3"],"context":"Why this question matters"}"#));
+        assert!(prompt.contains(
+            "do not include `Other`, `Something else`, or any catch-all option"
+        ));
         assert!(prompt.contains(
             "do not emit a fresh draft that ignores the existing review feedback or the latest draft file state"
         ));

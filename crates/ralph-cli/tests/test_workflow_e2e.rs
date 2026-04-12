@@ -318,6 +318,55 @@ fn bare_shortcut_routes_argv_requests_to_the_bare_workflow() {
 }
 
 #[test]
+fn payload_rejects_invalid_planning_question_json_on_stdout() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("project");
+    let run_dir = project_dir
+        .join(".ralph")
+        .join("runs")
+        .join("plan")
+        .join("run-1");
+    let runtime_dir = run_dir.join(".ralph-runtime");
+    let wal_path = runtime_dir.join("agent-events.wal.ndjson");
+    let prompt_path = temp.path().join("plan.yml");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::write(
+        &prompt_path,
+        "version: 1\nworkflow_id: plan\ntitle: Plan\nentrypoint: plan\nprompts:\n  plan:\n    title: Plan\n    fallback-route: no-route-error\n    prompt: hello\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ralph"))
+        .arg("payload")
+        .arg("planning-question")
+        .arg(r#"{"question":"What type of project do you want to build?","options":"CLI","context":"Need project type"}"#)
+        .env("RALPH_WAL_PATH", &wal_path)
+        .env("RALPH_CHANNEL_ID", "main")
+        .env("RALPH_PROMPT_PATH", &prompt_path)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "stdout:\n{stdout}\n\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("planning-question payload rejected:"));
+    assert!(stdout.contains("expected a sequence"));
+    assert!(stdout.contains("\"$RALPH_BIN\" payload 'planning-question' '<json>'"));
+    assert!(stdout.contains("`options` must be a non-empty array of non-empty strings"));
+    assert!(stderr.trim().is_empty(), "stderr:\n{stderr}");
+    assert!(
+        !wal_path.exists()
+            || fs::read_to_string(&wal_path)
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+    );
+}
+
+#[test]
 fn cli_run_reports_explicit_session_timeout() {
     let temp = tempfile::tempdir().unwrap();
     let project_dir = temp.path().join("project");

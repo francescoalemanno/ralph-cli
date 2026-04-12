@@ -332,7 +332,7 @@ Built-in workflows use this mechanism for loop control, for example:
 Planning workflows also use a host-intercepted event contract:
 
 Agent-emitted planning payloads:
-- `planning-question`: asks exactly one clarifying question; Ralph intercepts it, asks the user directly, and then appends host-side planning state into the WAL before rerouting
+- `planning-question`: asks exactly one clarifying question as a JSON payload like `{"question":"...","options":["..."],"context":"..."}`; Ralph intercepts it, asks the user directly, and then appends host-side planning state into the WAL before rerouting
 - `planning-target-path`: the current proposed project-relative output path for the draft plan file; Ralph reads that file and intercepts it for `accept` / `revise` / `reject`
 
 Host-emitted planning payloads on channel `host`:

@@ -11,8 +11,9 @@ use ralph_core::{
     WorkflowPromptDefinition, WorkflowRunSummary, WorkflowRuntimeRequest, WorkflowTransitionGuard,
     WorkflowTransitionGuardFailure, WorkflowTransitionGuardFailureAction, agent_events_wal_path,
     append_agent_event, current_agent_events_offset, current_unix_timestamp_ms,
-    latest_agent_event_body_from_wal_in_channel, load_workflow, read_agent_events_since,
-    reduce_loop_control, validate_agent_event, workflow_option_flag,
+    latest_agent_event_body_from_wal_in_channel, load_workflow,
+    parse_planning_question_json_payload, read_agent_events_since, reduce_loop_control,
+    validate_agent_event, workflow_option_flag,
 };
 use ralph_runner::{RunnerAdapter, RunnerStreamEvent, format_event_notice};
 use tokio::{
@@ -1124,6 +1125,24 @@ fn transition_guard_failure_step(
 }
 
 fn parse_planning_question(body: &str) -> Result<PlanningQuestion> {
+    let trimmed = body.trim();
+    if trimmed.starts_with('{') {
+        return parse_planning_question_json(trimmed);
+    }
+
+    parse_legacy_planning_question(body)
+}
+
+fn parse_planning_question_json(body: &str) -> Result<PlanningQuestion> {
+    let payload = parse_planning_question_json_payload(body)?;
+    Ok(PlanningQuestion {
+        question: payload.question,
+        options: payload.options,
+        context: Some(payload.context),
+    })
+}
+
+fn parse_legacy_planning_question(body: &str) -> Result<PlanningQuestion> {
     let mut question = None;
     let mut options = Vec::new();
     let mut context = None;
@@ -1168,10 +1187,14 @@ fn parse_planning_question(body: &str) -> Result<PlanningQuestion> {
         ));
     }
 
+    let context = context
+        .filter(|context| !context.trim().is_empty())
+        .ok_or_else(|| anyhow!("planning-question is missing a Context: line"))?;
+
     Ok(PlanningQuestion {
         question,
         options,
-        context,
+        context: Some(context),
     })
 }
 
@@ -1633,7 +1656,7 @@ mod tests {
 
     use crate::workflow_run::{
         HOST_CHANNEL_ID, PLANNING_ANSWER_EVENT, PLANNING_PLAN_FILE_EVENT, PLANNING_PROGRESS_EVENT,
-        PLANNING_TARGET_PATH_EVENT,
+        PLANNING_TARGET_PATH_EVENT, parse_planning_question,
     };
     use crate::{
         PlanningDraftDecision, PlanningDraftDecisionKind, PlanningDraftReview, PlanningQuestion,
@@ -2181,7 +2204,7 @@ prompts:
             events: Arc::new(Mutex::new(vec![
                 vec![(
                     ralph_core::PLANNING_QUESTION_EVENT.to_owned(),
-                    "Question: Which cache backend?\nOptions:\n- Redis\n- In-memory\nContext: Needed for the implementation plan".to_owned(),
+                    r#"{"question":"Which cache backend?","options":["Redis","In-memory"],"context":"Needed for the implementation plan"}"#.to_owned(),
                 )],
                 vec![("loop-stop:ok".to_owned(), "done".to_owned())],
             ])),
@@ -2233,6 +2256,42 @@ prompts:
                 .outputs
                 .concat()
                 .contains("◆ event emitted [host]: planning-answer")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_planning_question_accepts_json_payload() -> Result<()> {
+        let question = parse_planning_question(
+            r#"{"question":"What type of project would you like to create?","options":["CLI tool","Web application","Library"],"context":"Needed to create the right implementation plan"}"#,
+        )?;
+        assert_eq!(
+            question,
+            PlanningQuestion {
+                question: "What type of project would you like to create?".to_owned(),
+                options: vec![
+                    "CLI tool".to_owned(),
+                    "Web application".to_owned(),
+                    "Library".to_owned(),
+                ],
+                context: Some("Needed to create the right implementation plan".to_owned()),
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_planning_question_accepts_legacy_text_payload() -> Result<()> {
+        let question = parse_planning_question(
+            "Question: Which cache backend?\nOptions:\n- Redis\n- In-memory\nContext: Needed for the implementation plan",
+        )?;
+        assert_eq!(
+            question,
+            PlanningQuestion {
+                question: "Which cache backend?".to_owned(),
+                options: vec!["Redis".to_owned(), "In-memory".to_owned()],
+                context: Some("Needed for the implementation plan".to_owned()),
+            }
         );
         Ok(())
     }

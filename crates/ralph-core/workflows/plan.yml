@@ -30,9 +30,9 @@ prompts:
 
       Ralph stores planning progress in the current run WAL and keeps the current draft in the plan file you emit with `planning-target-path`.
 
-      Before you do ANY exploration, ask ANY question, or emit ANY payload, execute these exact commands in order to read the planning state. If a payload does not exist yet, treat the output as empty:
-      1. `"$RALPH_BIN" get --channel host planning-progress 2>/dev/null || true`
-      2. `"$RALPH_BIN" get planning-target-path 2>/dev/null || true`
+      Before you do ANY exploration, ask ANY question, or emit ANY payload, execute these exact commands in order to read the planning state. If one of them reports that the payload does not exist yet, treat that state as empty:
+      1. `"$RALPH_BIN" get --channel host planning-progress`
+      2. `"$RALPH_BIN" get planning-target-path`
       3. If step 2 returns a non-empty path and that file exists, read that file in full immediately.
 
       CRITICAL:
@@ -70,21 +70,21 @@ prompts:
 
       ## Step 3: Ask Clarifying Questions Only When Needed
 
-      If you genuinely need user input to create a good plan, emit exactly one payload named `planning-question` with this exact body shape:
+      If you genuinely need user input to create a good plan, emit exactly one payload named `planning-question` with a compact JSON object body using this exact schema:
 
-      Question: Your question here?
-      Options:
-      - Option 1
-      - Option 2
-      - Option 3
-      Context: Why this question matters
+      {"question":"Your question here?","options":["Option 1","Option 2","Option 3"],"context":"Why this question matters"}
+
+      Example command:
+      `"$RALPH_BIN" payload 'planning-question' '{"question":"Your question here?","options":["Option 1","Option 2","Option 3"],"context":"Why this question matters"}'`
 
       Rules for questions:
       - ask ONE question at a time
       - provide 2-4 concrete options
+      - do not include `Other`, `Something else`, or any catch-all option; every option must be a specific concrete choice
       - only ask about architecture, scope, or user preferences you cannot infer safely
       - do not ask about implementation details you can choose yourself
-      - keep `Context:` to one short line
+      - keep `context` to one short line
+      - emit the JSON object as a single payload body with no extra prose before or after the command
       - if a draft already exists, ask only the minimum question needed to refine that existing draft
 
       After emitting `planning-question`, stop immediately. Do not continue. Do not emit loop-control events in the same response.

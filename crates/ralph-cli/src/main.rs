@@ -3,7 +3,7 @@ mod output;
 
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env, fmt as std_fmt, fs,
     io::{self, IsTerminal, Read},
     process::{Command, ExitCode},
 };
@@ -27,17 +27,43 @@ use ralph_app::{
 };
 use ralph_core::{
     AgentEventRecord, AppConfig, ConfigFileScope, HOST_CHANNEL_ID, LastRunStatus, MAIN_CHANNEL_ID,
-    PLANNING_PLAN_FILE_EVENT, RUNTIME_DIR_NAME, agent_events_wal_path,
+    PLANNING_PLAN_FILE_EVENT, PLANNING_QUESTION_EVENT, RUNTIME_DIR_NAME, agent_events_wal_path,
     append_agent_event_to_wal_path, current_unix_timestamp_ms,
     latest_agent_event_body_from_wal_in_channel, validate_agent_event,
 };
 use tracing_subscriber::{EnvFilter, fmt};
 
 const SPECIAL_WORKFLOW_PLAN_PLACEHOLDER: &str = "<unavailable, ignore>";
+const PLANNING_QUESTION_PAYLOAD_EXAMPLE: &str = r#"{"question":"Your question here?","options":["Option 1","Option 2"],"context":"Why this question matters"}"#;
+
+#[derive(Debug)]
+struct StdoutCommandError {
+    message: String,
+}
+
+impl StdoutCommandError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std_fmt::Display for StdoutCommandError {
+    fn fmt(&self, f: &mut std_fmt::Formatter<'_>) -> std_fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StdoutCommandError {}
 
 #[tokio::main]
 async fn main() -> ExitCode {
     if let Err(error) = try_main().await {
+        if let Some(stdout_error) = error.downcast_ref::<StdoutCommandError>() {
+            println!("{}", stdout_error.message.trim_end());
+            return ExitCode::from(1);
+        }
         eprintln!("{error:#}");
         return ExitCode::from(1);
     }
@@ -383,8 +409,21 @@ fn run_signal(args: SignalArgs) -> Result<()> {
 
 fn run_payload(args: PayloadArgs) -> Result<()> {
     let context = EmitEventContext::from_env()?;
+    if args.event.trim() == PLANNING_QUESTION_EVENT
+        && let Err(error) =
+            validate_agent_event(&args.event, &args.body, Some(&context.prompt_path))
+    {
+        return Err(StdoutCommandError::new(render_planning_question_payload_error(&error)).into());
+    }
     append_event(&context, &args.event, &args.body)?;
     Ok(())
+}
+
+fn render_planning_question_payload_error(error: &anyhow::Error) -> String {
+    format!(
+        "planning-question payload rejected: {error:#}\n\nRe-run `\"$RALPH_BIN\" payload 'planning-question' '<json>'` with a JSON object body like:\n{}\n\nRules:\n- `question` must be a non-empty string\n- `options` must be a non-empty array of non-empty strings\n- `context` must be a non-empty string",
+        PLANNING_QUESTION_PAYLOAD_EXAMPLE
+    )
 }
 
 fn run_get(args: GetArgs) -> Result<()> {

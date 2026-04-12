@@ -11,10 +11,12 @@ mod workflow;
 pub use agent::{AgentConfig, CodingAgent, CommandMode, PromptInput, RunnerConfig, builtin_agents};
 pub use agent_events::{
     AGENT_EVENTS_WAL_FILE_NAME, AgentEventLogRead, AgentEventRecord, LoopControlDecision,
-    MAIN_CHANNEL_ID, ParsedAgentEvent, RUNTIME_DIR_NAME, agent_events_wal_path, append_agent_event,
-    append_agent_event_to_wal_path, current_agent_events_offset, latest_agent_event_body_from_wal,
-    latest_agent_event_body_from_wal_in_channel, read_agent_events_since,
-    read_agent_events_since_path, reduce_loop_control, validate_agent_event,
+    MAIN_CHANNEL_ID, ParsedAgentEvent, PlanningQuestionJsonPayload, RUNTIME_DIR_NAME,
+    agent_events_wal_path, append_agent_event, append_agent_event_to_wal_path,
+    current_agent_events_offset, latest_agent_event_body_from_wal,
+    latest_agent_event_body_from_wal_in_channel, parse_planning_question_json_payload,
+    read_agent_events_since, read_agent_events_since_path, reduce_loop_control,
+    validate_agent_event,
 };
 pub use atomic::atomic_write;
 pub use config::{

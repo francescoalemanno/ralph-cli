@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 
+use crate::protocol::PLANNING_QUESTION_EVENT;
 use crate::workflow::load_workflow_from_path;
 
 pub const RUNTIME_DIR_NAME: &str = ".ralph-runtime";
@@ -47,6 +48,20 @@ pub enum LoopControlDecision {
     StopOk(String),
     StopError(String),
     Route(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningQuestionJsonPayload {
+    pub question: String,
+    pub options: Vec<String>,
+    pub context: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPlanningQuestionJsonPayload {
+    question: Option<String>,
+    options: Option<Vec<String>>,
+    context: Option<String>,
 }
 
 fn default_channel_id() -> String {
@@ -200,6 +215,11 @@ pub fn validate_agent_event(event: &str, body: &str, prompt_path: Option<&Utf8Pa
         return Err(anyhow!("event name cannot be empty"));
     }
 
+    if trimmed_event == PLANNING_QUESTION_EVENT {
+        parse_planning_question_json_payload(body)?;
+        return Ok(());
+    }
+
     if !trimmed_event.starts_with("loop-") {
         return Ok(());
     }
@@ -209,6 +229,46 @@ pub fn validate_agent_event(event: &str, body: &str, prompt_path: Option<&Utf8Pa
         "loop-route" => validate_loop_route_body(body, prompt_path),
         _ => Err(anyhow!(unsupported_loop_event_message(trimmed_event))),
     }
+}
+
+pub fn parse_planning_question_json_payload(body: &str) -> Result<PlanningQuestionJsonPayload> {
+    let payload: RawPlanningQuestionJsonPayload =
+        serde_json::from_str(body).context("planning-question JSON payload is invalid")?;
+
+    let question = payload
+        .question
+        .map(|question| question.trim().to_owned())
+        .filter(|question| !question.is_empty())
+        .ok_or_else(|| {
+            anyhow!("planning-question JSON payload must include a non-empty `question`")
+        })?;
+
+    let options = payload
+        .options
+        .unwrap_or_default()
+        .into_iter()
+        .map(|option| option.trim().to_owned())
+        .filter(|option| !option.is_empty())
+        .collect::<Vec<_>>();
+    if options.is_empty() {
+        return Err(anyhow!(
+            "planning-question JSON payload must include at least one non-empty entry in `options`"
+        ));
+    }
+
+    let context = payload
+        .context
+        .map(|context| context.trim().to_owned())
+        .filter(|context| !context.is_empty())
+        .ok_or_else(|| {
+            anyhow!("planning-question JSON payload must include a non-empty `context`")
+        })?;
+
+    Ok(PlanningQuestionJsonPayload {
+        question,
+        options,
+        context,
+    })
 }
 
 fn validate_loop_route_body(body: &str, prompt_path: Option<&Utf8Path>) -> Result<()> {
@@ -260,10 +320,11 @@ mod tests {
 
     use super::{
         AGENT_EVENTS_WAL_FILE_NAME, AgentEventRecord, LoopControlDecision, MAIN_CHANNEL_ID,
-        RUNTIME_DIR_NAME, agent_events_wal_path, append_agent_event,
+        PlanningQuestionJsonPayload, RUNTIME_DIR_NAME, agent_events_wal_path, append_agent_event,
         append_agent_event_to_wal_path, current_agent_events_offset,
         latest_agent_event_body_from_wal, latest_agent_event_body_from_wal_in_channel,
-        read_agent_events_since, reduce_loop_control, validate_agent_event,
+        parse_planning_question_json_payload, read_agent_events_since, reduce_loop_control,
+        validate_agent_event,
     };
 
     fn sample_record(event: &str, body: &str, run_id: &str) -> AgentEventRecord {
@@ -412,5 +473,56 @@ prompts:
         assert!(error.contains("\"broken\" is not a valid event body for `loop-route`."));
         assert!(error.contains("alpha"));
         assert!(error.contains("beta"));
+    }
+
+    #[test]
+    fn parses_planning_question_json_payload() {
+        let payload = parse_planning_question_json_payload(
+            r#"{"question":"What do you want to build?","options":["CLI","Web"],"context":"Needed for planning"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            payload,
+            PlanningQuestionJsonPayload {
+                question: "What do you want to build?".to_owned(),
+                options: vec!["CLI".to_owned(), "Web".to_owned()],
+                context: "Needed for planning".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn planning_question_requires_non_empty_question_options_and_context() {
+        let missing_question =
+            parse_planning_question_json_payload(r#"{"options":["CLI"],"context":"Needed"}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(missing_question.contains("non-empty `question`"));
+
+        let missing_options = parse_planning_question_json_payload(
+            r#"{"question":"What?","options":[],"context":"Needed"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(missing_options.contains("non-empty entry in `options`"));
+
+        let missing_context =
+            parse_planning_question_json_payload(r#"{"question":"What?","options":["CLI"]}"#)
+                .unwrap_err()
+                .to_string();
+        assert!(missing_context.contains("non-empty `context`"));
+    }
+
+    #[test]
+    fn validates_planning_question_payload_shape() {
+        let error = validate_agent_event(
+            "planning-question",
+            r#"{"question":"What?","options":"CLI","context":"Needed"}"#,
+            None,
+        )
+        .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("planning-question JSON payload is invalid"));
+        assert!(rendered.contains("expected a sequence"));
     }
 }
