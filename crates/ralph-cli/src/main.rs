@@ -34,6 +34,8 @@ use ralph_core::{
 use serde::Serialize;
 use tracing_subscriber::{EnvFilter, fmt};
 
+const SPECIAL_WORKFLOW_PLAN_PLACEHOLDER: &str = "<unavailable, ignore>";
+
 #[tokio::main]
 async fn main() -> ExitCode {
     if let Err(error) = try_main().await {
@@ -482,12 +484,10 @@ fn resolve_special_workflow_plan_file(
     }
 
     latest_planning_plan_file(project_dir)?.map_or_else(
-        || {
-            Err(anyhow!(
-                "workflow '{}' requires a plan file; pass one explicitly or run `ralph --plan` first",
-                workflow_id
-            ))
-        },
+        // Review/finalize prompts always interpolate `{ralph-option:plan-file}`.
+        // When the shortcut is used without a plan, keep the workflow runnable by
+        // injecting a sentinel string that tells the agent to ignore the missing plan.
+        || Ok(Some(SPECIAL_WORKFLOW_PLAN_PLACEHOLDER.to_owned())),
         |plan_file| Ok(Some(plan_file)),
     )
 }
@@ -999,9 +999,25 @@ mod tests {
         let project_dir = Utf8PathBuf::from_path_buf(temp.path().join("project")).unwrap();
         fs::create_dir_all(project_dir.as_std_path()).unwrap();
 
-        let error = resolve_special_workflow_plan_file(&project_dir, "review", None)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("requires a plan file"));
+        assert_eq!(
+            resolve_special_workflow_plan_file(&project_dir, "review", None)
+                .unwrap()
+                .as_deref(),
+            Some(SPECIAL_WORKFLOW_PLAN_PLACEHOLDER)
+        );
+    }
+
+    #[test]
+    fn finalize_shortcut_uses_placeholder_when_no_plan_can_be_resolved() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().join("project")).unwrap();
+        fs::create_dir_all(project_dir.as_std_path()).unwrap();
+
+        assert_eq!(
+            resolve_special_workflow_plan_file(&project_dir, "finalize", None)
+                .unwrap()
+                .as_deref(),
+            Some(SPECIAL_WORKFLOW_PLAN_PLACEHOLDER)
+        );
     }
 }
