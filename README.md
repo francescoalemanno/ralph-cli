@@ -117,8 +117,8 @@ Guided behavior:
 - `ralph` asks for a plan description, runs `plan` interactively in the terminal, and can continue into `task` then `review`.
 - `ralph --plan[=DESCRIPTION]` runs the same interactive planning flow and stops after the plan file is written.
 - `ralph -t <PLAN_FILE>` runs only `task`.
-- `ralph -r [PLAN_FILE]` runs only `review`.
-- `ralph -f [PLAN_FILE]` runs only `finalize`.
+- `ralph -r [PLAN_FILE]` runs only `review`. If you omit `PLAN_FILE`, Ralph first reuses the latest accepted plan from `ralph --plan`; if none can be found, it still runs by injecting the sentinel plan value `"<unavailable, ignore>"`.
+- `ralph -f [PLAN_FILE]` runs only `finalize`. If you omit `PLAN_FILE`, Ralph first reuses the latest accepted plan from `ralph --plan`; if none can be found, it still runs by injecting the sentinel plan value `"<unavailable, ignore>"`.
 
 ### Low-Level Runner
 
@@ -182,9 +182,9 @@ If you provide a form that the workflow does not allow, or provide more than one
 | `bare` | Minimal wrapper when your request already contains the loop discipline you want. | None |
 | `default` | Repairs a durable `PLAN.md`, executes one plan item per loop, and verifies the whole project when the plan is complete. | `--planfile` (default: `PLAN.md`) |
 | `dbv` | Uses a durable `PLAN.md` as the control surface, decomposes when needed, builds one item per loop, and performs whole-project verification when the plan is complete. | `--planfile` (default: `PLAN.md`) |
-| `finalize` | Runs the best-effort finalization pass: fetch, rebase onto the base ref, tidy commits, and rerun relevant checks. | `--planfile`, `--baseref` (default: `main`) |
+| `finalize` | Runs the best-effort finalization pass: fetch, rebase onto the base ref, tidy commits, and rerun relevant checks. Top-level `ralph -f [PLAN_FILE]` can run without a plan by falling back to the latest accepted plan or `"<unavailable, ignore>"`. | `--planfile`, `--baseref` (default: `main`) |
 | `plan` | Runs a host-mediated planner loop that explores the repo, asks one clarifying question at a time, drafts a plan, and writes the accepted markdown file under `docs/plans/`. | `--plansdir` (default: `docs/plans`) |
-| `review` | Runs the standalone multi-agent review passes and fixes confirmed findings until the branch is clean. | `--planfile`, `--baseref` (default: `main`) |
+| `review` | Runs the standalone multi-agent review passes and fixes confirmed findings until the branch is clean. Top-level `ralph -r [PLAN_FILE]` can run without a plan by falling back to the latest accepted plan or `"<unavailable, ignore>"`. | `--planfile`, `--baseref` (default: `main`) |
 | `task` | Executes markdown task sections one at a time until the plan's implementation stage is complete, then stops before review. | `--planfile` |
 
 List them at any time with:
