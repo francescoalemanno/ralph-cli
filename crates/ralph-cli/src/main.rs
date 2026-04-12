@@ -6,7 +6,6 @@ use std::{
     env, fs,
     io::{self, IsTerminal, Read},
     process::{Command, ExitCode},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -26,18 +25,16 @@ use ralph_app::{
     prompt_yes_no,
 };
 use ralph_core::{
-    AgentEventRecord, AppConfig, ConfigFileScope, LastRunStatus, MAIN_CHANNEL_ID,
-    agent_events_wal_path, append_agent_event_to_wal_path, atomic_write,
+    AgentEventRecord, AppConfig, ConfigFileScope, HOST_CHANNEL_ID, LastRunStatus, MAIN_CHANNEL_ID,
+    PLANNING_PLAN_FILE_EVENT, RUNTIME_DIR_NAME, agent_events_wal_path,
+    append_agent_event_to_wal_path, atomic_write, current_unix_timestamp_ms,
     latest_agent_event_body_from_wal_in_channel, seed_builtin_workflows_if_missing,
     validate_agent_event,
 };
 use serde::Serialize;
 use tracing_subscriber::{EnvFilter, fmt};
 
-const HOST_CHANNEL_ID: &str = "host";
-const PLANNING_PLAN_FILE_EVENT: &str = "planning-plan-file";
 const MISSING_PLAN_FILE_PLACEHOLDER: &str = "<unavailable, ignore>";
-const RUNTIME_DIR_NAME: &str = ".ralph-runtime";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -451,13 +448,6 @@ fn project_dir_from_run_dir(run_dir: &Utf8Path) -> Result<Utf8PathBuf> {
         .parent()
         .map(Utf8Path::to_path_buf)
         .ok_or_else(|| anyhow!("invalid Ralph run directory; missing project directory"))
-}
-
-fn current_unix_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 fn planning_plan_file(summary: &ralph_core::WorkflowRunSummary) -> Result<Option<String>> {

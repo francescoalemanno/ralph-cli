@@ -1,22 +1,18 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::Component,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::BTreeMap, fs, path::Component, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{
-    AgentEventRecord, AnsiStyle, LastRunStatus, LoopControlDecision, MAIN_CHANNEL_ID,
-    NO_ROUTE_ERROR, NO_ROUTE_OK, ParsedAgentEvent, RunControl, RunnerConfig, RunnerInvocation,
-    TerminalTheme, WorkflowDefinition, WorkflowParallelWorkerDefinition, WorkflowPromptDefinition,
-    WorkflowRunSummary, WorkflowRuntimeRequest, WorkflowTransitionGuard,
+    AgentEventRecord, AnsiStyle, HOST_CHANNEL_ID, LastRunStatus, LoopControlDecision,
+    MAIN_CHANNEL_ID, NO_ROUTE_ERROR, NO_ROUTE_OK, PLANNING_ANSWER_EVENT, PLANNING_PLAN_FILE_EVENT,
+    PLANNING_PROGRESS_EVENT, PLANNING_QUESTION_EVENT, PLANNING_REVIEW_EVENT,
+    PLANNING_TARGET_PATH_EVENT, ParsedAgentEvent, RUNTIME_DIR_NAME, RunControl, RunnerConfig,
+    RunnerInvocation, TerminalTheme, WorkflowDefinition, WorkflowParallelWorkerDefinition,
+    WorkflowPromptDefinition, WorkflowRunSummary, WorkflowRuntimeRequest, WorkflowTransitionGuard,
     WorkflowTransitionGuardFailure, WorkflowTransitionGuardFailureAction, agent_events_wal_path,
-    append_agent_event, current_agent_events_offset, latest_agent_event_body_from_wal_in_channel,
-    load_workflow, read_agent_events_since, reduce_loop_control, validate_agent_event,
-    workflow_option_flag,
+    append_agent_event, current_agent_events_offset, current_unix_timestamp_ms,
+    latest_agent_event_body_from_wal_in_channel, load_workflow, read_agent_events_since,
+    reduce_loop_control, validate_agent_event, workflow_option_flag,
 };
 use ralph_runner::{RunnerAdapter, RunnerStreamEvent, format_event_notice};
 use tokio::{
@@ -29,14 +25,6 @@ use crate::{
     PlanningQuestionAnswer, RalphApp, RunDelegate, RunEvent,
     prompt::{interpolate_workflow_prompt, interpolate_workflow_value},
 };
-
-const HOST_CHANNEL_ID: &str = "host";
-const PLANNING_QUESTION_EVENT: &str = "planning-question";
-const PLANNING_ANSWER_EVENT: &str = "planning-answer";
-const PLANNING_REVIEW_EVENT: &str = "planning-review";
-const PLANNING_PROGRESS_EVENT: &str = "planning-progress";
-const PLANNING_PLAN_FILE_EVENT: &str = "planning-plan-file";
-const PLANNING_TARGET_PATH_EVENT: &str = "planning-target-path";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkflowRequestInput {
@@ -1563,13 +1551,6 @@ async fn persist_agent_events(
     Ok(())
 }
 
-fn current_unix_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 fn parallel_worker_label(channel_id: &str, worker: &WorkflowParallelWorkerDefinition) -> String {
     worker
         .title
@@ -1579,7 +1560,7 @@ fn parallel_worker_label(channel_id: &str, worker: &WorkflowParallelWorkerDefini
 
 fn parallel_output_log_path(run_dir: &Utf8Path, channel_id: &str) -> Utf8PathBuf {
     run_dir
-        .join(".ralph-runtime")
+        .join(RUNTIME_DIR_NAME)
         .join("channels")
         .join(channel_id)
         .join("output.log")
@@ -1631,11 +1612,7 @@ fn format_summary(prefix: &str, body: &str) -> String {
 }
 
 fn next_workflow_run_id() -> String {
-    let ts_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    format!("{}-{ts_unix_ms}", std::process::id())
+    format!("{}-{}", std::process::id(), current_unix_timestamp_ms())
 }
 
 #[cfg(test)]
@@ -2178,7 +2155,7 @@ prompts:
         let runner = WorkflowSpyRunner {
             events: Arc::new(Mutex::new(vec![
                 vec![(
-                    "planning-question".to_owned(),
+                    ralph_core::PLANNING_QUESTION_EVENT.to_owned(),
                     "Question: Which cache backend?\nOptions:\n- Redis\n- In-memory\nContext: Needed for the implementation plan".to_owned(),
                 )],
                 vec![("loop-stop:ok".to_owned(), "done".to_owned())],

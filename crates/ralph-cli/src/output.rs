@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use camino::Utf8Path;
 use ralph_core::{
     AgentConfig, TerminalTheme, ThemeConfig, WorkflowDefinition, WorkflowRunSummary,
-    WorkflowSummary,
+    WorkflowSummary, format_timeout_duration,
 };
 
 pub(crate) struct AgentListRow {
@@ -248,16 +248,6 @@ fn format_limits_line(
         ));
     }
     parts.join(" | ")
-}
-
-fn format_timeout_duration(total_seconds: u64) -> String {
-    if total_seconds.is_multiple_of(3600) {
-        return format!("{}h", total_seconds / 3600);
-    }
-    if total_seconds.is_multiple_of(60) {
-        return format!("{}m", total_seconds / 60);
-    }
-    format!("{}s", total_seconds)
 }
 
 fn preview_text(text: &str, max_lines: usize) -> Vec<String> {
