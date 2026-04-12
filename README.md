@@ -133,7 +133,9 @@ ralph run plan "add caching for API responses"
 
 Important behavior:
 
-- `ralph run` accepts the request as argv text, `--file <FILE>`, or piped stdin.
+- The allowed request forms come from each workflow's `request.runtime` definition.
+- Built-in `bare`, `default`, and `dbv` accept argv text, `--file <FILE>`, or piped stdin.
+- Built-in `plan` accepts argv text or `--file <FILE>` and does not accept stdin.
 - The request must be provided in exactly one runtime form.
 
 ## Theme
@@ -157,13 +159,12 @@ error_color = "red"
 
 ### Request Input Rules
 
-Ralph accepts the workflow request in exactly one runtime form:
+Ralph accepts the workflow request in exactly one runtime form, but the allowed forms depend on the selected workflow.
 
-- argv text
-- `--file <FILE>`
-- stdin
+- `bare`, `default`, and `dbv`: argv text, `--file <FILE>`, or stdin
+- `plan`: argv text or `--file <FILE>`
 
-If you provide more than one, Ralph exits with a usage error.
+If you provide a form that the workflow does not allow, or provide more than one form, Ralph exits with a usage error.
 
 ## Writing Better Ralph Requests
 

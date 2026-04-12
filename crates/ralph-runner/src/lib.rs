@@ -602,6 +602,25 @@ mod tests {
     }
 
     #[test]
+    fn event_notice_uses_the_supplied_ansi_style() {
+        let rendered = super::format_event_notice(
+            Some("main"),
+            &ralph_core::ParsedAgentEvent {
+                event: "status".to_owned(),
+                body: "ready".to_owned(),
+            },
+            ralph_core::AnsiStyle::default()
+                .with_enabled(true)
+                .fg(ralph_core::ThemeColor::Cyan)
+                .bold(),
+        );
+
+        assert!(rendered.starts_with("\u{1b}[1;36m"));
+        assert!(rendered.contains("◆ event emitted [main]: status | ready"));
+        assert!(rendered.ends_with("\u{1b}[0m\n"));
+    }
+
+    #[test]
     fn opencode_permissions_live_in_agent_config_not_runner_special_cases() {
         let opencode = CodingAgent::Opencode.definition();
         assert_eq!(

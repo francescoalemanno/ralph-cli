@@ -30,9 +30,21 @@ mod tests {
     use super::format_timeout_duration;
 
     #[test]
-    fn timeout_duration_prefers_larger_units() {
-        assert_eq!(format_timeout_duration(3600), "1h");
-        assert_eq!(format_timeout_duration(600), "10m");
-        assert_eq!(format_timeout_duration(59), "59s");
+    fn timeout_duration_formats_boundary_values() {
+        let cases = [
+            (1, "1s"),
+            (59, "59s"),
+            (60, "1m"),
+            (61, "61s"),
+            (600, "10m"),
+            (3599, "3599s"),
+            (3600, "1h"),
+            (3660, "61m"),
+            (7200, "2h"),
+        ];
+
+        for (seconds, expected) in cases {
+            assert_eq!(format_timeout_duration(seconds), expected);
+        }
     }
 }

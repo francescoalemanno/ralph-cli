@@ -23,6 +23,10 @@ impl TerminalTheme {
         self.palette
     }
 
+    pub fn colors_enabled(self) -> bool {
+        self.colors_enabled
+    }
+
     pub fn style(self) -> AnsiStyle {
         AnsiStyle {
             enabled: self.colors_enabled,
@@ -52,6 +56,11 @@ pub struct AnsiStyle {
 }
 
 impl AnsiStyle {
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
     pub fn fg(mut self, color: ThemeColor) -> Self {
         self.fg = Some(color);
         self
@@ -85,5 +94,60 @@ impl AnsiStyle {
             .collect::<Vec<_>>()
             .join(";");
         format!("\u{1b}[{codes}m{text}\u{1b}[0m")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AnsiStyle, TerminalTheme};
+    use crate::{LastRunStatus, ThemeColor, ThemeConfig};
+
+    #[test]
+    fn ansi_style_emits_escape_codes_when_enabled() {
+        let rendered = AnsiStyle::default()
+            .with_enabled(true)
+            .fg(ThemeColor::Cyan)
+            .bold()
+            .paint("hello");
+        assert_eq!(rendered, "\u{1b}[1;36mhello\u{1b}[0m");
+    }
+
+    #[test]
+    fn ansi_style_returns_plain_text_when_disabled() {
+        let rendered = AnsiStyle::default()
+            .with_enabled(false)
+            .fg(ThemeColor::Cyan)
+            .bold()
+            .paint("hello");
+        assert_eq!(rendered, "hello");
+    }
+
+    #[test]
+    fn terminal_theme_status_colors_follow_the_shared_palette() {
+        let theme = TerminalTheme {
+            colors_enabled: true,
+            palette: ThemeConfig::default().resolve(),
+        };
+
+        assert_eq!(
+            theme.status_color(LastRunStatus::NeverRun),
+            theme.palette().accent
+        );
+        assert_eq!(
+            theme.status_color(LastRunStatus::Completed),
+            theme.palette().success
+        );
+        assert_eq!(
+            theme.status_color(LastRunStatus::MaxIterations),
+            theme.palette().warning
+        );
+        assert_eq!(
+            theme.status_color(LastRunStatus::Failed),
+            theme.palette().error
+        );
+        assert_eq!(
+            theme.status_color(LastRunStatus::Canceled),
+            theme.palette().accent
+        );
     }
 }

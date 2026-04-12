@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    io::Write,
     process::{Command, Stdio},
 };
 
@@ -102,6 +103,62 @@ fn hidden_test_workflow_runs_end_to_end_via_the_cli_binary() {
     assert_eq!(
         wal.records.last().map(|record| record.body.as_str()),
         Some("completed 4 coordinated rounds")
+    );
+}
+
+#[test]
+fn bare_workflow_accepts_piped_stdin_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("project");
+    let config_home = temp.path().join("config-home");
+    let home_dir = temp.path().join("home");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::create_dir_all(&config_home).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ralph"))
+        .arg("--project-dir")
+        .arg(&project_dir)
+        .arg("run")
+        .arg("--agent")
+        .arg("__test_shell")
+        .arg("bare")
+        .env("HOME", &home_dir)
+        .env("RALPH_CONFIG_HOME", &config_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"printf stdin-request\n\"$RALPH_BIN\" payload 'loop-stop:ok' 'done'\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\n\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("request    stdin"));
+    assert!(stdout.contains("stdin-request"));
+
+    let run_root = project_dir.join(".ralph").join("runs").join("bare");
+    let mut run_dirs = fs::read_dir(&run_root)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    assert_eq!(run_dirs.len(), 1);
+    let run_dir = run_dirs.pop().unwrap();
+    assert_eq!(
+        fs::read_to_string(run_dir.join("request.txt")).unwrap(),
+        "printf stdin-request\n\"$RALPH_BIN\" payload 'loop-stop:ok' 'done'\n"
     );
 }
 

@@ -34,8 +34,6 @@ use ralph_core::{
 use serde::Serialize;
 use tracing_subscriber::{EnvFilter, fmt};
 
-const MISSING_PLAN_FILE_PLACEHOLDER: &str = "<unavailable, ignore>";
-
 #[tokio::main]
 async fn main() -> ExitCode {
     if let Err(error) = try_main().await {
@@ -133,13 +131,21 @@ async fn run_special_workflow(
     workflow_id: &str,
     plan_file: Option<String>,
 ) -> Result<ralph_core::WorkflowRunSummary> {
-    let plan_file = plan_file.unwrap_or_else(|| MISSING_PLAN_FILE_PLACEHOLDER.to_owned());
-    let args = build_run_args(
+    let plan_file = resolve_special_workflow_plan_file(&project_dir, workflow_id, plan_file)?;
+    let options = plan_file
+        .into_iter()
+        .map(|plan_file| ("plan-file".to_owned(), plan_file))
+        .collect();
+    run_workflow_with_input(
+        project_dir,
+        &RuntimeArgs::default(),
         workflow_id,
-        BTreeMap::from([("plan-file".to_owned(), plan_file)]),
-        None,
-    );
-    run_cli_workflow(project_dir, &args).await
+        WorkflowRunInput {
+            options,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 fn build_run_args(
@@ -169,10 +175,19 @@ async fn run_cli_workflow(
     project_dir: Utf8PathBuf,
     args: &cli::RunArgs,
 ) -> Result<ralph_core::WorkflowRunSummary> {
-    let mut app = RalphApp::load(project_dir)?;
     let input = resolve_workflow_run_input(args)?;
-    args.runtime.apply_to(&mut app)?;
-    let workflow = app.load_workflow(&args.workflow)?;
+    run_workflow_with_input(project_dir, &args.runtime, &args.workflow, input).await
+}
+
+async fn run_workflow_with_input(
+    project_dir: Utf8PathBuf,
+    runtime: &RuntimeArgs,
+    workflow_id: &str,
+    input: WorkflowRunInput,
+) -> Result<ralph_core::WorkflowRunSummary> {
+    let mut app = RalphApp::load(project_dir)?;
+    runtime.apply_to(&mut app)?;
+    let workflow = app.load_workflow(workflow_id)?;
     let request_preview = resolve_request_preview(app.project_dir(), &workflow, &input.request)?;
     let agent = app
         .config()
@@ -203,14 +218,12 @@ async fn run_cli_workflow(
                 .project_dir()
                 .join(".ralph")
                 .join("runs")
-                .join(&args.workflow)
+                .join(workflow_id)
                 .to_string(),
         },
     );
     let mut delegate = ConsoleDelegate::new(&app.config().theme);
-    let summary = app
-        .run_workflow(&args.workflow, input, &mut delegate)
-        .await?;
+    let summary = app.run_workflow(workflow_id, input, &mut delegate).await?;
     print_workflow_run(&app.config().theme, &summary);
     Ok(summary)
 }
@@ -457,6 +470,63 @@ fn planning_plan_file(summary: &ralph_core::WorkflowRunSummary) -> Result<Option
         PLANNING_PLAN_FILE_EVENT,
         Some(HOST_CHANNEL_ID),
     )
+}
+
+fn resolve_special_workflow_plan_file(
+    project_dir: &Utf8Path,
+    workflow_id: &str,
+    plan_file: Option<String>,
+) -> Result<Option<String>> {
+    if plan_file.is_some() || !matches!(workflow_id, "review" | "finalize") {
+        return Ok(plan_file);
+    }
+
+    latest_planning_plan_file(project_dir)?.map_or_else(
+        || {
+            Err(anyhow!(
+                "workflow '{}' requires a plan file; pass one explicitly or run `ralph --plan` first",
+                workflow_id
+            ))
+        },
+        |plan_file| Ok(Some(plan_file)),
+    )
+}
+
+fn latest_planning_plan_file(project_dir: &Utf8Path) -> Result<Option<String>> {
+    let plan_runs_dir = project_dir.join(".ralph").join("runs").join("plan");
+    if !plan_runs_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut run_dirs = fs::read_dir(plan_runs_dir.as_std_path())
+        .with_context(|| format!("failed to read {}", plan_runs_dir))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| Utf8PathBuf::from_path_buf(entry.path()).ok())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    run_dirs.sort_by_key(|path| planning_run_timestamp(path));
+    run_dirs.reverse();
+
+    for run_dir in run_dirs {
+        let wal_path = agent_events_wal_path(&run_dir);
+        if let Some(plan_file) = latest_agent_event_body_from_wal_in_channel(
+            &wal_path,
+            PLANNING_PLAN_FILE_EVENT,
+            Some(HOST_CHANNEL_ID),
+        )? {
+            return Ok(Some(plan_file));
+        }
+    }
+
+    Ok(None)
+}
+
+fn planning_run_timestamp(run_dir: &Utf8Path) -> u64 {
+    run_dir
+        .file_name()
+        .and_then(|name| name.rsplit_once('-'))
+        .and_then(|(_, timestamp)| timestamp.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 fn ensure_interactive_terminal(context: &str) -> Result<()> {
@@ -881,5 +951,57 @@ mod tests {
             assert!(rendered.contains("ralph run fixture-flow"));
             assert!(rendered.contains("--statefile"));
         });
+    }
+
+    #[test]
+    fn review_shortcut_resolves_the_latest_planning_plan_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().join("project")).unwrap();
+        let older_run_dir = project_dir.join(".ralph/runs/plan/42-100");
+        let newer_run_dir = project_dir.join(".ralph/runs/plan/42-200");
+        fs::create_dir_all(older_run_dir.as_std_path()).unwrap();
+        fs::create_dir_all(newer_run_dir.as_std_path()).unwrap();
+
+        for (run_dir, plan_file) in [
+            (&older_run_dir, "docs/plans/older.md"),
+            (&newer_run_dir, "docs/plans/newer.md"),
+        ] {
+            ralph_core::append_agent_event(
+                run_dir,
+                &ralph_core::AgentEventRecord {
+                    v: 1,
+                    ts_unix_ms: 1,
+                    run_id: run_dir.file_name().unwrap().to_owned(),
+                    channel_id: HOST_CHANNEL_ID.to_owned(),
+                    event: PLANNING_PLAN_FILE_EVENT.to_owned(),
+                    body: plan_file.to_owned(),
+                    project_dir: project_dir.clone(),
+                    run_dir: run_dir.to_path_buf(),
+                    prompt_path: Utf8PathBuf::from("/tmp/plan.yml"),
+                    prompt_name: "plan".to_owned(),
+                    pid: 1,
+                },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            resolve_special_workflow_plan_file(&project_dir, "review", None)
+                .unwrap()
+                .as_deref(),
+            Some("docs/plans/newer.md")
+        );
+    }
+
+    #[test]
+    fn review_shortcut_requires_a_plan_when_none_can_be_resolved() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().join("project")).unwrap();
+        fs::create_dir_all(project_dir.as_std_path()).unwrap();
+
+        let error = resolve_special_workflow_plan_file(&project_dir, "review", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires a plan file"));
     }
 }

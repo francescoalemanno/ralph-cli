@@ -79,6 +79,66 @@ where
         theme.style().fg(theme.palette().accent).bold()
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn append_host_payloads<D>(
+        &self,
+        run_id: &str,
+        run_dir: &Utf8Path,
+        workflow_path: &Utf8Path,
+        prompt_id: &str,
+        payloads: &[(&str, String)],
+        wal_write_lock: Arc<AsyncMutex<()>>,
+        delegate: &mut D,
+    ) -> Result<()>
+    where
+        D: RunDelegate,
+    {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+
+        let guard = wal_write_lock.lock().await;
+        for (event, body) in payloads {
+            append_agent_event(
+                run_dir,
+                &AgentEventRecord {
+                    v: 1,
+                    ts_unix_ms: current_unix_timestamp_ms(),
+                    run_id: run_id.to_owned(),
+                    channel_id: HOST_CHANNEL_ID.to_owned(),
+                    event: (*event).to_owned(),
+                    body: body.clone(),
+                    project_dir: self.project_dir.clone(),
+                    run_dir: run_dir.to_path_buf(),
+                    prompt_path: workflow_path.to_path_buf(),
+                    prompt_name: prompt_id.to_owned(),
+                    pid: 0,
+                },
+            )?;
+        }
+        drop(guard);
+
+        for (event, body) in payloads {
+            let notice_body = if *event == PLANNING_PROGRESS_EVENT {
+                "updated".to_owned()
+            } else {
+                body.clone()
+            };
+            delegate
+                .on_event(RunEvent::Output(format_event_notice(
+                    Some(HOST_CHANNEL_ID),
+                    &ParsedAgentEvent {
+                        event: (*event).to_owned(),
+                        body: notice_body,
+                    },
+                    self.event_notice_style(),
+                )))
+                .await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn run_workflow<D>(
         &self,
         workflow_id: &str,
@@ -537,9 +597,8 @@ where
             let question = parse_planning_question(question_body)?;
             let answer = delegate.answer_planning_question(&question).await?;
             let progress_after = append_question_progress(&progress_before, &question, &answer);
-            append_host_payloads(
+            self.append_host_payloads(
                 run_id,
-                &self.project_dir,
                 run_dir,
                 workflow_path,
                 prompt_id,
@@ -550,7 +609,6 @@ where
                     ),
                     (PLANNING_PROGRESS_EVENT, progress_after),
                 ],
-                self.event_notice_style(),
                 wal_write_lock,
                 delegate,
             )
@@ -574,9 +632,8 @@ where
 
         match decision.kind {
             PlanningDraftDecisionKind::Accept => {
-                append_host_payloads(
+                self.append_host_payloads(
                     run_id,
-                    &self.project_dir,
                     run_dir,
                     workflow_path,
                     prompt_id,
@@ -591,7 +648,6 @@ where
                             display_project_path(&self.project_dir, &target_path),
                         ),
                     ],
-                    self.event_notice_style(),
                     wal_write_lock,
                     delegate,
                 )
@@ -602,9 +658,8 @@ where
                 ))))
             }
             PlanningDraftDecisionKind::Revise => {
-                append_host_payloads(
+                self.append_host_payloads(
                     run_id,
-                    &self.project_dir,
                     run_dir,
                     workflow_path,
                     prompt_id,
@@ -615,7 +670,6 @@ where
                         ),
                         (PLANNING_PROGRESS_EVENT, progress_after),
                     ],
-                    self.event_notice_style(),
                     wal_write_lock,
                     delegate,
                 )
@@ -623,9 +677,8 @@ where
                 Ok(Some(NextStep::Continue))
             }
             PlanningDraftDecisionKind::Reject => {
-                append_host_payloads(
+                self.append_host_payloads(
                     run_id,
-                    &self.project_dir,
                     run_dir,
                     workflow_path,
                     prompt_id,
@@ -636,7 +689,6 @@ where
                         ),
                         (PLANNING_PROGRESS_EVENT, progress_after),
                     ],
-                    self.event_notice_style(),
                     wal_write_lock,
                     delegate,
                 )
@@ -1265,67 +1317,6 @@ fn read_planning_draft(path: &Utf8Path) -> Result<String> {
 
 fn display_project_path(project_dir: &Utf8Path, path: &Utf8Path) -> String {
     path.strip_prefix(project_dir).unwrap_or(path).to_string()
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn append_host_payloads<D>(
-    run_id: &str,
-    project_dir: &Utf8Path,
-    run_dir: &Utf8Path,
-    workflow_path: &Utf8Path,
-    prompt_id: &str,
-    payloads: &[(&str, String)],
-    event_notice_style: AnsiStyle,
-    wal_write_lock: Arc<AsyncMutex<()>>,
-    delegate: &mut D,
-) -> Result<()>
-where
-    D: RunDelegate,
-{
-    if payloads.is_empty() {
-        return Ok(());
-    }
-
-    let guard = wal_write_lock.lock().await;
-    for (event, body) in payloads {
-        append_agent_event(
-            run_dir,
-            &AgentEventRecord {
-                v: 1,
-                ts_unix_ms: current_unix_timestamp_ms(),
-                run_id: run_id.to_owned(),
-                channel_id: HOST_CHANNEL_ID.to_owned(),
-                event: (*event).to_owned(),
-                body: body.clone(),
-                project_dir: project_dir.to_path_buf(),
-                run_dir: run_dir.to_path_buf(),
-                prompt_path: workflow_path.to_path_buf(),
-                prompt_name: prompt_id.to_owned(),
-                pid: 0,
-            },
-        )?;
-    }
-    drop(guard);
-
-    for (event, body) in payloads {
-        let notice_body = if *event == PLANNING_PROGRESS_EVENT {
-            "updated".to_owned()
-        } else {
-            body.clone()
-        };
-        delegate
-            .on_event(RunEvent::Output(format_event_notice(
-                Some(HOST_CHANNEL_ID),
-                &ParsedAgentEvent {
-                    event: (*event).to_owned(),
-                    body: notice_body,
-                },
-                event_notice_style,
-            )))
-            .await?;
-    }
-
-    Ok(())
 }
 
 async fn execute_runner<R, D>(

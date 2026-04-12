@@ -79,7 +79,6 @@ The event is written to the current Ralph channel from `RALPH_CHANNEL_ID`.
 This command only works inside a Ralph agent run.";
 
 const PROJECT_DIR_ARG: &str = "project_dir";
-const CLI_ARG: &str = "cli";
 const AGENT_ARG: &str = "agent";
 const MAX_ITERATIONS_ARG: &str = "max_iterations";
 const SESSION_TIMEOUT_ARG: &str = "session_timeout";
@@ -615,13 +614,6 @@ fn build_run_command() -> Result<Command> {
         .subcommand_required(true)
         .subcommand_help_heading("Workflows")
         .arg(
-            Arg::new(CLI_ARG)
-                .long("cli")
-                .global(true)
-                .action(ArgAction::SetTrue)
-                .hide(true),
-        )
-        .arg(
             Arg::new(AGENT_ARG)
                 .long("agent")
                 .global(true)
@@ -1052,26 +1044,6 @@ mod tests {
             assert_eq!(
                 args.request_args.request_file,
                 Some(camino::Utf8PathBuf::from("REQ.md"))
-            );
-        });
-    }
-
-    #[test]
-    fn run_subcommand_accepts_legacy_cli_flag() {
-        with_test_workflow_home(|| {
-            let cli =
-                Cli::try_parse_from(["ralph", "run", "--cli", "fixture-flow", "fix", "tests"])
-                    .unwrap();
-
-            let Commands::Run(args) = cli.command else {
-                panic!("expected run subcommand");
-            };
-            assert_eq!(args.workflow, "fixture-flow");
-            assert_eq!(args.runtime.session_timeout_secs, Some(60 * 60));
-            assert_eq!(args.runtime.idle_timeout_secs, Some(10 * 60));
-            assert_eq!(
-                args.request_args.request,
-                vec!["fix".to_owned(), "tests".to_owned()]
             );
         });
     }
