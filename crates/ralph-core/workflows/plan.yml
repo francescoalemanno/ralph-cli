@@ -43,7 +43,7 @@ prompts:
 
       FIRST, check whether a plan file already exists under `{ralph-option:plans-dir}` that already covers this request.
       If a matching plan already exists:
-      - emit event `loop-stop:ok` with body `matching plan already exists`
+      - emit payload `planning-target-path` with exactly that relative path.
       - stop immediately
 
       ## Step 1: Read Planning Progress
