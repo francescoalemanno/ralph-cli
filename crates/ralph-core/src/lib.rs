@@ -21,7 +21,7 @@ pub use agent_events::{
 pub use atomic::atomic_write;
 pub use config::{
     ARTIFACT_DIR_NAME, AppConfig, ConfigFileScope, ScopedGlobalConfigDirOverride, ThemeConfig,
-    global_config_dir, scoped_global_config_dir_override,
+    ensure_project_artifact_dir, global_config_dir, scoped_global_config_dir_override,
 };
 pub use protocol::{
     HOST_CHANNEL_ID, PLANNING_ANSWER_EVENT, PLANNING_PLAN_FILE_EVENT, PLANNING_PROGRESS_EVENT,

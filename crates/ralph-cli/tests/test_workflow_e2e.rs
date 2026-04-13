@@ -71,6 +71,9 @@ fn hidden_test_workflow_runs_end_to_end_via_the_cli_binary() {
     assert!(summary.contains("rounds=4"));
     assert!(summary.contains("entries=14"));
 
+    let artifact_gitignore = fs::read_to_string(project_dir.join(".ralph/.gitignore")).unwrap();
+    assert_eq!(artifact_gitignore, "*\n");
+
     let wal = ralph_core::read_agent_events_since(&Utf8PathBuf::from_path_buf(run_dir).unwrap(), 0)
         .unwrap();
     let phase_events = wal

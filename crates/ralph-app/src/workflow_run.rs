@@ -11,7 +11,7 @@ use ralph_core::{
     WorkflowPromptDefinition, WorkflowRunSummary, WorkflowRuntimeRequest, WorkflowTransitionGuard,
     WorkflowTransitionGuardFailure, WorkflowTransitionGuardFailureAction, agent_events_wal_path,
     append_agent_event, current_agent_events_offset, current_unix_timestamp_ms,
-    latest_agent_event_body_from_wal_in_channel, load_workflow,
+    ensure_project_artifact_dir, latest_agent_event_body_from_wal_in_channel, load_workflow,
     parse_planning_question_json_payload, read_agent_events_since, reduce_loop_control,
     validate_agent_event, workflow_option_flag,
 };
@@ -185,6 +185,7 @@ where
         let workflow_options = self.resolve_workflow_options(&workflow, input.options)?;
         let request = self.resolve_workflow_request(&workflow, input.request)?;
         let run_id = next_workflow_run_id();
+        ensure_project_artifact_dir(&self.project_dir)?;
         let run_dir = self.workflow_run_dir(&workflow.workflow_id, &run_id);
         fs::create_dir_all(run_dir.as_std_path())
             .with_context(|| format!("failed to create run directory {}", run_dir))?;

@@ -9,6 +9,8 @@ use crate::{AgentConfig, ThemeMode, atomic_write, builtin_agents};
 
 pub const ARTIFACT_DIR_NAME: &str = ".ralph";
 const PROJECT_CONFIG_FILE_NAME: &str = "config.toml";
+const PROJECT_ARTIFACT_GITIGNORE_FILE_NAME: &str = ".gitignore";
+const PROJECT_ARTIFACT_GITIGNORE_CONTENTS: &str = "*\n";
 const RALPH_CONFIG_HOME_ENV: &str = "RALPH_CONFIG_HOME";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +148,9 @@ impl AppConfig {
         let config = Self::load(project_dir)?;
         if config.agent_definition(agent_id).is_none() {
             return Err(anyhow!("agent '{}' is not defined", agent_id));
+        }
+        if scope == ConfigFileScope::Project {
+            ensure_project_artifact_dir(project_dir)?;
         }
 
         let path = config_path_for_scope(project_dir, scope)?
@@ -327,10 +332,23 @@ fn is_builtin_registry_snapshot(agents: &[AgentConfig]) -> bool {
     })
 }
 
+pub fn ensure_project_artifact_dir(project_dir: &Utf8Path) -> Result<Utf8PathBuf> {
+    let artifact_dir = project_artifact_dir(project_dir);
+    let gitignore_path = artifact_dir.join(PROJECT_ARTIFACT_GITIGNORE_FILE_NAME);
+    if !gitignore_path.exists() {
+        atomic_write(&gitignore_path, PROJECT_ARTIFACT_GITIGNORE_CONTENTS).with_context(|| {
+            format!("failed to seed Ralph artifact ignore file at {gitignore_path}")
+        })?;
+    }
+    Ok(artifact_dir)
+}
+
+fn project_artifact_dir(project_dir: &Utf8Path) -> Utf8PathBuf {
+    project_dir.join(ARTIFACT_DIR_NAME)
+}
+
 fn project_config_path(project_dir: &Utf8Path) -> Utf8PathBuf {
-    project_dir
-        .join(ARTIFACT_DIR_NAME)
-        .join(PROJECT_CONFIG_FILE_NAME)
+    project_artifact_dir(project_dir).join(PROJECT_CONFIG_FILE_NAME)
 }
 
 fn config_path_for_scope(
@@ -522,7 +540,7 @@ mod tests {
 
     use super::{
         AppConfig, ConfigFileScope, PartialAppConfig, configure_test_global_config_home,
-        merge_config, write_partial_config,
+        ensure_project_artifact_dir, merge_config, write_partial_config,
     };
     use crate::{AgentConfig, CommandMode, PromptInput, RunnerConfig};
 
@@ -580,6 +598,38 @@ mod tests {
         let raw = fs::read_to_string(project_dir.join(".ralph/config.toml")).unwrap();
         assert!(raw.contains("agent = \"raijin\""));
         assert!(!raw.contains("[[agents]]"));
+    }
+
+    #[test]
+    fn persisted_project_config_seeds_artifact_gitignore() {
+        let (_, _guard) = configure_test_global_config_home();
+        if let Some(user_path) = AppConfig::user_config_path().unwrap()
+            && user_path.exists()
+        {
+            fs::remove_file(&user_path).unwrap();
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+
+        AppConfig::persist_scoped_coding_agent(&project_dir, ConfigFileScope::Project, "raijin")
+            .unwrap();
+
+        let raw = fs::read_to_string(project_dir.join(".ralph/.gitignore")).unwrap();
+        assert_eq!(raw, "*\n");
+    }
+
+    #[test]
+    fn seeding_artifact_gitignore_preserves_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_dir = Utf8PathBuf::from_path_buf(temp.path().to_path_buf()).unwrap();
+        let artifact_dir = project_dir.join(".ralph");
+        fs::create_dir_all(&artifact_dir).unwrap();
+        fs::write(artifact_dir.join(".gitignore"), "custom\n").unwrap();
+
+        ensure_project_artifact_dir(&project_dir).unwrap();
+
+        let raw = fs::read_to_string(artifact_dir.join(".gitignore")).unwrap();
+        assert_eq!(raw, "custom\n");
     }
 
     #[test]
