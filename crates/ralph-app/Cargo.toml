@@ -10,9 +10,10 @@ camino.workspace = true
 ralph-core = { version = "0.5.2", path = "../ralph-core" }
 ralph-runner = { version = "0.5.2", path = "../ralph-runner" }
 serde_json.workspace = true
+similar.workspace = true
+tempfile.workspace = true
 termimad.workspace = true
 time.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true

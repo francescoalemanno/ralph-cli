@@ -108,6 +108,8 @@ prompts:
 
       If the planning progress shows `Decision: revise`:
       - first examine the latest review feedback and the latest draft file you just read
+      - if the review feedback includes a unified diff with headers `Old plan draft` and `User revised draft`, treat that diff as authoritative requested changes against the latest draft file before making any further edits
+      - the latest draft file remains the canonical base; the unified diff describes the requested revision and has not been applied yet
       - if the feedback asks for missing user choices you cannot infer safely (for example library, stack, architecture, or scope preferences), emit exactly one `planning-question` instead of a new draft
       - revise the latest draft file you just read; do not invent a fresh unrelated draft
       - reuse the latest `planning-target-path` unless the feedback requires a different filename

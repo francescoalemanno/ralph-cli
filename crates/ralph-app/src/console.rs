@@ -1,15 +1,16 @@
 use std::{
     env,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, BufRead, IsTerminal, Write},
     process::Command,
 };
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use ralph_core::{LastRunStatus, TerminalTheme, ThemeColor, ThemeConfig};
 use serde_json::Value;
+use similar::TextDiff;
 use termimad::{MadSkin, crossterm::style::Color};
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 
@@ -25,6 +26,7 @@ const OUTPUT_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
 pub struct ConsoleDelegate {
     theme: TerminalTheme,
     output_buffer: ConsoleOutputBuffer,
+    editor_override: Option<String>,
 }
 
 #[cfg(unix)]
@@ -39,9 +41,17 @@ const CONSOLE_OUTPUT_PATH: &str = "CONOUT$";
 
 impl ConsoleDelegate {
     pub fn new(theme_config: &ThemeConfig) -> Self {
+        Self::new_with_editor_override(theme_config, None)
+    }
+
+    pub fn new_with_editor_override(
+        theme_config: &ThemeConfig,
+        editor_override: Option<&str>,
+    ) -> Self {
         Self {
             theme: TerminalTheme::new(theme_config),
             output_buffer: ConsoleOutputBuffer::default(),
+            editor_override: editor_override.map(str::to_owned),
         }
     }
 
@@ -181,23 +191,34 @@ impl RunDelegate for ConsoleDelegate {
         draft: &PlanningDraftReview,
     ) -> Result<PlanningDraftDecision> {
         self.flush_pending_output()?;
-        with_prompt_output(|output, output_is_terminal| {
-            writeln!(output)?;
-            writeln!(output, "Plan draft")?;
-            writeln!(output, "Target: {}", draft.target_path)?;
-            writeln!(output, "--------------------")?;
-            render_markdown_draft(output, &draft.draft, self.theme, output_is_terminal)?;
-            writeln!(output, "--------------------")?;
-            writeln!(output)?;
-            writeln!(output, "  1) Accept")?;
-            writeln!(output, "  2) Revise")?;
-            writeln!(output, "  3) Reject")?;
-            output.flush()?;
-            Ok(())
-        })?;
+        with_prompt_io(|input, output, output_is_terminal| {
+            self.review_planning_draft_with_io(draft, input, output, output_is_terminal, edit_file)
+        })
+    }
+}
+
+impl ConsoleDelegate {
+    fn review_planning_draft_with_io<F>(
+        &mut self,
+        draft: &PlanningDraftReview,
+        input: &mut (impl BufRead + ?Sized),
+        output: &mut (impl Write + ?Sized),
+        output_is_terminal: bool,
+        mut edit_with_editor: F,
+    ) -> Result<PlanningDraftDecision>
+    where
+        F: FnMut(&Utf8Path, Option<&str>) -> Result<()>,
+    {
+        render_planning_draft_review(
+            output,
+            &draft.draft,
+            &draft.target_path,
+            self.theme,
+            output_is_terminal,
+        )?;
 
         loop {
-            match prompt_line("Enter number (1-3): ")?.trim() {
+            match prompt_line_with_io("Enter number (1-4): ", input, output)?.trim() {
                 "1" => {
                     return Ok(PlanningDraftDecision {
                         kind: PlanningDraftDecisionKind::Accept,
@@ -207,20 +228,65 @@ impl RunDelegate for ConsoleDelegate {
                 "2" => {
                     return Ok(PlanningDraftDecision {
                         kind: PlanningDraftDecisionKind::Revise,
-                        feedback: Some(prompt_multiline_nonempty("Enter revision feedback:")?),
+                        feedback: Some(prompt_multiline_nonempty_with_io(
+                            "Enter revision feedback:",
+                            input,
+                            output,
+                        )?),
                     });
                 }
-                "3" => {
+                "3" => match self.review_planning_draft_with_external_editor(
+                    draft,
+                    output,
+                    &mut edit_with_editor,
+                ) {
+                    Ok(Some(decision)) => return Ok(decision),
+                    Ok(None) => {}
+                    Err(error) => {
+                        prompt_error_with_io(output, &error.to_string())?;
+                    }
+                },
+                "4" => {
                     return Ok(PlanningDraftDecision {
                         kind: PlanningDraftDecisionKind::Reject,
                         feedback: None,
                     });
                 }
                 _ => {
-                    prompt_error("invalid selection, enter 1, 2, or 3")?;
+                    prompt_error_with_io(output, "invalid selection, enter 1, 2, 3, or 4")?;
                 }
             }
         }
+    }
+
+    fn review_planning_draft_with_external_editor<F>(
+        &self,
+        draft: &PlanningDraftReview,
+        output: &mut (impl Write + ?Sized),
+        edit_with_editor: &mut F,
+    ) -> Result<Option<PlanningDraftDecision>>
+    where
+        F: FnMut(&Utf8Path, Option<&str>) -> Result<()>,
+    {
+        let revised_draft = edit_planning_draft_in_temp_copy(
+            draft,
+            self.editor_override.as_deref(),
+            edit_with_editor,
+        )?;
+        if revised_draft == draft.draft {
+            prompt_error_with_io(
+                output,
+                "No external changes detected; draft review remains unchanged.",
+            )?;
+            return Ok(None);
+        }
+
+        let udiff = render_external_review_diff(&draft.draft, &revised_draft);
+        write_external_review_diff(output, &udiff)?;
+        Ok(Some(PlanningDraftDecision {
+            kind: PlanningDraftDecisionKind::Revise,
+            feedback: Some(format_external_edit_review_feedback(&udiff)),
+        }))
     }
 }
 
@@ -295,10 +361,6 @@ pub fn prompt_nonempty(prompt: &str) -> Result<String> {
     with_prompt_io(|input, output, _| prompt_nonempty_with_io(prompt, input, output))
 }
 
-pub fn prompt_multiline_nonempty(prompt: &str) -> Result<String> {
-    with_prompt_io(|input, output, _| prompt_multiline_nonempty_with_io(prompt, input, output))
-}
-
 pub fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
     let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
 
@@ -316,6 +378,85 @@ pub fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
 
 pub fn prompt_line(prompt: &str) -> Result<String> {
     with_prompt_io(|input, output, _| prompt_line_with_io(prompt, input, output))
+}
+
+fn render_planning_draft_review(
+    output: &mut (impl Write + ?Sized),
+    draft: &str,
+    target_path: &Utf8Path,
+    theme: TerminalTheme,
+    output_is_terminal: bool,
+) -> Result<()> {
+    writeln!(output)?;
+    writeln!(output, "Plan draft")?;
+    writeln!(output, "Target: {}", target_path)?;
+    writeln!(output, "--------------------")?;
+    render_markdown_draft(output, draft, theme, output_is_terminal)?;
+    writeln!(output, "--------------------")?;
+    writeln!(output)?;
+    writeln!(output, "  1) Accept")?;
+    writeln!(output, "  2) Revise")?;
+    writeln!(output, "  3) Edit externally")?;
+    writeln!(output, "  4) Reject")?;
+    output.flush()?;
+    Ok(())
+}
+
+fn edit_planning_draft_in_temp_copy<F>(
+    draft: &PlanningDraftReview,
+    editor_override: Option<&str>,
+    edit_with_editor: &mut F,
+) -> Result<String>
+where
+    F: FnMut(&Utf8Path, Option<&str>) -> Result<()>,
+{
+    let temp =
+        tempfile::tempdir().context("failed to create temporary planning draft directory")?;
+    let temp_path = planning_temp_copy_path(
+        &temp
+            .path()
+            .join(draft.target_path.file_name().unwrap_or("plan-draft.md")),
+    )?;
+    fs::write(temp_path.as_std_path(), &draft.draft)
+        .with_context(|| format!("failed to write temporary planning draft {}", temp_path))?;
+    edit_with_editor(&temp_path, editor_override)?;
+    fs::read_to_string(temp_path.as_std_path())
+        .with_context(|| format!("failed to read revised planning draft {}", temp_path))
+}
+
+fn planning_temp_copy_path(path: &std::path::Path) -> Result<Utf8PathBuf> {
+    Utf8PathBuf::from_path_buf(path.to_path_buf())
+        .map_err(|_| anyhow!("temporary planning draft path is not valid UTF-8"))
+}
+
+fn render_external_review_diff(old_text: &str, new_text: &str) -> String {
+    format!(
+        "{}",
+        TextDiff::from_lines(old_text, new_text)
+            .unified_diff()
+            .context_radius(4)
+            .header("Old plan draft", "User revised draft")
+    )
+}
+
+fn format_external_edit_review_feedback(udiff: &str) -> String {
+    format!(
+        "Review source: external edit\n\nApply this unified diff to the latest draft:\n\n{}",
+        udiff.trim_end()
+    )
+}
+
+fn write_external_review_diff(output: &mut (impl Write + ?Sized), udiff: &str) -> Result<()> {
+    writeln!(output)?;
+    writeln!(output, "External review diff")?;
+    writeln!(output, "--------------------")?;
+    write!(output, "{udiff}")?;
+    if !udiff.ends_with('\n') {
+        writeln!(output)?;
+    }
+    writeln!(output, "--------------------")?;
+    output.flush()?;
+    Ok(())
 }
 
 fn render_markdown_draft(
@@ -473,11 +614,13 @@ fn prompt_line_with_io(
 }
 
 fn prompt_error(message: &str) -> Result<()> {
-    with_prompt_output(|output, _| {
-        writeln!(output, "{message}")?;
-        output.flush()?;
-        Ok(())
-    })
+    with_prompt_output(|output, _| prompt_error_with_io(output, message))
+}
+
+fn prompt_error_with_io(output: &mut (impl Write + ?Sized), message: &str) -> Result<()> {
+    writeln!(output, "{message}")?;
+    output.flush()?;
+    Ok(())
 }
 
 fn with_prompt_io<T>(
@@ -685,13 +828,16 @@ fn format_finish_line(theme: TerminalTheme, status: LastRunStatus, summary: &str
 mod tests {
     use std::{fs, io::Cursor, io::Write};
 
+    use anyhow::anyhow;
     use camino::Utf8PathBuf;
+    use ralph_core::ThemeConfig;
 
     use super::{
-        ConsoleOutputBuffer, ConsoleRenderedLine, edit_file_with_external_editor,
+        ConsoleDelegate, ConsoleOutputBuffer, ConsoleRenderedLine, edit_file_with_external_editor,
         prompt_line_with_io, prompt_multiline_nonempty_with_io, render_console_line,
-        require_editor_command, resolve_editor_command,
+        render_external_review_diff, require_editor_command, resolve_editor_command,
     };
+    use crate::{PlanningDraftDecisionKind, PlanningDraftReview};
 
     #[derive(Default)]
     struct FlushTrackingWriter {
@@ -791,6 +937,109 @@ mod tests {
 
         edit_file_with_external_editor(&path, &command).unwrap();
         assert_eq!(fs::read_to_string(captured).unwrap(), path.as_str());
+    }
+
+    #[test]
+    fn external_edit_review_returns_revise_with_unified_diff_feedback() {
+        let mut delegate =
+            ConsoleDelegate::new_with_editor_override(&ThemeConfig::default(), Some("code -w"));
+        let draft = PlanningDraftReview {
+            target_path: Utf8PathBuf::from("docs/plans/cache-plan.md"),
+            draft: "# Cache Plan\n\n## Overview\nInitial draft.\n".to_owned(),
+        };
+        let mut input = Cursor::new(b"3\n".to_vec());
+        let mut output = Vec::new();
+
+        let decision = delegate
+            .review_planning_draft_with_io(
+                &draft,
+                &mut input,
+                &mut output,
+                false,
+                |path, editor_override| {
+                    assert_eq!(editor_override, Some("code -w"));
+                    assert_eq!(fs::read_to_string(path.as_std_path()).unwrap(), draft.draft);
+                    fs::write(
+                        path.as_std_path(),
+                        "# Cache Plan\n\n## Overview\nUser revised draft.\n",
+                    )
+                    .unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(decision.kind, PlanningDraftDecisionKind::Revise);
+        let feedback = decision.feedback.unwrap();
+        assert!(feedback.contains("Review source: external edit"));
+        assert!(feedback.contains("--- Old plan draft"));
+        assert!(feedback.contains("+++ User revised draft"));
+        assert!(feedback.contains("User revised draft."));
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("  3) Edit externally"));
+        assert!(rendered.contains("External review diff"));
+        assert!(rendered.contains("--- Old plan draft"));
+        assert!(rendered.contains("+++ User revised draft"));
+    }
+
+    #[test]
+    fn external_edit_review_noop_returns_to_menu() {
+        let mut delegate = ConsoleDelegate::new(&ThemeConfig::default());
+        let draft = PlanningDraftReview {
+            target_path: Utf8PathBuf::from("docs/plans/cache-plan.md"),
+            draft: "# Cache Plan\n".to_owned(),
+        };
+        let mut input = Cursor::new(b"3\n4\n".to_vec());
+        let mut output = Vec::new();
+
+        let decision = delegate
+            .review_planning_draft_with_io(&draft, &mut input, &mut output, false, |_, _| Ok(()))
+            .unwrap();
+
+        assert_eq!(decision.kind, PlanningDraftDecisionKind::Reject);
+        assert!(decision.feedback.is_none());
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("No external changes detected")
+        );
+    }
+
+    #[test]
+    fn external_edit_review_editor_error_returns_to_menu() {
+        let mut delegate = ConsoleDelegate::new(&ThemeConfig::default());
+        let draft = PlanningDraftReview {
+            target_path: Utf8PathBuf::from("docs/plans/cache-plan.md"),
+            draft: "# Cache Plan\n".to_owned(),
+        };
+        let mut input = Cursor::new(b"3\n4\n".to_vec());
+        let mut output = Vec::new();
+
+        let decision = delegate
+            .review_planning_draft_with_io(&draft, &mut input, &mut output, false, |_, _| {
+                Err(anyhow!("editor launch failed"))
+            })
+            .unwrap();
+
+        assert_eq!(decision.kind, PlanningDraftDecisionKind::Reject);
+        assert!(decision.feedback.is_none());
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("editor launch failed")
+        );
+    }
+
+    #[test]
+    fn external_review_diff_uses_expected_headers() {
+        let udiff = render_external_review_diff("alpha\nbeta\ngamma\n", "alpha\nbeta\nrevised\n");
+
+        assert!(udiff.contains("--- Old plan draft"));
+        assert!(udiff.contains("+++ User revised draft"));
+        assert!(udiff.contains("@@"));
+        assert!(udiff.contains("-gamma"));
+        assert!(udiff.contains("+revised"));
     }
 
     #[test]

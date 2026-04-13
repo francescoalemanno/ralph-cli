@@ -267,7 +267,10 @@ async fn run_workflow_with_input(
                 .to_string(),
         },
     );
-    let mut delegate = ConsoleDelegate::new(&app.config().theme);
+    let mut delegate = ConsoleDelegate::new_with_editor_override(
+        &app.config().theme,
+        app.config().editor_override.as_deref(),
+    );
     let summary = app.run_workflow(workflow_id, input, &mut delegate).await?;
     print_workflow_run(&app.config().theme, &summary);
     Ok(summary)

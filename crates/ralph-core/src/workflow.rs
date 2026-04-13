@@ -1540,6 +1540,12 @@ prompts:
             prompt
                 .contains("if the feedback asks for missing user choices you cannot infer safely")
         );
+        assert!(prompt.contains(
+            "if the review feedback includes a unified diff with headers `Old plan draft` and `User revised draft`"
+        ));
+        assert!(prompt.contains(
+            "the latest draft file remains the canonical base; the unified diff describes the requested revision and has not been applied yet"
+        ));
         assert!(prompt.contains("emit exactly one `planning-question` instead of a new draft"));
         assert!(prompt.contains(r#"{"question":"Your question here?","options":["Option 1","Option 2","Option 3"],"context":"Why this question matters"}"#));
         assert!(
