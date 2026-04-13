@@ -348,7 +348,8 @@ mod tests {
                 workflow_title: "Plan".to_owned(),
                 entrypoint: "draft".to_owned(),
                 agent: "Codex (codex)".to_owned(),
-                runner: "codex exec".to_owned(),
+                runner: "codex exec --dangerously-bypass-approvals-and-sandbox --ephemeral --json"
+                    .to_owned(),
                 project_dir: "/tmp/project".to_owned(),
                 branch: Some("main".to_owned()),
                 request_source: "argv".to_owned(),

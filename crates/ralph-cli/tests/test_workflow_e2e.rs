@@ -3,6 +3,7 @@
 use std::{
     fs,
     io::Write,
+    os::unix::fs::PermissionsExt,
     process::{Command, Stdio},
 };
 
@@ -318,6 +319,63 @@ fn bare_shortcut_routes_argv_requests_to_the_bare_workflow() {
 }
 
 #[test]
+fn cli_renders_jsonl_text_fields_as_timestamped_stdout_lines() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("project");
+    let config_home = temp.path().join("config-home");
+    let home_dir = temp.path().join("home");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::create_dir_all(&config_home).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    let script_path = project_dir.join("emit-jsonl.sh");
+    fs::write(
+        &script_path,
+        "#!/bin/sh\nprintf '%s\\n' '{\"text\":\"hello\"}' '{\"meta\":{\"text\":\"world\"}}'\n\"$RALPH_BIN\" payload 'loop-stop:ok' 'done'\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script_path, permissions).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ralph"))
+        .arg("--project-dir")
+        .arg(&project_dir)
+        .arg("--agent")
+        .arg("__test_shell")
+        .arg("-b")
+        .arg("./emit-jsonl.sh")
+        .env("HOME", &home_dir)
+        .env("RALPH_CONFIG_HOME", &config_home)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\n\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| is_timestamped_output_line(line, "hello")),
+        "stdout:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| is_timestamped_output_line(line, "world")),
+        "stdout:\n{stdout}"
+    );
+    assert!(!stdout.contains(r#"{"text":"hello"}"#), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains(r#"{"meta":{"text":"world"}}"#),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
 fn payload_rejects_invalid_planning_question_json_on_stdout() {
     let temp = tempfile::tempdir().unwrap();
     let project_dir = temp.path().join("project");
@@ -433,4 +491,53 @@ fn cli_run_reports_explicit_idle_timeout() {
     );
     assert!(stdout.contains("warmup"));
     assert!(stderr.contains("runner idle timeout after 1s"));
+}
+
+#[test]
+fn suppressed_json_output_still_resets_idle_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_dir = temp.path().join("project");
+    let config_home = temp.path().join("config-home");
+    let home_dir = temp.path().join("home");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::create_dir_all(&config_home).unwrap();
+    fs::create_dir_all(&home_dir).unwrap();
+
+    let request = "printf '%s\\n' '{\"type\":\"ping\"}'\nsleep 0.7\nprintf '%s\\n' '{\"type\":\"ping\"}'\nsleep 0.7\nprintf 'visible-done\\n'\n\"$RALPH_BIN\" payload 'loop-stop:ok' 'done'\n";
+    let output = Command::new(env!("CARGO_BIN_EXE_ralph"))
+        .arg("--project-dir")
+        .arg(&project_dir)
+        .arg("--agent")
+        .arg("__test_shell")
+        .arg("--idle-timeout")
+        .arg("1s")
+        .arg("-b")
+        .arg(request)
+        .env("HOME", &home_dir)
+        .env("RALPH_CONFIG_HOME", &config_home)
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "stdout:\n{stdout}\n\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("visible-done"), "stdout:\n{stdout}");
+    assert!(
+        !stderr.contains("runner idle timeout after 1s"),
+        "stdout:\n{stdout}\n\nstderr:\n{stderr}"
+    );
+}
+
+fn is_timestamped_output_line(line: &str, text: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.len() == text.len() + 11
+        && bytes[0] == b'['
+        && bytes[3] == b':'
+        && bytes[6] == b':'
+        && bytes[9] == b']'
+        && bytes[10] == b' '
+        && line.ends_with(text)
 }

@@ -87,8 +87,9 @@ impl CodingAgent {
                     program: Some("opencode".to_owned()),
                     args: vec![
                         "run".to_owned(),
+                        "--thinking".to_owned(),
                         "--format".to_owned(),
-                        "default".to_owned(),
+                        "json".to_owned(),
                     ],
                     command: None,
                     prompt_input: PromptInput::Stdin,
@@ -114,6 +115,7 @@ impl CodingAgent {
                         "exec".to_owned(),
                         "--dangerously-bypass-approvals-and-sandbox".to_owned(),
                         "--ephemeral".to_owned(),
+                        "--json".to_owned(),
                     ],
                     command: None,
                     prompt_input: PromptInput::Stdin,
@@ -448,6 +450,7 @@ mod tests {
                 "exec",
                 "--dangerously-bypass-approvals-and-sandbox",
                 "--ephemeral",
+                "--json",
             ]
         );
     }
@@ -462,7 +465,10 @@ mod tests {
     fn opencode_builtin_commands_match_expected_shapes() {
         let opencode = CodingAgent::Opencode.definition();
         assert_eq!(opencode.runner.prompt_input, PromptInput::Stdin);
-        assert_eq!(opencode.runner.args, vec!["run", "--format", "default"]);
+        assert_eq!(
+            opencode.runner.args,
+            vec!["run", "--thinking", "--format", "json"]
+        );
     }
 
     #[test]

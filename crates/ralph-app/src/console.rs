@@ -9,16 +9,22 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use camino::Utf8Path;
 use ralph_core::{LastRunStatus, TerminalTheme, ThemeColor, ThemeConfig};
+use serde_json::Value;
 use termimad::{MadSkin, crossterm::style::Color};
+use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 
 use crate::{
     PlanningAnswerSource, PlanningDraftDecision, PlanningDraftDecisionKind, PlanningDraftReview,
     PlanningQuestion, PlanningQuestionAnswer, RunDelegate, RunEvent,
 };
 
-#[derive(Debug, Clone, Copy)]
+const OUTPUT_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
+    format_description!("[hour]:[minute]:[second]");
+
+#[derive(Debug, Clone)]
 pub struct ConsoleDelegate {
     theme: TerminalTheme,
+    output_buffer: ConsoleOutputBuffer,
 }
 
 #[cfg(unix)]
@@ -35,7 +41,19 @@ impl ConsoleDelegate {
     pub fn new(theme_config: &ThemeConfig) -> Self {
         Self {
             theme: TerminalTheme::new(theme_config),
+            output_buffer: ConsoleOutputBuffer::default(),
         }
+    }
+
+    fn render_output_chunk(&mut self, chunk: &str) -> Result<()> {
+        with_stdout(|output| {
+            self.output_buffer
+                .push_chunk(chunk, output, current_output_timestamp)
+        })
+    }
+
+    fn flush_pending_output(&mut self) -> Result<()> {
+        with_stdout(|output| self.output_buffer.flush(output, current_output_timestamp))
     }
 }
 
@@ -54,6 +72,7 @@ impl RunDelegate for ConsoleDelegate {
                 iteration,
                 max_iterations,
             } => {
+                self.flush_pending_output()?;
                 println!();
                 println!(
                     "{}",
@@ -61,15 +80,17 @@ impl RunDelegate for ConsoleDelegate {
                 );
             }
             RunEvent::Output(chunk) => {
-                print!("{chunk}");
+                self.render_output_chunk(&chunk)?;
             }
             RunEvent::ParallelWorkerLaunched { channel_id, label } => {
+                self.flush_pending_output()?;
                 println!(
                     "{}",
                     format_parallel_event(self.theme, "queued", &channel_id, &label, None)
                 );
             }
             RunEvent::ParallelWorkerStarted { channel_id, label } => {
+                self.flush_pending_output()?;
                 println!(
                     "{}",
                     format_parallel_event(self.theme, "running", &channel_id, &label, None)
@@ -80,15 +101,18 @@ impl RunDelegate for ConsoleDelegate {
                 label,
                 exit_code,
             } => {
+                self.flush_pending_output()?;
                 println!(
                     "{}",
                     format_parallel_event(self.theme, "done", &channel_id, &label, Some(exit_code))
                 );
             }
             RunEvent::Note(note) => {
+                self.flush_pending_output()?;
                 eprintln!("{}", format_note(self.theme, &note));
             }
             RunEvent::Finished { status, summary } => {
+                self.flush_pending_output()?;
                 println!("\n{}", format_finish_line(self.theme, status, &summary));
             }
         }
@@ -99,6 +123,7 @@ impl RunDelegate for ConsoleDelegate {
         &mut self,
         question: &PlanningQuestion,
     ) -> Result<PlanningQuestionAnswer> {
+        self.flush_pending_output()?;
         with_prompt_output(|output, _| {
             writeln!(output)?;
             writeln!(output, "Planner question")?;
@@ -155,6 +180,7 @@ impl RunDelegate for ConsoleDelegate {
         &mut self,
         draft: &PlanningDraftReview,
     ) -> Result<PlanningDraftDecision> {
+        self.flush_pending_output()?;
         with_prompt_output(|output, output_is_terminal| {
             writeln!(output)?;
             writeln!(output, "Plan draft")?;
@@ -195,6 +221,66 @@ impl RunDelegate for ConsoleDelegate {
                 }
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConsoleOutputBuffer {
+    pending: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConsoleRenderedLine {
+    Raw(String),
+    ExtractedTexts(Vec<String>),
+    Suppressed,
+}
+
+impl ConsoleOutputBuffer {
+    fn push_chunk<F>(
+        &mut self,
+        chunk: &str,
+        output: &mut (impl Write + ?Sized),
+        mut now: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> String,
+    {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+
+        self.pending.push_str(chunk);
+        while let Some(newline_index) = self.pending.find('\n') {
+            let remainder = self.pending.split_off(newline_index + 1);
+            let line = std::mem::replace(&mut self.pending, remainder);
+            write_rendered_line(
+                render_console_line(trim_trailing_line_endings(&line)),
+                output,
+                &mut now,
+            )?;
+            output.flush()?;
+        }
+
+        Ok(())
+    }
+
+    fn flush<F>(&mut self, output: &mut (impl Write + ?Sized), mut now: F) -> Result<()>
+    where
+        F: FnMut() -> String,
+    {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        let line = std::mem::take(&mut self.pending);
+        write_rendered_line(
+            render_console_line(trim_trailing_line_endings(&line)),
+            output,
+            &mut now,
+        )?;
+        output.flush()?;
+        Ok(())
     }
 }
 
@@ -420,6 +506,14 @@ fn with_prompt_output<T>(operation: impl FnOnce(&mut dyn Write, bool) -> Result<
     operation(&mut output, stderr_is_terminal)
 }
 
+fn with_stdout<T>(operation: impl FnOnce(&mut dyn Write) -> Result<T>) -> Result<T> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let result = operation(&mut output)?;
+    output.flush()?;
+    Ok(result)
+}
+
 fn open_console_io() -> Option<(io::BufReader<File>, File)> {
     let input = File::open(CONSOLE_INPUT_PATH).ok()?;
     let output = OpenOptions::new()
@@ -455,6 +549,84 @@ fn termimad_color(color: ThemeColor) -> Color {
         ThemeColor::LightCyan => Color::Cyan,
         ThemeColor::White => Color::White,
     }
+}
+
+fn trim_trailing_line_endings(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+}
+
+fn render_console_line(line: &str) -> ConsoleRenderedLine {
+    match serde_json::from_str::<Value>(line) {
+        Ok(value) => {
+            let mut texts = Vec::new();
+            collect_json_texts(&value, &mut texts);
+            if texts.is_empty() {
+                ConsoleRenderedLine::Suppressed
+            } else {
+                ConsoleRenderedLine::ExtractedTexts(texts)
+            }
+        }
+        Err(_) => ConsoleRenderedLine::Raw(line.to_owned()),
+    }
+}
+
+fn collect_json_texts(value: &Value, texts: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(json_text_value) {
+                texts.push(text);
+            }
+            for value in map.values() {
+                collect_json_texts(value, texts);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_json_texts(value, texts);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn json_text_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::String(value) => Some(value.clone()),
+        Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+fn write_rendered_line<F>(
+    line: ConsoleRenderedLine,
+    output: &mut (impl Write + ?Sized),
+    now: &mut F,
+) -> Result<()>
+where
+    F: FnMut() -> String,
+{
+    match line {
+        ConsoleRenderedLine::Raw(line) => {
+            writeln!(output, "{line}")?;
+        }
+        ConsoleRenderedLine::ExtractedTexts(texts) => {
+            let timestamp = now();
+            for text in texts {
+                writeln!(output, "[{timestamp}] {text}")?;
+            }
+        }
+        ConsoleRenderedLine::Suppressed => {}
+    }
+    Ok(())
+}
+
+fn current_output_timestamp() -> String {
+    OffsetDateTime::now_local()
+        .unwrap_or_else(|_| OffsetDateTime::now_utc())
+        .format(OUTPUT_TIMESTAMP_FORMAT)
+        .unwrap_or_else(|_| "00:00:00".to_owned())
 }
 
 fn format_iteration_banner(
@@ -511,14 +683,33 @@ fn format_finish_line(theme: TerminalTheme, status: LastRunStatus, summary: &str
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Cursor};
+    use std::{fs, io::Cursor, io::Write};
 
     use camino::Utf8PathBuf;
 
     use super::{
-        edit_file_with_external_editor, prompt_line_with_io, prompt_multiline_nonempty_with_io,
+        ConsoleOutputBuffer, ConsoleRenderedLine, edit_file_with_external_editor,
+        prompt_line_with_io, prompt_multiline_nonempty_with_io, render_console_line,
         require_editor_command, resolve_editor_command,
     };
+
+    #[derive(Default)]
+    struct FlushTrackingWriter {
+        bytes: Vec<u8>,
+        flush_count: usize,
+    }
+
+    impl Write for FlushTrackingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_count += 1;
+            Ok(())
+        }
+    }
 
     #[test]
     fn editor_override_has_highest_priority() {
@@ -600,5 +791,88 @@ mod tests {
 
         edit_file_with_external_editor(&path, &command).unwrap();
         assert_eq!(fs::read_to_string(captured).unwrap(), path.as_str());
+    }
+
+    #[test]
+    fn output_buffer_renders_raw_lines_line_by_line() {
+        let mut buffer = ConsoleOutputBuffer::default();
+        let mut output = Vec::new();
+        buffer
+            .push_chunk("alpha\nbeta\n", &mut output, || "12:34:56".to_owned())
+            .unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn output_buffer_waits_for_complete_line_before_rendering() {
+        let mut buffer = ConsoleOutputBuffer::default();
+        let mut output = Vec::new();
+        buffer
+            .push_chunk("al", &mut output, || "12:34:56".to_owned())
+            .unwrap();
+        assert!(output.is_empty());
+
+        buffer
+            .push_chunk("pha\nbe", &mut output, || "12:34:56".to_owned())
+            .unwrap();
+        assert_eq!(String::from_utf8(output.clone()).unwrap(), "alpha\n");
+
+        buffer.flush(&mut output, || "12:34:56".to_owned()).unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "alpha\nbe\n");
+    }
+
+    #[test]
+    fn output_buffer_flushes_immediately_after_completed_lines() {
+        let mut buffer = ConsoleOutputBuffer::default();
+        let mut output = FlushTrackingWriter::default();
+        buffer
+            .push_chunk("alpha\nbeta\n", &mut output, || "12:34:56".to_owned())
+            .unwrap();
+
+        assert_eq!(String::from_utf8(output.bytes).unwrap(), "alpha\nbeta\n");
+        assert_eq!(output.flush_count, 2);
+    }
+
+    #[test]
+    fn output_buffer_extracts_nested_json_text_fields() {
+        let mut buffer = ConsoleOutputBuffer::default();
+        let mut output = Vec::new();
+        buffer
+            .push_chunk(
+                r#"{"delta":{"text":"hello"},"items":[{"ignored":1},{"text":"world"}]}"#,
+                &mut output,
+                || "12:34:56".to_owned(),
+            )
+            .unwrap();
+        buffer
+            .push_chunk("\n", &mut output, || "12:34:56".to_owned())
+            .unwrap();
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "[12:34:56] hello\n[12:34:56] world\n"
+        );
+    }
+
+    #[test]
+    fn output_buffer_suppresses_json_lines_without_text_fields() {
+        let mut buffer = ConsoleOutputBuffer::default();
+        let mut output = Vec::new();
+        buffer
+            .push_chunk(
+                r#"{"type":"status","phase":"running"}\n"#,
+                &mut output,
+                || "12:34:56".to_owned(),
+            )
+            .unwrap();
+        assert!(String::from_utf8(output).unwrap().is_empty());
+    }
+
+    #[test]
+    fn console_line_without_json_text_is_suppressed() {
+        assert_eq!(
+            render_console_line(r#"{"type":"status","phase":"running"}"#),
+            ConsoleRenderedLine::Suppressed
+        );
     }
 }
