@@ -1,6 +1,10 @@
-use std::{collections::BTreeMap, env, ffi::OsStr, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Component, Path},
+};
 
 use serde::{Deserialize, Serialize};
+use which::{which, which_global};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -34,9 +38,7 @@ pub enum CodingAgent {
 
 impl CodingAgent {
     pub fn detected() -> Vec<Self> {
-        let path = env::var_os("PATH");
-        let pathext = env::var_os("PATHEXT");
-        detect_agents_in_path(path.as_deref(), pathext.as_deref())
+        detect_agents_on_path()
     }
 
     pub fn id(self) -> &'static str {
@@ -290,16 +292,7 @@ impl RunnerConfig {
     pub fn is_available(&self) -> bool {
         match self.mode {
             CommandMode::Shell => true,
-            CommandMode::Exec => self.program.as_deref().is_some_and(|program| {
-                if Path::new(program).is_absolute() || program.contains(std::path::MAIN_SEPARATOR) {
-                    return Path::new(program).is_file();
-                }
-                program_is_on_path(
-                    program,
-                    env::var_os("PATH").as_deref(),
-                    env::var_os("PATHEXT").as_deref(),
-                )
-            }),
+            CommandMode::Exec => self.program.as_deref().is_some_and(executable_is_available),
         }
     }
 }
@@ -351,45 +344,24 @@ fn test_shell_agent_definition() -> AgentConfig {
     }
 }
 
-fn detect_agents_in_path(path: Option<&OsStr>, pathext: Option<&OsStr>) -> Vec<CodingAgent> {
+fn detect_agents_on_path() -> Vec<CodingAgent> {
     CodingAgent::all()
         .into_iter()
-        .filter(|agent| program_is_on_path(agent.default_program(), path, pathext))
+        .filter(|agent| executable_is_available(agent.default_program()))
         .collect()
 }
 
-fn program_is_on_path(program: &str, path: Option<&OsStr>, pathext: Option<&OsStr>) -> bool {
-    let Some(path) = path else {
-        return false;
-    };
-    let extensions = executable_extensions(pathext);
-    env::split_paths(path).any(|dir| {
-        if extensions.is_empty() {
-            dir.join(program).is_file()
-        } else {
-            extensions
-                .iter()
-                .any(|extension| dir.join(format!("{program}{extension}")).is_file())
-        }
-    })
+fn executable_is_available(program: &str) -> bool {
+    if is_bare_program_name(program) {
+        which_global(program).is_ok()
+    } else {
+        which(program).is_ok()
+    }
 }
 
-fn executable_extensions(pathext: Option<&OsStr>) -> Vec<String> {
-    if cfg!(windows) {
-        pathext
-            .and_then(|value| value.to_str())
-            .map(|value| {
-                value
-                    .split(';')
-                    .filter(|part| !part.is_empty())
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| vec![".exe".to_owned(), ".cmd".to_owned(), ".bat".to_owned()])
-    } else {
-        Vec::new()
-    }
+fn is_bare_program_name(program: &str) -> bool {
+    let mut components = Path::new(program).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 fn default_prompt_env_var() -> String {
@@ -403,8 +375,23 @@ fn droid_skip_permissions_flag() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodingAgent, CommandMode, PromptInput, builtin_agents, droid_skip_permissions_flag,
+        CodingAgent, CommandMode, PromptInput, RunnerConfig, builtin_agents,
+        droid_skip_permissions_flag,
     };
+
+    fn exec_runner(program: &str) -> RunnerConfig {
+        RunnerConfig {
+            mode: CommandMode::Exec,
+            program: Some(program.to_owned()),
+            args: Vec::new(),
+            command: None,
+            prompt_input: PromptInput::Stdin,
+            prompt_env_var: "PROMPT".to_owned(),
+            env: Default::default(),
+            session_timeout_secs: None,
+            idle_timeout_secs: None,
+        }
+    }
 
     #[test]
     fn builtin_agent_definitions_are_seeded() {
@@ -437,6 +424,17 @@ mod tests {
         assert!(agent.hidden);
         assert_eq!(agent.runner.mode, CommandMode::Shell);
         assert_eq!(agent.runner.command.as_deref(), Some("{prompt}"));
+    }
+
+    #[test]
+    fn exec_runner_accepts_existing_absolute_program_paths() {
+        let current_exe = std::env::current_exe().unwrap();
+        assert!(exec_runner(&current_exe.to_string_lossy()).is_available());
+    }
+
+    #[test]
+    fn exec_runner_rejects_missing_programs() {
+        assert!(!exec_runner("__missing_agent__").is_available());
     }
 
     #[test]
